@@ -17,31 +17,35 @@ go build -o ollamaclaw .
 
 ## Quickstart
 
-### 1) Configure Telegram bot
+### 1) Launch (auto-onboarding)
 
 ```bash
-./ollamaclaw telegram init --token <TELEGRAM_BOT_TOKEN>
+./ollamaclaw launch
 ```
 
-This will:
-- Validate token (`getMe`)
-- Clear webhook (for long polling)
-- Set bot commands: `/help`, `/reset`, `/model`, `/tools`, `/status`
-- Save config to `~/.ollamaclaw/config.json`
+If config is missing, OllamaClaw opens an interactive setup UI.
+It will ask for:
+- Ollama host
+- Default model
+- Telegram bot token
+- Telegram owner ID
 
-### 2) Run bot
+The owner ID is used for both `owner_chat_id` and `owner_user_id`.
+
+### 2) Update config later
 
 ```bash
-./ollamaclaw telegram run
+./ollamaclaw configure
 ```
-
-The bot only handles **private chats**.
 
 ### 3) Run REPL mode
 
 ```bash
 ./ollamaclaw repl
 ```
+
+The bot only handles **private chats** and only responds to the configured owner allowlist.
+`launch` prints live runtime logs (updates, commands, tool calls, cron output, and errors) to stdout.
 
 Optional:
 
@@ -53,8 +57,10 @@ Optional:
 
 ```bash
 ollamaclaw repl [--model <name>]
-ollamaclaw telegram init [--token <telegram-bot-token>]
-ollamaclaw telegram run
+ollamaclaw launch
+ollamaclaw configure
+ollamaclaw telegram init [--token <telegram-bot-token>] [--owner-id <id>] [--owner-chat-id <id>] [--owner-user-id <id>]
+ollamaclaw telegram run   # legacy alias for launch
 
 ollamaclaw plugin new <name>
 ollamaclaw plugin test [--path <dir>]
@@ -69,9 +75,11 @@ ollamaclaw plugin update [plugin-id]
 
 ## Telegram commands
 
+- `/start` shows onboarding/help text
 - `/help` shows usage
 - `/model [name]` shows/sets per-chat model
 - `/tools` lists built-in + enabled plugin tools
+- `/verbose [on|off]` enables/disables tool-call tracing for this chat session
 - `/status` shows model, token counters, compactions, enabled plugin count, DB path
 - `/reset` archives current session and starts a fresh one
 
@@ -151,7 +159,9 @@ Defaults:
   "bash_timeout_seconds": 120,
   "plugin_call_timeout_sec": 60,
   "telegram": {
-    "bot_token": ""
+    "bot_token": "",
+    "owner_chat_id": 0,
+    "owner_user_id": 0
   }
 }
 ```

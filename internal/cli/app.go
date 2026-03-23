@@ -6,11 +6,17 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/parth/ollamaclaw/internal/agent"
 	"github.com/parth/ollamaclaw/internal/config"
+	"github.com/parth/ollamaclaw/internal/cronjobs"
 	"github.com/parth/ollamaclaw/internal/db"
 	"github.com/parth/ollamaclaw/internal/ollama"
 	"github.com/parth/ollamaclaw/internal/plugin"
@@ -23,13 +29,16 @@ func New() *App { return &App{} }
 
 func (a *App) Run(args []string) error {
 	if len(args) == 0 {
-		a.printUsage()
-		return nil
+		return a.runLaunch(nil)
 	}
 	cmd := args[0]
 	switch cmd {
 	case "repl":
 		return a.runRepl(args[1:])
+	case "launch":
+		return a.runLaunch(args[1:])
+	case "configure":
+		return a.runConfigure(args[1:])
 	case "telegram":
 		return a.runTelegram(args[1:])
 	case "plugin":
@@ -47,8 +56,10 @@ func (a *App) printUsage() {
 
 Usage:
   ollamaclaw repl [--model <name>]
-  ollamaclaw telegram init [--token <telegram-bot-token>]
-  ollamaclaw telegram run
+  ollamaclaw launch
+  ollamaclaw configure
+  ollamaclaw telegram init [--token <telegram-bot-token>] [--owner-id <id>] [--owner-chat-id <id>] [--owner-user-id <id>]
+  ollamaclaw telegram run (legacy alias)
   ollamaclaw plugin new <name>
   ollamaclaw plugin test [--path <dir>]
   ollamaclaw plugin pack [--path <dir>]
@@ -72,6 +83,14 @@ func (a *App) runRepl(args []string) error {
 		return err
 	}
 	defer cleanup()
+	r.cron.SetOutputSink(func(ctx context.Context, transport, sessionKey, content string) error {
+		fmt.Printf("\n[cron %s/%s]\n%s\n", transport, sessionKey, content)
+		return nil
+	})
+	if err := r.cron.Start(context.Background()); err != nil {
+		return err
+	}
+	defer r.cron.Stop()
 	if strings.TrimSpace(*model) != "" {
 		sess, err := r.engine.GetOrCreateSession(context.Background(), "repl", "default")
 		if err == nil {
@@ -90,6 +109,9 @@ func (a *App) runTelegram(args []string) error {
 	case "init":
 		fs := flag.NewFlagSet("telegram init", flag.ContinueOnError)
 		token := fs.String("token", "", "Telegram bot token")
+		ownerID := fs.Int64("owner-id", 0, "Allowlisted Telegram owner id for both chat and user (server-side)")
+		ownerChatID := fs.Int64("owner-chat-id", 0, "Allowlisted Telegram chat id (server-side)")
+		ownerUserID := fs.Int64("owner-user-id", 0, "Allowlisted Telegram user id (server-side)")
 		if err := fs.Parse(args[1:]); err != nil {
 			return err
 		}
@@ -110,6 +132,13 @@ func (a *App) runTelegram(args []string) error {
 			return err
 		}
 		cfg.Telegram.BotToken = *token
+		resolvedChatID, resolvedUserID := normalizeOwnerIDs(*ownerID, *ownerChatID, *ownerUserID)
+		if resolvedChatID != 0 {
+			cfg.Telegram.OwnerChatID = resolvedChatID
+		}
+		if resolvedUserID != 0 {
+			cfg.Telegram.OwnerUserID = resolvedUserID
+		}
 		if err := config.Save(cfg); err != nil {
 			return err
 		}
@@ -119,25 +148,67 @@ func (a *App) runTelegram(args []string) error {
 		}
 		defer store.Close()
 		fmt.Println("Telegram initialized and config saved")
+		if cfg.Telegram.OwnerChatID == 0 || cfg.Telegram.OwnerUserID == 0 {
+			fmt.Println("warning: owner allowlist is not set. Run init with --owner-id (or --owner-chat-id and --owner-user-id) before launch.")
+		}
 		return nil
 	case "run":
-		r, cleanup, err := a.bootstrap()
-		if err != nil {
-			return err
-		}
-		defer cleanup()
-		if strings.TrimSpace(r.cfg.Telegram.BotToken) == "" {
-			return errors.New("telegram bot token is missing; run `ollamaclaw telegram init` first")
-		}
-		runner := telegram.Runner{
-			Cfg:    r.cfg,
-			Store:  r.store,
-			Engine: r.engine,
-		}
-		return runner.Run(context.Background())
+		return a.runLaunch(args[1:])
 	default:
 		return fmt.Errorf("unknown telegram subcommand: %s", sub)
 	}
+}
+
+func (a *App) runLaunch(args []string) error {
+	if len(args) != 0 {
+		return errors.New("launch takes no arguments")
+	}
+	cfg, err := config.Load()
+	if err != nil {
+		return err
+	}
+	if !launchConfigReady(cfg) {
+		if !isInteractiveTerminal() {
+			return launchConfigError(cfg)
+		}
+		fmt.Println("OllamaClaw needs configuration before launch.")
+		fmt.Println("Opening setup UI...")
+		if err := a.runConfigure(nil); err != nil {
+			return err
+		}
+		cfg, err = config.Load()
+		if err != nil {
+			return err
+		}
+		if !launchConfigReady(cfg) {
+			return launchConfigError(cfg)
+		}
+	}
+	if conflicts, err := findOtherLaunchProcesses(os.Getpid()); err == nil && len(conflicts) > 0 {
+		return fmt.Errorf("another local OllamaClaw process is already running (%s); stop it and retry", strings.Join(conflicts, "; "))
+	}
+	lockPath, releaseLock, err := acquireLaunchLock()
+	if err != nil {
+		return err
+	}
+	defer releaseLock()
+	fmt.Printf("launch lock acquired: %s\n", lockPath)
+
+	r, cleanup, err := a.bootstrap()
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+	if !launchConfigReady(r.cfg) {
+		return launchConfigError(r.cfg)
+	}
+	runner := telegram.Runner{
+		Cfg:       r.cfg,
+		Store:     r.store,
+		Engine:    r.engine,
+		Scheduler: r.cron,
+	}
+	return runner.Run(context.Background())
 }
 
 func (a *App) runPlugin(args []string) error {
@@ -265,11 +336,173 @@ func (a *App) runPlugin(args []string) error {
 	}
 }
 
+func launchConfigReady(cfg config.Config) bool {
+	return strings.TrimSpace(cfg.Telegram.BotToken) != "" && cfg.Telegram.OwnerChatID != 0 && cfg.Telegram.OwnerUserID != 0
+}
+
+func launchConfigError(cfg config.Config) error {
+	if strings.TrimSpace(cfg.Telegram.BotToken) == "" {
+		return errors.New("telegram bot token is missing; run `ollamaclaw configure` (or `ollamaclaw telegram init`) first")
+	}
+	if cfg.Telegram.OwnerChatID == 0 || cfg.Telegram.OwnerUserID == 0 {
+		return errors.New("telegram owner allowlist is missing; run `ollamaclaw configure` (or set --owner-id via `ollamaclaw telegram init`)")
+	}
+	return errors.New("launch configuration is incomplete")
+}
+
+func isInteractiveTerminal() bool {
+	if strings.TrimSpace(os.Getenv("OLLAMACLAW_FORCE_NONINTERACTIVE")) != "" {
+		return false
+	}
+	if strings.TrimSpace(os.Getenv("OLLAMACLAW_FORCE_INTERACTIVE")) != "" {
+		return true
+	}
+	stdinInfo, err := os.Stdin.Stat()
+	if err != nil {
+		return false
+	}
+	stdoutInfo, err := os.Stdout.Stat()
+	if err != nil {
+		return false
+	}
+	return (stdinInfo.Mode()&os.ModeCharDevice) != 0 && (stdoutInfo.Mode()&os.ModeCharDevice) != 0
+}
+
+func normalizeOwnerIDs(ownerID, ownerChatID, ownerUserID int64) (int64, int64) {
+	if ownerID != 0 {
+		if ownerChatID == 0 {
+			ownerChatID = ownerID
+		}
+		if ownerUserID == 0 {
+			ownerUserID = ownerID
+		}
+	}
+	if ownerChatID != 0 && ownerUserID == 0 {
+		ownerUserID = ownerChatID
+	}
+	if ownerUserID != 0 && ownerChatID == 0 {
+		ownerChatID = ownerUserID
+	}
+	return ownerChatID, ownerUserID
+}
+
+func acquireLaunchLock() (string, func(), error) {
+	dir, err := config.ConfigDir()
+	if err != nil {
+		return "", nil, err
+	}
+	lockPath := filepath.Join(dir, "launch.lock")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", nil, err
+	}
+	f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return "", nil, err
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		_ = f.Close()
+		return "", nil, fmt.Errorf("another local OllamaClaw launch is already running (lock: %s); stop the existing process and retry", lockPath)
+	}
+	if err := f.Truncate(0); err == nil {
+		_, _ = fmt.Fprintf(f, "pid=%d\nstarted=%s\n", os.Getpid(), time.Now().UTC().Format(time.RFC3339Nano))
+	}
+	release := func() {
+		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+		_ = f.Close()
+	}
+	return lockPath, release, nil
+}
+
+func findOtherLaunchProcesses(selfPID int) ([]string, error) {
+	out, err := exec.Command("ps", "-axo", "pid=,ppid=,command=").Output()
+	if err != nil {
+		return nil, err
+	}
+	return parseLaunchProcessConflicts(string(out), selfPID), nil
+}
+
+func parseLaunchProcessConflicts(psOutput string, selfPID int) []string {
+	type proc struct {
+		pid  int
+		ppid int
+		cmd  string
+	}
+	lines := strings.Split(psOutput, "\n")
+	procs := make([]proc, 0, len(lines))
+	ppidByPID := map[int]int{}
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 3 {
+			continue
+		}
+		pid, err := strconv.Atoi(fields[0])
+		if err != nil || pid <= 0 {
+			continue
+		}
+		ppid, err := strconv.Atoi(fields[1])
+		if err != nil || ppid < 0 {
+			continue
+		}
+		prefix := fields[0] + " " + fields[1]
+		cmd := strings.TrimSpace(strings.TrimPrefix(line, prefix))
+		procs = append(procs, proc{pid: pid, ppid: ppid, cmd: cmd})
+		ppidByPID[pid] = ppid
+	}
+	ancestorSet := map[int]struct{}{selfPID: {}}
+	for p := selfPID; p > 1; {
+		parent, ok := ppidByPID[p]
+		if !ok || parent <= 1 {
+			break
+		}
+		ancestorSet[parent] = struct{}{}
+		p = parent
+	}
+
+	conflicts := make([]string, 0)
+	for _, p := range procs {
+		if _, isSelfOrAncestor := ancestorSet[p.pid]; isSelfOrAncestor {
+			continue
+		}
+		cmd := p.cmd
+		cmdLower := strings.ToLower(cmd)
+		if !strings.Contains(cmdLower, "ollamaclaw") {
+			continue
+		}
+		if strings.Contains(cmdLower, "pgrep") || strings.Contains(cmdLower, "grep ") {
+			continue
+		}
+		isLaunchCandidate := strings.Contains(cmdLower, "ollamaclaw telegram run") ||
+			strings.Contains(cmdLower, "ollamaclaw launch") ||
+			strings.HasSuffix(cmdLower, "/ollamaclaw") ||
+			strings.HasSuffix(cmdLower, " ./ollamaclaw") ||
+			cmdLower == "./ollamaclaw"
+		if !isLaunchCandidate {
+			continue
+		}
+		conflicts = append(conflicts, fmt.Sprintf("pid=%d cmd=%q", p.pid, previewCommandForError(cmd)))
+	}
+	return conflicts
+}
+
+func previewCommandForError(cmd string) string {
+	compact := strings.Join(strings.Fields(strings.TrimSpace(cmd)), " ")
+	const max = 180
+	if len(compact) <= max {
+		return compact
+	}
+	return compact[:max-3] + "..."
+}
+
 type runtime struct {
 	cfg           config.Config
 	store         *db.Store
 	engine        *agent.Engine
 	pluginManager *plugin.Manager
+	cron          *cronjobs.Manager
 }
 
 func (a *App) bootstrap() (*runtime, func(), error) {
@@ -283,12 +516,21 @@ func (a *App) bootstrap() (*runtime, func(), error) {
 	}
 	client := ollama.NewClient(cfg.OllamaHost)
 	pm := plugin.NewManager(store, cfg)
-	eng := agent.New(cfg, store, client, pm)
+	cronMgr := cronjobs.NewManager(store)
+	eng := agent.New(cfg, store, client, pm, cronMgr)
+	cronMgr.SetRunner(func(ctx context.Context, transport, sessionKey, prompt string) (string, error) {
+		res, err := eng.HandleText(ctx, transport, sessionKey, prompt)
+		if err != nil {
+			return "", err
+		}
+		return res.AssistantContent, nil
+	})
 	cleanup := func() {
+		cronMgr.Stop()
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
 		_ = store.SetSetting(ctx, "last_shutdown", time.Now().UTC().Format(time.RFC3339Nano))
 		_ = store.Close()
 	}
-	return &runtime{cfg: cfg, store: store, engine: eng, pluginManager: pm}, cleanup, nil
+	return &runtime{cfg: cfg, store: store, engine: eng, pluginManager: pm, cron: cronMgr}, cleanup, nil
 }

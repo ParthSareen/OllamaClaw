@@ -131,6 +131,23 @@ CREATE TABLE IF NOT EXISTS plugin_tools (
   FOREIGN KEY(plugin_id) REFERENCES plugins(id)
 );
 `,
+		`
+CREATE TABLE IF NOT EXISTS cron_jobs (
+  id TEXT PRIMARY KEY,
+  schedule TEXT NOT NULL,
+  prompt TEXT NOT NULL,
+  transport TEXT NOT NULL,
+  session_key TEXT NOT NULL,
+  active INTEGER NOT NULL DEFAULT 1,
+  last_run_at TEXT NULL,
+  next_run_at TEXT NULL,
+  last_error TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_cron_jobs_active ON cron_jobs(active, next_run_at);
+`,
 	}
 
 	for i, sqlText := range migrations {
@@ -593,6 +610,145 @@ func (s *Store) ListPluginTools(ctx context.Context, pluginID string) ([]PluginT
 		out = append(out, t)
 	}
 	return out, rows.Err()
+}
+
+func (s *Store) UpsertCronJob(ctx context.Context, job CronJob) error {
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	lastRun := nullableTimeString(job.LastRunAt)
+	nextRun := nullableTimeString(job.NextRunAt)
+	_, err := s.db.ExecContext(ctx, `
+INSERT INTO cron_jobs(id, schedule, prompt, transport, session_key, active, last_run_at, next_run_at, last_error, created_at, updated_at)
+VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(id) DO UPDATE SET
+  schedule=excluded.schedule,
+  prompt=excluded.prompt,
+  transport=excluded.transport,
+  session_key=excluded.session_key,
+  active=excluded.active,
+  last_run_at=excluded.last_run_at,
+  next_run_at=excluded.next_run_at,
+  last_error=excluded.last_error,
+  updated_at=excluded.updated_at
+`, job.ID, job.Schedule, job.Prompt, job.Transport, job.SessionKey, boolToInt(job.Active), lastRun, nextRun, job.LastError, now, now)
+	if err != nil {
+		return fmt.Errorf("upsert cron job: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) GetCronJob(ctx context.Context, id string) (CronJob, bool, error) {
+	row := s.db.QueryRowContext(ctx, `
+SELECT id, schedule, prompt, transport, session_key, active, last_run_at, next_run_at, last_error, created_at, updated_at
+FROM cron_jobs
+WHERE id = ?
+`, id)
+	job, ok, err := scanCronJob(row)
+	if err != nil {
+		return CronJob{}, false, err
+	}
+	return job, ok, nil
+}
+
+func (s *Store) ListCronJobs(ctx context.Context, activeOnly bool) ([]CronJob, error) {
+	query := `
+SELECT id, schedule, prompt, transport, session_key, active, last_run_at, next_run_at, last_error, created_at, updated_at
+FROM cron_jobs
+`
+	if activeOnly {
+		query += ` WHERE active = 1`
+	}
+	query += ` ORDER BY id ASC`
+	rows, err := s.db.QueryContext(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("list cron jobs: %w", err)
+	}
+	defer rows.Close()
+	out := []CronJob{}
+	for rows.Next() {
+		var (
+			job                    CronJob
+			active                 int
+			lastRunRaw, nextRaw    sql.NullString
+			createdRaw, updatedRaw string
+		)
+		if err := rows.Scan(&job.ID, &job.Schedule, &job.Prompt, &job.Transport, &job.SessionKey, &active, &lastRunRaw, &nextRaw, &job.LastError, &createdRaw, &updatedRaw); err != nil {
+			return nil, fmt.Errorf("scan cron job: %w", err)
+		}
+		job.Active = active == 1
+		job.LastRunAt = parseNullTime(lastRunRaw)
+		job.NextRunAt = parseNullTime(nextRaw)
+		job.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdRaw)
+		job.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updatedRaw)
+		out = append(out, job)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate cron jobs: %w", err)
+	}
+	return out, nil
+}
+
+func (s *Store) DeleteCronJob(ctx context.Context, id string) error {
+	res, err := s.db.ExecContext(ctx, `DELETE FROM cron_jobs WHERE id = ?`, id)
+	if err != nil {
+		return fmt.Errorf("delete cron job: %w", err)
+	}
+	affected, _ := res.RowsAffected()
+	if affected == 0 {
+		return fmt.Errorf("cron job %s not found", id)
+	}
+	return nil
+}
+
+func (s *Store) UpdateCronRun(ctx context.Context, id string, lastRun, nextRun *time.Time, lastError string) error {
+	_, err := s.db.ExecContext(ctx, `
+UPDATE cron_jobs
+SET last_run_at = ?, next_run_at = ?, last_error = ?, updated_at = ?
+WHERE id = ?
+`, nullableTimeString(lastRun), nullableTimeString(nextRun), lastError, time.Now().UTC().Format(time.RFC3339Nano), id)
+	if err != nil {
+		return fmt.Errorf("update cron job run: %w", err)
+	}
+	return nil
+}
+
+func scanCronJob(row *sql.Row) (CronJob, bool, error) {
+	var (
+		job                    CronJob
+		active                 int
+		lastRunRaw, nextRaw    sql.NullString
+		createdRaw, updatedRaw string
+	)
+	err := row.Scan(&job.ID, &job.Schedule, &job.Prompt, &job.Transport, &job.SessionKey, &active, &lastRunRaw, &nextRaw, &job.LastError, &createdRaw, &updatedRaw)
+	if errors.Is(err, sql.ErrNoRows) {
+		return CronJob{}, false, nil
+	}
+	if err != nil {
+		return CronJob{}, false, fmt.Errorf("scan cron job: %w", err)
+	}
+	job.Active = active == 1
+	job.LastRunAt = parseNullTime(lastRunRaw)
+	job.NextRunAt = parseNullTime(nextRaw)
+	job.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdRaw)
+	job.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updatedRaw)
+	return job, true, nil
+}
+
+func parseNullTime(v sql.NullString) *time.Time {
+	if !v.Valid || strings.TrimSpace(v.String) == "" {
+		return nil
+	}
+	t, err := time.Parse(time.RFC3339Nano, v.String)
+	if err != nil {
+		return nil
+	}
+	return &t
+}
+
+func nullableTimeString(t *time.Time) interface{} {
+	if t == nil {
+		return nil
+	}
+	return t.UTC().Format(time.RFC3339Nano)
 }
 
 func boolToInt(v bool) int {

@@ -64,3 +64,17 @@ type PluginTool struct {
 	Enabled     bool
 	UpdatedAt   time.Time
 }
+
+type CronJob struct {
+	ID         string
+	Schedule   string
+	Prompt     string
+	Transport  string
+	SessionKey string
+	Active     bool
+	LastRunAt  *time.Time
+	NextRunAt  *time.Time
+	LastError  string
+	CreatedAt  time.Time
+	UpdatedAt  time.Time
+}

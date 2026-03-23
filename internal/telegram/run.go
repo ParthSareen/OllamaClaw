@@ -2,46 +2,138 @@ package telegram
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime/debug"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/go-telegram/bot"
 	"github.com/go-telegram/bot/models"
 	"github.com/parth/ollamaclaw/internal/agent"
 	"github.com/parth/ollamaclaw/internal/config"
+	"github.com/parth/ollamaclaw/internal/cronjobs"
 	"github.com/parth/ollamaclaw/internal/db"
 )
 
 type Runner struct {
-	Cfg    config.Config
-	Store  *db.Store
-	Engine *agent.Engine
+	Cfg       config.Config
+	Store     *db.Store
+	Engine    *agent.Engine
+	Scheduler *cronjobs.Manager
 
 	lastUpdateID atomic.Int64
+	logMu        sync.Mutex
+	logFile      *os.File
 }
 
+const (
+	settingOffsetKey = "telegram_last_update_id"
+	maxLogPreview    = 280
+)
+
 func (r *Runner) Run(ctx context.Context) error {
+	if err := r.openLogFile(); err != nil {
+		fmt.Printf("[%s] [launch] log sink setup failed: %v\n", time.Now().UTC().Format(time.RFC3339), err)
+	}
+	defer r.closeLogFile()
+
 	offset := r.readOffset(ctx)
 	r.lastUpdateID.Store(int64(offset))
+	r.logf("launch starting: db=%s owner_chat_id=%d owner_user_id=%d initial_offset=%d", r.Cfg.DBPath, r.Cfg.Telegram.OwnerChatID, r.Cfg.Telegram.OwnerUserID, offset)
+
+	if err := r.ensurePollingOwnership(offset); err != nil {
+		r.logf("telegram polling preflight failed: %v", err)
+		return err
+	}
+	r.logf("telegram polling preflight passed")
+
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
 
 	opts := []bot.Option{
 		bot.WithDefaultHandler(r.handleUpdate),
 		bot.WithAllowedUpdates([]string{"message"}),
-		bot.WithInitialOffset(int64(offset + 1)),
+		bot.WithInitialOffset(int64(offset)),
+		bot.WithErrorsHandler(func(err error) {
+			if err == nil {
+				return
+			}
+			if isPollingConflictErr(err) {
+				hint := localPollerHint(os.Getpid())
+				if hint == "" {
+					hint = "no local ollamaclaw poller candidates detected"
+				}
+				r.logf("telegram long polling conflict detected; waiting and retrying (%s): %v", hint, err)
+				return
+			}
+			r.logf("telegram polling error: %v", err)
+		}),
 	}
 	b, err := bot.New(r.Cfg.Telegram.BotToken, opts...)
 	if err != nil {
+		r.logf("bot init failed: %v", err)
 		return err
 	}
-	fmt.Println("Telegram bot running (private chats only)")
-	b.Start(ctx)
+	r.logf("telegram client initialized (long polling, private chats)")
+	if r.Scheduler != nil {
+		jobs, err := r.Scheduler.ListJobs(ctx, true)
+		if err != nil {
+			r.logf("cron preload list failed: %v", err)
+		} else {
+			r.logf("cron active jobs loaded: %d", len(jobs))
+		}
+		r.Scheduler.SetOutputSink(func(ctx context.Context, transport, sessionKey, content string) error {
+			if transport != "telegram" {
+				return nil
+			}
+			chatID, err := strconv.ParseInt(sessionKey, 10, 64)
+			if err != nil {
+				r.logf("cron output drop: invalid session_key=%q error=%v", sessionKey, err)
+				return err
+			}
+			r.logf("cron output -> chat=%d bytes=%d preview=%q", chatID, len(content), previewForLog(content))
+			r.sendChunked(ctx, b, chatID, nil, content)
+			return nil
+		})
+		if err := r.Scheduler.Start(runCtx); err != nil {
+			r.logf("cron scheduler start failed: %v", err)
+			return err
+		}
+		r.logf("cron scheduler started")
+		defer r.Scheduler.Stop()
+		defer r.logf("cron scheduler stopped")
+	}
+	r.logf("telegram bot running")
+	b.Start(runCtx)
+	r.logf("telegram runner stopped")
 	return nil
 }
 
+func (r *Runner) ensurePollingOwnership(offset int) error {
+	_, err := call(r.Cfg.Telegram.BotToken, "getUpdates", map[string]interface{}{
+		"offset":          int64(offset + 1),
+		"limit":           1,
+		"timeout":         0,
+		"allowed_updates": []string{"message"},
+	})
+	if err == nil {
+		return nil
+	}
+	if isPollingConflictErr(err) {
+		return fmt.Errorf("another bot instance is currently polling this token")
+	}
+	return fmt.Errorf("telegram getUpdates preflight failed: %w", err)
+}
+
 func (r *Runner) readOffset(ctx context.Context) int {
-	v, ok, err := r.Store.GetSetting(ctx, "telegram_last_update_id")
+	v, ok, err := r.Store.GetSetting(ctx, settingOffsetKey)
 	if err != nil || !ok {
 		return 0
 	}
@@ -53,49 +145,138 @@ func (r *Runner) readOffset(ctx context.Context) int {
 }
 
 func (r *Runner) setOffset(ctx context.Context, updateID int64) {
-	_ = r.Store.SetSetting(ctx, "telegram_last_update_id", strconv.FormatInt(updateID, 10))
+	_ = r.Store.SetSetting(ctx, settingOffsetKey, strconv.FormatInt(updateID, 10))
 	r.lastUpdateID.Store(updateID)
+	r.logf("checkpoint offset=%d", updateID)
 }
 
 func (r *Runner) handleUpdate(ctx context.Context, b *bot.Bot, update *models.Update) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			r.logf("panic in update handler: %v\n%s", rec, string(debug.Stack()))
+		}
+	}()
+
 	if update == nil {
+		r.logf("received nil update")
 		return
 	}
+	r.logf("update received: id=%d", update.ID)
 	if int64(update.ID) <= r.lastUpdateID.Load() {
+		r.logf("update skipped: stale id=%d last=%d", update.ID, r.lastUpdateID.Load())
 		return
 	}
 	r.setOffset(ctx, update.ID)
 
 	if update.Message == nil {
+		r.logf("update ignored: no message id=%d", update.ID)
 		return
 	}
 	if update.Message.Chat.Type != models.ChatTypePrivate {
+		r.logf("update ignored: chat_type=%s chat=%d", update.Message.Chat.Type, update.Message.Chat.ID)
 		return
 	}
 	chatID := update.Message.Chat.ID
+	var userID int64
+	if update.Message.From != nil {
+		userID = update.Message.From.ID
+	}
 	text := strings.TrimSpace(update.Message.Text)
 	if text == "" {
+		r.logf("message ignored: empty text chat=%d user=%d", chatID, userID)
 		return
 	}
-	if strings.HasPrefix(text, "/") {
+	r.logf("message received: chat=%d user=%d chars=%d preview=%q", chatID, userID, len(text), previewForLog(text))
+	cmd := parseCommand(text)
+	if !r.authorize(ctx, b, chatID, userID, cmd) {
+		r.logf("authorization denied: chat=%d user=%d command=%q", chatID, userID, cmd)
+		return
+	}
+	r.logf("authorization accepted: chat=%d user=%d command=%q", chatID, userID, cmd)
+	if cmd != "" {
+		r.logf("command dispatch: chat=%d cmd=%s raw=%q", chatID, cmd, previewForLog(text))
 		r.handleCommand(ctx, b, chatID, text)
 		return
 	}
 
 	progress, _ := b.SendMessage(ctx, &bot.SendMessageParams{ChatID: chatID, Text: "Thinking..."})
-	res, err := r.Engine.HandleText(ctx, "telegram", strconv.FormatInt(chatID, 10), text)
+	if progress != nil {
+		r.logf("progress message sent: chat=%d message_id=%d", chatID, progress.ID)
+	}
+	sessionKey := strconv.FormatInt(chatID, 10)
+	r.logf("agent turn start: chat=%d session_key=%s", chatID, sessionKey)
+	startedAt := time.Now()
+	res, err := r.Engine.HandleText(ctx, "telegram", sessionKey, text)
 	if err != nil {
+		r.logf("agent turn failed: chat=%d error=%v", chatID, err)
 		r.replyError(ctx, b, chatID, progress, err)
 		return
+	}
+	r.logf("agent turn complete: chat=%d model=%s prompt_tokens=%d eval_tokens=%d compacted=%t tool_calls=%d elapsed_ms=%d", chatID, res.Session.ModelOverride, res.PromptTokens, res.EvalTokens, res.Compacted, len(res.ToolTrace), time.Since(startedAt).Milliseconds())
+	for i, tr := range res.ToolTrace {
+		line := fmt.Sprintf("tool trace [%d/%d]: chat=%d name=%s duration_ms=%d args=%q", i+1, len(res.ToolTrace), chatID, tr.Name, tr.DurationMs, previewForLog(tr.ArgsJSON))
+		if strings.TrimSpace(tr.Error) != "" {
+			line += fmt.Sprintf(" error=%q", previewForLog(tr.Error))
+		} else {
+			line += fmt.Sprintf(" result=%q", previewForLog(tr.ResultJSON))
+		}
+		r.logf("%s", line)
+	}
+	verbose, _ := r.Engine.IsSessionVerbose(ctx, "telegram", sessionKey)
+	if verbose && len(res.ToolTrace) > 0 {
+		trace := formatToolTrace(res.ToolTrace)
+		if strings.TrimSpace(res.AssistantContent) == "" {
+			res.AssistantContent = trace
+		} else {
+			res.AssistantContent += "\n\n" + trace
+		}
 	}
 	if strings.TrimSpace(res.AssistantContent) == "" {
 		res.AssistantContent = "(empty response)"
 	}
+	r.logf("response send: chat=%d chars=%d", chatID, len(res.AssistantContent))
 	r.sendChunked(ctx, b, chatID, progress, res.AssistantContent)
+}
+
+func (r *Runner) authorize(ctx context.Context, b *bot.Bot, chatID, userID int64, cmd string) bool {
+	send := func(text string) {
+		_, _ = b.SendMessage(ctx, &bot.SendMessageParams{ChatID: chatID, Text: text})
+	}
+
+	ownerChatID := r.Cfg.Telegram.OwnerChatID
+	ownerUserID := r.Cfg.Telegram.OwnerUserID
+	if ownerChatID == chatID && ownerUserID == userID {
+		return true
+	}
+	if cmd == "start" {
+		r.logf("unauthorized /start attempt: chat=%d user=%d", chatID, userID)
+		send("Unauthorized DM. This bot is restricted to the server allowlist.")
+		return false
+	}
+	r.logf("unauthorized message: chat=%d user=%d", chatID, userID)
+	send("Unauthorized DM. This bot only accepts messages from the allowlisted owner.")
+	return false
+}
+
+func parseCommand(raw string) string {
+	text := strings.TrimSpace(raw)
+	if !strings.HasPrefix(text, "/") {
+		return ""
+	}
+	parts := strings.Fields(text)
+	if len(parts) == 0 {
+		return ""
+	}
+	cmd := strings.ToLower(strings.TrimPrefix(parts[0], "/"))
+	if at := strings.Index(cmd, "@"); at > 0 {
+		cmd = cmd[:at]
+	}
+	return cmd
 }
 
 func (r *Runner) replyError(ctx context.Context, b *bot.Bot, chatID int64, progress *models.Message, err error) {
 	msg := "error: " + err.Error()
+	r.logf("reply error: chat=%d message=%q", chatID, previewForLog(msg))
 	if progress != nil {
 		_, _ = b.EditMessageText(ctx, &bot.EditMessageTextParams{ChatID: chatID, MessageID: progress.ID, Text: msg})
 		return
@@ -108,10 +289,7 @@ func (r *Runner) handleCommand(ctx context.Context, b *bot.Bot, chatID int64, ra
 	if len(parts) == 0 {
 		return
 	}
-	cmd := strings.ToLower(strings.TrimPrefix(parts[0], "/"))
-	if at := strings.Index(cmd, "@"); at > 0 {
-		cmd = cmd[:at]
-	}
+	cmd := parseCommand(parts[0])
 
 	send := func(text string) {
 		_, _ = b.SendMessage(ctx, &bot.SendMessageParams{ChatID: chatID, Text: text})
@@ -125,16 +303,24 @@ func (r *Runner) handleCommand(ctx context.Context, b *bot.Bot, chatID int64, ra
 	}
 
 	switch cmd {
+	case "start":
+		r.logf("command start: chat=%d", chatID)
+		send("OllamaClaw is ready.\nCommands:\n/start\n/help\n/model [name]\n/tools\n/verbose [on|off]\n/think [on|off]\n/status\n/reset")
 	case "help":
-		send("Commands:\n/help\n/model [name]\n/tools\n/status\n/reset\n\nSend any text to chat with OllamaClaw.")
+		r.logf("command help: chat=%d", chatID)
+		send("Commands:\n/start\n/help\n/model [name]\n/tools\n/verbose [on|off]\n/think [on|off]\n/status\n/reset\n\nSend any text to chat with OllamaClaw.")
 	case "reset":
+		r.logf("command reset: chat=%d", chatID)
 		newSess, err := r.Engine.ResetSession(ctx, "telegram", sessionKey)
 		if err != nil {
+			r.logf("command reset failed: chat=%d error=%v", chatID, err)
 			send("error: " + err.Error())
 			return
 		}
+		r.logf("command reset complete: chat=%d new_session=%s", chatID, newSess.ID)
 		send("session reset: " + newSess.ID)
 	case "model":
+		r.logf("command model: chat=%d args=%q", chatID, previewForLog(strings.Join(parts[1:], " ")))
 		if len(parts) == 1 {
 			send("model: " + sess.ModelOverride)
 			return
@@ -145,13 +331,17 @@ func (r *Runner) handleCommand(ctx context.Context, b *bot.Bot, chatID int64, ra
 			return
 		}
 		if err := r.Engine.SetSessionModel(ctx, sess.ID, model); err != nil {
+			r.logf("command model failed: chat=%d error=%v", chatID, err)
 			send("error: " + err.Error())
 			return
 		}
+		r.logf("command model set: chat=%d model=%s", chatID, model)
 		send("model set to: " + model)
 	case "tools":
+		r.logf("command tools: chat=%d", chatID)
 		all, err := r.Engine.ListTools(ctx)
 		if err != nil {
+			r.logf("command tools failed: chat=%d error=%v", chatID, err)
 			send("error: " + err.Error())
 			return
 		}
@@ -164,11 +354,63 @@ func (r *Runner) handleCommand(ctx context.Context, b *bot.Bot, chatID int64, ra
 			}
 		}
 		send(strings.Join(lines, "\n"))
+	case "verbose":
+		r.logf("command verbose: chat=%d args=%q", chatID, previewForLog(strings.Join(parts[1:], " ")))
+		if len(parts) == 1 {
+			enabled, err := r.Engine.IsSessionVerbose(ctx, "telegram", sessionKey)
+			if err != nil {
+				r.logf("command verbose read failed: chat=%d error=%v", chatID, err)
+				send("error: " + err.Error())
+				return
+			}
+			send(fmt.Sprintf("verbose: %t", enabled))
+			return
+		}
+		enabled, ok := parseOnOff(parts[1])
+		if !ok {
+			send("usage: /verbose [on|off]")
+			return
+		}
+		if err := r.Engine.SetSessionVerbose(ctx, "telegram", sessionKey, enabled); err != nil {
+			r.logf("command verbose set failed: chat=%d error=%v", chatID, err)
+			send("error: " + err.Error())
+			return
+		}
+		r.logf("command verbose set: chat=%d enabled=%t", chatID, enabled)
+		send(fmt.Sprintf("verbose: %t", enabled))
+	case "think":
+		r.logf("command think: chat=%d args=%q", chatID, previewForLog(strings.Join(parts[1:], " ")))
+		if len(parts) == 1 {
+			enabled, err := r.Engine.IsSessionThink(ctx, "telegram", sessionKey)
+			if err != nil {
+				r.logf("command think read failed: chat=%d error=%v", chatID, err)
+				send("error: " + err.Error())
+				return
+			}
+			send(fmt.Sprintf("think: %t", enabled))
+			return
+		}
+		enabled, ok := parseOnOff(parts[1])
+		if !ok {
+			send("usage: /think [on|off]")
+			return
+		}
+		if err := r.Engine.SetSessionThink(ctx, "telegram", sessionKey, enabled); err != nil {
+			r.logf("command think set failed: chat=%d error=%v", chatID, err)
+			send("error: " + err.Error())
+			return
+		}
+		r.logf("command think set: chat=%d enabled=%t", chatID, enabled)
+		send(fmt.Sprintf("think: %t", enabled))
 	case "status":
+		r.logf("command status: chat=%d", chatID)
 		enabledPlugins, _ := r.Store.ListPlugins(ctx, true)
-		text := fmt.Sprintf("status:\nmodel: %s\nprompt_tokens: %d\ncompletion_tokens: %d\ncompactions: %d\nenabled_plugins: %d\ndb: %s", sess.ModelOverride, sess.TotalPromptToken, sess.TotalEvalToken, sess.CompactionCount, len(enabledPlugins), r.Cfg.DBPath)
+		verbose, _ := r.Engine.IsSessionVerbose(ctx, "telegram", sessionKey)
+		think, _ := r.Engine.IsSessionThink(ctx, "telegram", sessionKey)
+		text := fmt.Sprintf("status:\nmodel: %s\nverbose: %t\nthink: %t\nprompt_tokens: %d\ncompletion_tokens: %d\ncompactions: %d\nenabled_plugins: %d\ndb: %s\nlog: %s", sess.ModelOverride, verbose, think, sess.TotalPromptToken, sess.TotalEvalToken, sess.CompactionCount, len(enabledPlugins), r.Cfg.DBPath, strings.TrimSpace(r.Cfg.LogPath))
 		send(text)
 	default:
+		r.logf("unknown command: chat=%d cmd=%s", chatID, cmd)
 		send("unknown command")
 	}
 }
@@ -178,15 +420,19 @@ func (r *Runner) sendChunked(ctx context.Context, b *bot.Bot, chatID int64, prog
 	if len(chunks) == 0 {
 		chunks = []string{"(empty response)"}
 	}
+
+	r.logf("sendChunked: chat=%d chunks=%d first_chunk_chars=%d", chatID, len(chunks), len(chunks[0]))
 	if progress != nil {
 		_, err := b.EditMessageText(ctx, &bot.EditMessageTextParams{ChatID: chatID, MessageID: progress.ID, Text: chunks[0]})
 		if err != nil {
+			r.logf("edit progress failed, fallback send: chat=%d message_id=%d error=%v", chatID, progress.ID, err)
 			_, _ = b.SendMessage(ctx, &bot.SendMessageParams{ChatID: chatID, Text: chunks[0]})
 		}
 	} else {
 		_, _ = b.SendMessage(ctx, &bot.SendMessageParams{ChatID: chatID, Text: chunks[0]})
 	}
 	for i := 1; i < len(chunks); i++ {
+		r.logf("sendChunked: chat=%d chunk=%d/%d chars=%d", chatID, i+1, len(chunks), len(chunks[i]))
 		_, _ = b.SendMessage(ctx, &bot.SendMessageParams{ChatID: chatID, Text: chunks[i]})
 	}
 }
@@ -211,4 +457,161 @@ func splitText(text string, max int) []string {
 		out = append(out, text)
 	}
 	return out
+}
+
+func parseOnOff(raw string) (bool, bool) {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "on", "1", "true", "yes":
+		return true, true
+	case "off", "0", "false", "no":
+		return false, true
+	default:
+		return false, false
+	}
+}
+
+func formatToolTrace(trace []agent.ToolTraceEntry) string {
+	if len(trace) == 0 {
+		return "tool calls: (none)"
+	}
+	lines := []string{"tool calls:"}
+	for i, entry := range trace {
+		line := fmt.Sprintf("%d. %s (%d ms)", i+1, entry.Name, entry.DurationMs)
+		if strings.TrimSpace(entry.ArgsJSON) != "" {
+			line += " args=" + entry.ArgsJSON
+		}
+		if strings.TrimSpace(entry.Error) != "" {
+			line += " error=" + entry.Error
+		} else if strings.TrimSpace(entry.ResultJSON) != "" {
+			line += " result=" + entry.ResultJSON
+		}
+		lines = append(lines, line)
+	}
+	return strings.Join(lines, "\n")
+}
+
+func isPollingConflictErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, bot.ErrorConflict) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "conflict") && strings.Contains(msg, "getupdates")
+}
+
+type pollerCandidate struct {
+	pid int
+	cmd string
+}
+
+func localPollerHint(selfPID int) string {
+	out, err := exec.Command("ps", "-axo", "pid=,command=").Output()
+	if err != nil {
+		return ""
+	}
+	candidates := parsePollerCandidates(string(out), selfPID)
+	if len(candidates) == 0 {
+		return ""
+	}
+	max := 3
+	if len(candidates) < max {
+		max = len(candidates)
+	}
+	parts := make([]string, 0, max)
+	for i := 0; i < max; i++ {
+		c := candidates[i]
+		parts = append(parts, fmt.Sprintf("pid=%d cmd=%q", c.pid, previewForLog(c.cmd)))
+	}
+	return strings.Join(parts, "; ")
+}
+
+func parsePollerCandidates(psOutput string, selfPID int) []pollerCandidate {
+	lines := strings.Split(psOutput, "\n")
+	out := make([]pollerCandidate, 0)
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		pid, err := strconv.Atoi(fields[0])
+		if err != nil || pid <= 0 || pid == selfPID {
+			continue
+		}
+		cmd := strings.TrimSpace(strings.TrimPrefix(line, fields[0]))
+		cmdLower := strings.ToLower(cmd)
+		if strings.Contains(cmdLower, "ollamaclaw") {
+			// Focus on launch-style invocations that can poll Telegram.
+			if strings.Contains(cmdLower, "telegram run") || strings.Contains(cmdLower, " launch") || strings.HasSuffix(cmdLower, "/ollamaclaw") || strings.HasSuffix(cmdLower, " ./ollamaclaw") || cmdLower == "./ollamaclaw" {
+				out = append(out, pollerCandidate{pid: pid, cmd: cmd})
+			}
+			continue
+		}
+		// Include known external Telegram bot runner patterns for easier diagnosis.
+		if strings.Contains(cmdLower, "telegram") && (strings.Contains(cmdLower, "plugins-official/telegram") || strings.Contains(cmdLower, " bot") || strings.Contains(cmdLower, " getupdates ")) {
+			out = append(out, pollerCandidate{pid: pid, cmd: cmd})
+		}
+	}
+	return out
+}
+
+func (r *Runner) logf(format string, args ...interface{}) {
+	ts := time.Now().UTC().Format(time.RFC3339)
+	line := fmt.Sprintf("[%s] [launch] %s", ts, fmt.Sprintf(format, args...))
+	fmt.Println(line)
+	r.logMu.Lock()
+	defer r.logMu.Unlock()
+	if r.logFile != nil {
+		_, _ = r.logFile.WriteString(line + "\n")
+	}
+}
+
+func (r *Runner) openLogFile() error {
+	path := strings.TrimSpace(r.Cfg.LogPath)
+	if path == "" {
+		return nil
+	}
+	if strings.HasPrefix(path, "~/") {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return err
+		}
+		path = filepath.Join(home, strings.TrimPrefix(path, "~/"))
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	r.logMu.Lock()
+	r.logFile = f
+	r.logMu.Unlock()
+	return nil
+}
+
+func (r *Runner) closeLogFile() {
+	r.logMu.Lock()
+	defer r.logMu.Unlock()
+	if r.logFile != nil {
+		_ = r.logFile.Close()
+		r.logFile = nil
+	}
+}
+
+func previewForLog(s string) string {
+	if strings.TrimSpace(s) == "" {
+		return ""
+	}
+	compact := strings.Join(strings.Fields(strings.TrimSpace(s)), " ")
+	if len(compact) <= maxLogPreview {
+		return compact
+	}
+	return compact[:maxLogPreview-3] + "..."
 }

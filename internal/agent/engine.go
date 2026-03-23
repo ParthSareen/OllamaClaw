@@ -14,17 +14,11 @@ import (
 	"github.com/parth/ollamaclaw/internal/tools"
 )
 
-const baseSystemPrompt = `You are OllamaClaw, a coding agent.
+const systemPrompt = `You are OllamaClaw, a coding agent.
 Use tools when needed. Be concise, accurate, and action-oriented.
-When tool output is long, summarize key findings.`
-
-const cloudSystemAddendum = `Cloud model safety mode is enabled.
-Assume prompts and tool outputs may be processed remotely.
-Minimize sensitive data exposure:
-- Prefer summaries over raw dumps.
-- Share only the smallest snippet needed to complete the task.
-- Never reveal secrets or tokens; redact sensitive values if encountered.
-- For file and web content, avoid returning unrelated private data.`
+When tool output is long, summarize key findings.
+Never start, stop, or relaunch OllamaClaw itself from tools, and never modify launch lock files.
+For self-debugging and telemetry, use read_logs when you need runtime traces.`
 
 type Engine struct {
 	cfg           config.Config
@@ -40,17 +34,29 @@ type HandleResult struct {
 	PromptTokens     int
 	EvalTokens       int
 	Compacted        bool
+	ToolTrace        []ToolTraceEntry
 }
 
-func New(cfg config.Config, store *db.Store, client *ollama.Client, pm *plugin.Manager) *Engine {
+type ToolTraceEntry struct {
+	Name       string
+	ArgsJSON   string
+	ResultJSON string
+	Error      string
+	DurationMs int64
+}
+
+func New(cfg config.Config, store *db.Store, client *ollama.Client, pm *plugin.Manager, cronCtrl tools.CronController) *Engine {
 	builtin := tools.BuiltinTools(tools.BuiltinsConfig{
 		ToolOutputMaxBytes: cfg.ToolOutputMaxBytes,
 		BashTimeoutSec:     cfg.BashTimeoutSeconds,
+		LogPath:            cfg.LogPath,
+		Cron:               cronCtrl,
 	}, client)
 	return &Engine{cfg: cfg, store: store, client: client, pluginManager: pm, builtinTools: builtin}
 }
 
 func (e *Engine) HandleText(ctx context.Context, transport, sessionKey, input string) (HandleResult, error) {
+	ctx = tools.WithSessionInfo(ctx, transport, sessionKey)
 	sess, err := e.store.GetOrCreateActiveSession(ctx, transport, sessionKey, e.cfg.DefaultModel)
 	if err != nil {
 		return HandleResult{}, err
@@ -64,10 +70,13 @@ func (e *Engine) HandleText(ctx context.Context, transport, sessionKey, input st
 		model = e.cfg.DefaultModel
 	}
 
+	thinkEnabled, _ := e.IsSessionThink(ctx, transport, sessionKey)
+
 	var lastReply string
 	var promptTokens int
 	var evalTokens int
 	compacted := false
+	toolTrace := []ToolTraceEntry{}
 
 	for i := 0; i < 12; i++ {
 		combined, err := e.combinedTools(ctx)
@@ -75,11 +84,11 @@ func (e *Engine) HandleText(ctx context.Context, transport, sessionKey, input st
 			return HandleResult{}, err
 		}
 		toolDefs := toOllamaTools(combined)
-		msgList, err := e.activePromptMessages(ctx, sess.ID, model)
+		msgList, err := e.activePromptMessages(ctx, sess.ID)
 		if err != nil {
 			return HandleResult{}, err
 		}
-		resp, err := e.client.Chat(ctx, ollama.ChatRequest{Model: model, Messages: msgList, Tools: toolDefs, Stream: false})
+		resp, err := e.client.Chat(ctx, ollama.ChatRequest{Model: model, Messages: msgList, Tools: toolDefs, Stream: false, Think: thinkEnabled})
 		if err != nil {
 			return HandleResult{}, err
 		}
@@ -109,7 +118,7 @@ func (e *Engine) HandleText(ctx context.Context, transport, sessionKey, input st
 			lastReply = resp.Message.Content
 		}
 
-		justCompacted, err := e.maybeCompact(ctx, sess, model, resp.PromptEvalCount)
+		justCompacted, err := e.maybeCompact(ctx, sess, model, resp.PromptEvalCount, thinkEnabled)
 		if err != nil {
 			return HandleResult{}, err
 		}
@@ -126,6 +135,8 @@ func (e *Engine) HandleText(ctx context.Context, transport, sessionKey, input st
 			name := call.Function.Name
 			args := call.Function.Arguments
 			result := map[string]interface{}{}
+			trace := ToolTraceEntry{Name: name, ArgsJSON: mustJSON(args)}
+			startedAt := time.Now()
 			if t, ok := toolMap[name]; ok {
 				r, err := func() (map[string]interface{}, error) {
 					if t.TimeoutSec <= 0 {
@@ -136,17 +147,24 @@ func (e *Engine) HandleText(ctx context.Context, transport, sessionKey, input st
 					return t.Execute(ctxTool, args)
 				}()
 				if err != nil {
-					result["error"] = err.Error()
+					errMsg := err.Error()
+					result["error"] = errMsg
+					trace.Error = errMsg
 				} else {
 					result = r
 				}
 			} else {
-				result["error"] = fmt.Sprintf("tool %s not found", name)
+				errMsg := fmt.Sprintf("tool %s not found", name)
+				result["error"] = errMsg
+				trace.Error = errMsg
 			}
+			trace.DurationMs = time.Since(startedAt).Milliseconds()
 			payload, _ := json.Marshal(result)
 			if len(payload) > e.cfg.ToolOutputMaxBytes {
 				payload = payload[:e.cfg.ToolOutputMaxBytes]
 			}
+			trace.ResultJSON = truncateForTrace(string(payload), 2000)
+			toolTrace = append(toolTrace, trace)
 			if err := e.store.InsertMessage(ctx, &db.Message{
 				SessionID:    sess.ID,
 				Role:         "tool",
@@ -165,6 +183,7 @@ func (e *Engine) HandleText(ctx context.Context, transport, sessionKey, input st
 		PromptTokens:     promptTokens,
 		EvalTokens:       evalTokens,
 		Compacted:        compacted,
+		ToolTrace:        toolTrace,
 	}, nil
 }
 
@@ -182,6 +201,54 @@ func (e *Engine) SetSessionModel(ctx context.Context, sessionID, model string) e
 
 func (e *Engine) ResetSession(ctx context.Context, transport, sessionKey string) (db.Session, error) {
 	return e.store.ResetSession(ctx, transport, sessionKey, e.cfg.DefaultModel)
+}
+
+func (e *Engine) IsSessionVerbose(ctx context.Context, transport, sessionKey string) (bool, error) {
+	v, ok, err := e.store.GetSetting(ctx, verboseSettingKey(transport, sessionKey))
+	if err != nil {
+		return false, err
+	}
+	if !ok {
+		return false, nil
+	}
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "1", "true", "on", "yes":
+		return true, nil
+	default:
+		return false, nil
+	}
+}
+
+func (e *Engine) SetSessionVerbose(ctx context.Context, transport, sessionKey string, enabled bool) error {
+	val := "0"
+	if enabled {
+		val = "1"
+	}
+	return e.store.SetSetting(ctx, verboseSettingKey(transport, sessionKey), val)
+}
+
+func (e *Engine) IsSessionThink(ctx context.Context, transport, sessionKey string) (bool, error) {
+	v, ok, err := e.store.GetSetting(ctx, thinkSettingKey(transport, sessionKey))
+	if err != nil {
+		return false, err
+	}
+	if !ok {
+		return false, nil
+	}
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "1", "true", "on", "yes":
+		return true, nil
+	default:
+		return false, nil
+	}
+}
+
+func (e *Engine) SetSessionThink(ctx context.Context, transport, sessionKey string, enabled bool) error {
+	val := "0"
+	if enabled {
+		val = "1"
+	}
+	return e.store.SetSetting(ctx, thinkSettingKey(transport, sessionKey), val)
 }
 
 func (e *Engine) combinedTools(ctx context.Context) ([]tools.Tool, error) {
@@ -204,8 +271,8 @@ func (e *Engine) combinedTools(ctx context.Context) ([]tools.Tool, error) {
 	return all, nil
 }
 
-func (e *Engine) activePromptMessages(ctx context.Context, sessionID, model string) ([]ollama.ChatMessage, error) {
-	messages := []ollama.ChatMessage{{Role: "system", Content: systemPromptForModel(model)}}
+func (e *Engine) activePromptMessages(ctx context.Context, sessionID string) ([]ollama.ChatMessage, error) {
+	messages := []ollama.ChatMessage{{Role: "system", Content: systemPrompt}}
 	summary, ok, err := e.store.LatestCompactionSummary(ctx, sessionID)
 	if err != nil {
 		return nil, err
@@ -230,7 +297,7 @@ func (e *Engine) activePromptMessages(ctx context.Context, sessionID, model stri
 	return messages, nil
 }
 
-func (e *Engine) maybeCompact(ctx context.Context, sess db.Session, model string, promptEvalCount int) (bool, error) {
+func (e *Engine) maybeCompact(ctx context.Context, sess db.Session, model string, promptEvalCount int, thinkEnabled bool) (bool, error) {
 	thresholdTokens := int(float64(e.cfg.ContextWindowTokens) * e.cfg.CompactionThreshold)
 	if promptEvalCount < thresholdTokens {
 		return false, nil
@@ -276,10 +343,10 @@ func (e *Engine) maybeCompact(ctx context.Context, sess db.Session, model string
 	}
 	b, _ := json.Marshal(payload)
 	summaryPrompt := []ollama.ChatMessage{
-		{Role: "system", Content: compactionPromptForModel(model)},
+		{Role: "system", Content: "Summarize the archived conversation for future continuation. Include decisions, constraints, file/task state, and unresolved items."},
 		{Role: "user", Content: "Previous summary:\n" + latestSummary + "\n\nMessages to summarize:\n" + string(b)},
 	}
-	summaryResp, err := e.client.Chat(ctx, ollama.ChatRequest{Model: model, Messages: summaryPrompt, Stream: false})
+	summaryResp, err := e.client.Chat(ctx, ollama.ChatRequest{Model: model, Messages: summaryPrompt, Stream: false, Think: thinkEnabled})
 	if err != nil {
 		return false, err
 	}
@@ -328,22 +395,20 @@ func mustJSON(v interface{}) string {
 	return string(b)
 }
 
-func systemPromptForModel(model string) string {
-	if usesCloudModel(model) {
-		return baseSystemPrompt + "\n\n" + cloudSystemAddendum
-	}
-	return baseSystemPrompt
+func verboseSettingKey(transport, sessionKey string) string {
+	return fmt.Sprintf("session_verbose:%s:%s", transport, sessionKey)
 }
 
-func compactionPromptForModel(model string) string {
-	prompt := "Summarize the archived conversation for future continuation. Include decisions, constraints, file/task state, and unresolved items."
-	if usesCloudModel(model) {
-		prompt += " Do not include secrets, tokens, or unnecessary private content."
-	}
-	return prompt
+func thinkSettingKey(transport, sessionKey string) string {
+	return fmt.Sprintf("session_think:%s:%s", transport, sessionKey)
 }
 
-func usesCloudModel(model string) bool {
-	m := strings.ToLower(strings.TrimSpace(model))
-	return strings.HasSuffix(m, ":cloud") || strings.HasSuffix(m, "-cloud") || strings.Contains(m, ":cloud-")
+func truncateForTrace(v string, max int) string {
+	if max <= 0 || len(v) <= max {
+		return v
+	}
+	if max <= 3 {
+		return v[:max]
+	}
+	return v[:max-3] + "..."
 }

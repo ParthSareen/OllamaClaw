@@ -13,6 +13,7 @@ const (
 	defaultConfigDirName = ".ollamaclaw"
 	defaultConfigFile    = "config.json"
 	defaultStateDBFile   = "state.db"
+	defaultLogFile       = "ollamaclaw.log"
 	defaultLockFile      = "plugins.lock.json"
 )
 
@@ -21,6 +22,7 @@ type Config struct {
 	OllamaHost           string         `json:"ollama_host"`
 	DefaultModel         string         `json:"default_model"`
 	DBPath               string         `json:"db_path"`
+	LogPath              string         `json:"log_path"`
 	CompactionThreshold  float64        `json:"compaction_threshold"`
 	KeepRecentTurns      int            `json:"keep_recent_turns"`
 	ContextWindowTokens  int            `json:"context_window_tokens"`
@@ -31,7 +33,9 @@ type Config struct {
 }
 
 type TelegramConfig struct {
-	BotToken string `json:"bot_token"`
+	BotToken    string `json:"bot_token"`
+	OwnerChatID int64  `json:"owner_chat_id"`
+	OwnerUserID int64  `json:"owner_user_id"`
 }
 
 func Default() Config {
@@ -41,6 +45,7 @@ func Default() Config {
 		OllamaHost:           "http://localhost:11434",
 		DefaultModel:         "kimi-k2.5:cloud",
 		DBPath:               filepath.Join(base, defaultStateDBFile),
+		LogPath:              filepath.Join(base, defaultLogFile),
 		CompactionThreshold:  0.8,
 		KeepRecentTurns:      8,
 		ContextWindowTokens:  128000,
@@ -116,6 +121,9 @@ func sanitize(cfg *Config) {
 	if cfg.DBPath == "" {
 		cfg.DBPath = defaults.DBPath
 	}
+	if cfg.LogPath == "" {
+		cfg.LogPath = defaults.LogPath
+	}
 	if cfg.CompactionThreshold <= 0 || cfg.CompactionThreshold > 1 {
 		cfg.CompactionThreshold = defaults.CompactionThreshold
 	}
@@ -164,6 +172,10 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, fmt.Errorf("expand db path: %w", err)
 	}
+	cfg.LogPath, err = expandPath(cfg.LogPath)
+	if err != nil {
+		return Config{}, fmt.Errorf("expand log path: %w", err)
+	}
 	return cfg, nil
 }
 
@@ -173,6 +185,7 @@ func Save(cfg Config) error {
 	}
 	sanitize(&cfg)
 	cfg.DBPath, _ = expandPath(cfg.DBPath)
+	cfg.LogPath, _ = expandPath(cfg.LogPath)
 	path, err := ConfigPath()
 	if err != nil {
 		return err

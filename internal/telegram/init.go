@@ -27,10 +27,13 @@ func Init(ctx context.Context, token string) error {
 		return fmt.Errorf("clear webhook failed: %w", err)
 	}
 	commands := []map[string]string{
+		{"command": "start", "description": "Show onboarding and usage"},
 		{"command": "help", "description": "Show usage and examples"},
 		{"command": "reset", "description": "Reset chat session"},
 		{"command": "model", "description": "Show/set active model"},
 		{"command": "tools", "description": "List available tools"},
+		{"command": "verbose", "description": "Show or set tool-call tracing"},
+		{"command": "think", "description": "Show or set thinking mode"},
 		{"command": "status", "description": "Show status and token usage"},
 	}
 	if _, err := call(token, "setMyCommands", map[string]interface{}{"commands": commands}); err != nil {

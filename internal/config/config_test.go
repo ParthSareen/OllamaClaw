@@ -37,6 +37,7 @@ func TestSaveExpandsDBPath(t *testing.T) {
 	t.Setenv("HOME", home)
 	cfg := Default()
 	cfg.DBPath = "~/custom/state.db"
+	cfg.LogPath = "~/custom/ollamaclaw.log"
 	if err := Save(cfg); err != nil {
 		t.Fatalf("Save() error: %v", err)
 	}
@@ -47,5 +48,9 @@ func TestSaveExpandsDBPath(t *testing.T) {
 	expected := filepath.Join(home, "custom", "state.db")
 	if loaded.DBPath != expected {
 		t.Fatalf("expected %s, got %s", expected, loaded.DBPath)
+	}
+	expectedLog := filepath.Join(home, "custom", "ollamaclaw.log")
+	if loaded.LogPath != expectedLog {
+		t.Fatalf("expected %s, got %s", expectedLog, loaded.LogPath)
 	}
 }

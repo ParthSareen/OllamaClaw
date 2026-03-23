@@ -1,6 +1,7 @@
 package tools
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -26,13 +27,61 @@ type Tool struct {
 	TimeoutSec  int
 }
 
+type CronJobSpec struct {
+	ID         string
+	Schedule   string
+	Prompt     string
+	Transport  string
+	SessionKey string
+}
+
+type CronJobInfo struct {
+	ID         string `json:"id"`
+	Schedule   string `json:"schedule"`
+	Prompt     string `json:"prompt"`
+	Transport  string `json:"transport"`
+	SessionKey string `json:"session_key"`
+	Active     bool   `json:"active"`
+	LastRunAt  string `json:"last_run_at,omitempty"`
+	NextRunAt  string `json:"next_run_at,omitempty"`
+	LastError  string `json:"last_error,omitempty"`
+}
+
+type CronController interface {
+	AddJob(ctx context.Context, spec CronJobSpec) (CronJobInfo, error)
+	ListJobs(ctx context.Context, activeOnly bool) ([]CronJobInfo, error)
+	RemoveJob(ctx context.Context, id string) error
+}
+
 type BuiltinsConfig struct {
 	ToolOutputMaxBytes int
 	BashTimeoutSec     int
+	LogPath            string
+	Cron               CronController
+}
+
+type sessionContextKey struct{}
+
+type SessionInfo struct {
+	Transport  string
+	SessionKey string
+}
+
+func WithSessionInfo(ctx context.Context, transport, sessionKey string) context.Context {
+	return context.WithValue(ctx, sessionContextKey{}, SessionInfo{Transport: transport, SessionKey: sessionKey})
+}
+
+func SessionInfoFromContext(ctx context.Context) (SessionInfo, bool) {
+	v := ctx.Value(sessionContextKey{})
+	if v == nil {
+		return SessionInfo{}, false
+	}
+	info, ok := v.(SessionInfo)
+	return info, ok
 }
 
 func BuiltinTools(cfg BuiltinsConfig, client *ollama.Client) []Tool {
-	return []Tool{
+	out := []Tool{
 		{
 			Name:        "bash",
 			Description: "Execute a shell command and return exit code, stdout, and stderr",
@@ -48,6 +97,9 @@ func BuiltinTools(cfg BuiltinsConfig, client *ollama.Client) []Tool {
 				cmdVal, ok := args["command"].(string)
 				if !ok || strings.TrimSpace(cmdVal) == "" {
 					return nil, errors.New("command is required")
+				}
+				if err := guardTelegramBashCommand(ctx, cmdVal); err != nil {
+					return nil, err
 				}
 				timeout := cfg.BashTimeoutSec
 				if v, ok := asInt(args["timeout_seconds"]); ok && v > 0 && v <= 600 {
@@ -67,19 +119,19 @@ func BuiltinTools(cfg BuiltinsConfig, client *ollama.Client) []Tool {
 						exitCode = ee.ExitCode()
 						stderr = string(ee.Stderr)
 					} else {
-						return map[string]interface{}{"exit_code": -1, "stdout": "", "stderr": err.Error()}, nil
+						return map[string]any{"exit_code": -1, "stdout": "", "stderr": err.Error()}, nil
 					}
 				}
-				out := map[string]interface{}{
+				res := map[string]any{
 					"exit_code": exitCode,
 					"stdout":    truncate(string(stdout), cfg.ToolOutputMaxBytes),
 					"stderr":    truncate(stderr, cfg.ToolOutputMaxBytes),
 				}
 				if ctxTimeout.Err() == context.DeadlineExceeded {
-					out["stderr"] = truncate(out["stderr"].(string)+"\ncommand timed out", cfg.ToolOutputMaxBytes)
-					out["exit_code"] = -1
+					res["stderr"] = truncate(res["stderr"].(string)+"\ncommand timed out", cfg.ToolOutputMaxBytes)
+					res["exit_code"] = -1
 				}
-				return out, nil
+				return res, nil
 			},
 			Source: "builtin",
 		},
@@ -104,7 +156,7 @@ func BuiltinTools(cfg BuiltinsConfig, client *ollama.Client) []Tool {
 				if err != nil {
 					return nil, err
 				}
-				return map[string]interface{}{"path": p, "content": truncate(string(b), cfg.ToolOutputMaxBytes)}, nil
+				return map[string]any{"path": p, "content": truncate(string(b), cfg.ToolOutputMaxBytes)}, nil
 			},
 			Source: "builtin",
 		},
@@ -143,7 +195,78 @@ func BuiltinTools(cfg BuiltinsConfig, client *ollama.Client) []Tool {
 				if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
 					return nil, err
 				}
-				return map[string]interface{}{"path": p, "bytes_written": len(content)}, nil
+				return map[string]any{"path": p, "bytes_written": len(content)}, nil
+			},
+			Source: "builtin",
+		},
+		{
+			Name:        "read_logs",
+			Description: "Read OllamaClaw runtime logs for self-debugging",
+			Schema: mustSchema(`{
+  "type": "object",
+  "properties": {
+    "lines": {"type": "integer", "minimum": 1, "maximum": 5000, "description": "How many recent matching lines to return"},
+    "contains": {"type": "string", "description": "Optional substring filter"}
+  }
+}`),
+			Execute: func(ctx context.Context, args map[string]interface{}) (map[string]interface{}, error) {
+				_ = ctx
+				logPath := strings.TrimSpace(cfg.LogPath)
+				if logPath == "" {
+					return nil, errors.New("log path is not configured")
+				}
+				lines := 200
+				if v, ok := asInt(args["lines"]); ok && v > 0 {
+					if v > 5000 {
+						v = 5000
+					}
+					lines = v
+				}
+				contains := ""
+				if v, ok := args["contains"].(string); ok {
+					contains = strings.TrimSpace(v)
+				}
+
+				f, err := os.Open(logPath)
+				if errors.Is(err, os.ErrNotExist) {
+					return map[string]interface{}{
+						"path":           logPath,
+						"total_lines":    0,
+						"selected_lines": 0,
+						"content":        "",
+					}, nil
+				}
+				if err != nil {
+					return nil, err
+				}
+				defer f.Close()
+
+				all := make([]string, 0, 512)
+				scanner := bufio.NewScanner(f)
+				scanner.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
+				for scanner.Scan() {
+					line := scanner.Text()
+					if contains != "" && !strings.Contains(line, contains) {
+						continue
+					}
+					all = append(all, line)
+				}
+				if err := scanner.Err(); err != nil {
+					return nil, err
+				}
+
+				start := 0
+				if len(all) > lines {
+					start = len(all) - lines
+				}
+				selected := all[start:]
+				content := strings.Join(selected, "\n")
+				return map[string]interface{}{
+					"path":           logPath,
+					"total_lines":    len(all),
+					"selected_lines": len(selected),
+					"content":        truncate(content, cfg.ToolOutputMaxBytes),
+				}, nil
 			},
 			Source: "builtin",
 		},
@@ -175,7 +298,7 @@ func BuiltinTools(cfg BuiltinsConfig, client *ollama.Client) []Tool {
 				for _, r := range res.Results {
 					items = append(items, map[string]string{"title": r.Title, "url": r.URL, "content": truncate(r.Content, cfg.ToolOutputMaxBytes)})
 				}
-				return map[string]interface{}{"results": items}, nil
+				return map[string]any{"results": items}, nil
 			},
 			Source: "builtin",
 		},
@@ -198,11 +321,132 @@ func BuiltinTools(cfg BuiltinsConfig, client *ollama.Client) []Tool {
 				if err != nil {
 					return nil, err
 				}
+				return map[string]any{"title": res.Title, "content": truncate(res.Content, cfg.ToolOutputMaxBytes), "links": res.Links}, nil
+			},
+			Source: "builtin",
+		},
+	}
+
+	if cfg.Cron != nil {
+		out = append(out, cronTools(cfg.Cron)...)
+	}
+	return out
+}
+
+func cronTools(ctrl CronController) []Tool {
+	return []Tool{
+		{
+			Name:        "cron_add",
+			Description: "Create or update a cron job that periodically sends a prompt to OllamaClaw",
+			Schema: mustSchema(`{
+  "type": "object",
+  "properties": {
+    "id": {"type": "string"},
+    "schedule": {"type": "string", "description": "Cron schedule, e.g. '0 * * * *'"},
+    "prompt": {"type": "string", "description": "Prompt to run when the job triggers"},
+    "transport": {"type": "string", "description": "Target transport, defaults to current session transport"},
+    "session_key": {"type": "string", "description": "Target session key, defaults to current session key"}
+  },
+  "required": ["schedule", "prompt"]
+}`),
+			Execute: func(ctx context.Context, args map[string]interface{}) (map[string]interface{}, error) {
+				schedule, ok := args["schedule"].(string)
+				if !ok || strings.TrimSpace(schedule) == "" {
+					return nil, errors.New("schedule is required")
+				}
+				prompt, ok := args["prompt"].(string)
+				if !ok || strings.TrimSpace(prompt) == "" {
+					return nil, errors.New("prompt is required")
+				}
+				spec := CronJobSpec{Schedule: schedule, Prompt: prompt}
+				if v, ok := args["id"].(string); ok {
+					spec.ID = v
+				}
+				if v, ok := args["transport"].(string); ok {
+					spec.Transport = v
+				}
+				if v, ok := args["session_key"].(string); ok {
+					spec.SessionKey = v
+				}
+				if info, ok := SessionInfoFromContext(ctx); ok {
+					if strings.TrimSpace(spec.Transport) == "" {
+						spec.Transport = info.Transport
+					}
+					if strings.TrimSpace(spec.SessionKey) == "" {
+						spec.SessionKey = info.SessionKey
+					}
+				}
+				job, err := ctrl.AddJob(ctx, spec)
+				if err != nil {
+					return nil, err
+				}
 				return map[string]interface{}{
-					"title":   res.Title,
-					"content": truncate(res.Content, cfg.ToolOutputMaxBytes),
-					"links":   res.Links,
+					"id":          job.ID,
+					"schedule":    job.Schedule,
+					"prompt":      job.Prompt,
+					"transport":   job.Transport,
+					"session_key": job.SessionKey,
+					"active":      job.Active,
+					"next_run_at": job.NextRunAt,
 				}, nil
+			},
+			Source: "builtin",
+		},
+		{
+			Name:        "cron_list",
+			Description: "List configured cron jobs",
+			Schema: mustSchema(`{
+  "type": "object",
+  "properties": {
+    "active_only": {"type": "boolean", "default": true}
+  }
+}`),
+			Execute: func(ctx context.Context, args map[string]interface{}) (map[string]interface{}, error) {
+				activeOnly := true
+				if v, ok := args["active_only"].(bool); ok {
+					activeOnly = v
+				}
+				jobs, err := ctrl.ListJobs(ctx, activeOnly)
+				if err != nil {
+					return nil, err
+				}
+				items := make([]map[string]interface{}, 0, len(jobs))
+				for _, j := range jobs {
+					items = append(items, map[string]interface{}{
+						"id":          j.ID,
+						"schedule":    j.Schedule,
+						"prompt":      j.Prompt,
+						"transport":   j.Transport,
+						"session_key": j.SessionKey,
+						"active":      j.Active,
+						"last_run_at": j.LastRunAt,
+						"next_run_at": j.NextRunAt,
+						"last_error":  j.LastError,
+					})
+				}
+				return map[string]interface{}{"jobs": items}, nil
+			},
+			Source: "builtin",
+		},
+		{
+			Name:        "cron_remove",
+			Description: "Remove a cron job by id",
+			Schema: mustSchema(`{
+  "type": "object",
+  "properties": {
+    "id": {"type": "string"}
+  },
+  "required": ["id"]
+}`),
+			Execute: func(ctx context.Context, args map[string]interface{}) (map[string]interface{}, error) {
+				id, ok := args["id"].(string)
+				if !ok || strings.TrimSpace(id) == "" {
+					return nil, errors.New("id is required")
+				}
+				if err := ctrl.RemoveJob(ctx, id); err != nil {
+					return nil, err
+				}
+				return map[string]interface{}{"removed": true, "id": id}, nil
 			},
 			Source: "builtin",
 		},
@@ -256,6 +500,38 @@ func expandPath(p string) string {
 		}
 	}
 	return p
+}
+
+func guardTelegramBashCommand(ctx context.Context, cmd string) error {
+	info, ok := SessionInfoFromContext(ctx)
+	if !ok || !strings.EqualFold(strings.TrimSpace(info.Transport), "telegram") {
+		return nil
+	}
+	reason := disallowedTelegramLifecycleReason(cmd)
+	if reason == "" {
+		return nil
+	}
+	return fmt.Errorf("command blocked in telegram bash: %s", reason)
+}
+
+func disallowedTelegramLifecycleReason(cmd string) string {
+	norm := strings.ToLower(strings.Join(strings.Fields(cmd), " "))
+	if norm == "" {
+		return ""
+	}
+	if strings.Contains(norm, "pkill") && strings.Contains(norm, "ollamaclaw") {
+		return "process-kill commands targeting ollamaclaw are not allowed in telegram sessions"
+	}
+	if strings.Contains(norm, "killall") && strings.Contains(norm, "ollamaclaw") {
+		return "process-kill commands targeting ollamaclaw are not allowed in telegram sessions"
+	}
+	if (strings.Contains(norm, "rm ") || strings.Contains(norm, "unlink ")) && strings.Contains(norm, "launch.lock") {
+		return "modifying launch lock files is not allowed in telegram sessions"
+	}
+	if strings.Contains(norm, "ollamaclaw telegram run") || strings.Contains(norm, "ollamaclaw launch") || strings.Contains(norm, "./ollamaclaw") {
+		return "starting nested ollamaclaw launch/poller processes is not allowed in telegram sessions"
+	}
+	return ""
 }
 
 func mustSchema(s string) json.RawMessage {
