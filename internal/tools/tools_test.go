@@ -92,3 +92,49 @@ func TestGuardTelegramBashCommand(t *testing.T) {
 		t.Fatalf("expected repl context to allow command, got %v", err)
 	}
 }
+
+func TestEffectiveBashTimeoutSec(t *testing.T) {
+	tests := []struct {
+		name       string
+		configured int
+		args       map[string]interface{}
+		want       int
+	}{
+		{name: "default when configured zero", configured: 0, args: map[string]interface{}{}, want: 120},
+		{name: "clamp configured high", configured: 900, args: map[string]interface{}{}, want: 120},
+		{name: "use arg timeout", configured: 60, args: map[string]interface{}{"timeout_seconds": float64(30)}, want: 30},
+		{name: "clamp arg timeout high", configured: 60, args: map[string]interface{}{"timeout_seconds": float64(999)}, want: 120},
+		{name: "arg timeout ignored when non-positive", configured: 45, args: map[string]interface{}{"timeout_seconds": float64(0)}, want: 45},
+	}
+	for _, tc := range tests {
+		if got := effectiveBashTimeoutSec(tc.configured, tc.args); got != tc.want {
+			t.Fatalf("%s: effectiveBashTimeoutSec(%d, %+v)=%d want=%d", tc.name, tc.configured, tc.args, got, tc.want)
+		}
+	}
+}
+
+func TestBashToolTimeoutMessageIncludesDuration(t *testing.T) {
+	toolMap := ToolMap(BuiltinTools(BuiltinsConfig{
+		ToolOutputMaxBytes: 4096,
+		BashTimeoutSec:     10,
+	}, ollama.NewClient("http://localhost:11434")))
+	bashTool, ok := toolMap["bash"]
+	if !ok {
+		t.Fatalf("bash tool not found")
+	}
+
+	res, err := bashTool.Execute(context.Background(), map[string]interface{}{
+		"command":         "sleep 2",
+		"timeout_seconds": float64(1),
+	})
+	if err != nil {
+		t.Fatalf("bash execute error: %v", err)
+	}
+	if got, ok := res["exit_code"].(int); !ok || got != -1 {
+		t.Fatalf("expected exit_code -1 on timeout, got %#v", res["exit_code"])
+	}
+	stderr, _ := res["stderr"].(string)
+	if !strings.Contains(stderr, "command timed out after 1s") {
+		t.Fatalf("expected timeout duration in stderr, got %q", stderr)
+	}
+}

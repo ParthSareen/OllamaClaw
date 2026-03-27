@@ -60,6 +60,11 @@ type BuiltinsConfig struct {
 	Cron               CronController
 }
 
+const (
+	defaultBashTimeoutSec = 120
+	maxBashTimeoutSec     = 120
+)
+
 type sessionContextKey struct{}
 
 type SessionInfo struct {
@@ -89,7 +94,7 @@ func BuiltinTools(cfg BuiltinsConfig, client *ollama.Client) []Tool {
   "type": "object",
   "properties": {
     "command": {"type": "string", "description": "Shell command to execute"},
-    "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 600}
+    "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 120}
   },
   "required": ["command"]
 }`),
@@ -101,13 +106,7 @@ func BuiltinTools(cfg BuiltinsConfig, client *ollama.Client) []Tool {
 				if err := guardTelegramBashCommand(ctx, cmdVal); err != nil {
 					return nil, err
 				}
-				timeout := cfg.BashTimeoutSec
-				if v, ok := asInt(args["timeout_seconds"]); ok && v > 0 && v <= 600 {
-					timeout = v
-				}
-				if timeout <= 0 {
-					timeout = 120
-				}
+				timeout := effectiveBashTimeoutSec(cfg.BashTimeoutSec, args)
 				ctxTimeout, cancel := context.WithTimeout(ctx, time.Duration(timeout)*time.Second)
 				defer cancel()
 				cmd := exec.CommandContext(ctxTimeout, "/bin/bash", "-lc", cmdVal)
@@ -128,7 +127,7 @@ func BuiltinTools(cfg BuiltinsConfig, client *ollama.Client) []Tool {
 					"stderr":    truncate(stderr, cfg.ToolOutputMaxBytes),
 				}
 				if ctxTimeout.Err() == context.DeadlineExceeded {
-					res["stderr"] = truncate(res["stderr"].(string)+"\ncommand timed out", cfg.ToolOutputMaxBytes)
+					res["stderr"] = truncate(res["stderr"].(string)+fmt.Sprintf("\ncommand timed out after %ds", timeout), cfg.ToolOutputMaxBytes)
 					res["exit_code"] = -1
 				}
 				return res, nil
@@ -476,6 +475,24 @@ func asInt(v interface{}) (int, bool) {
 	default:
 		return 0, false
 	}
+}
+
+func effectiveBashTimeoutSec(configured int, args map[string]interface{}) int {
+	timeout := configured
+	if v, ok := asInt(args["timeout_seconds"]); ok && v > 0 {
+		timeout = v
+	}
+	return clampBashTimeoutSec(timeout)
+}
+
+func clampBashTimeoutSec(timeout int) int {
+	if timeout <= 0 {
+		return defaultBashTimeoutSec
+	}
+	if timeout > maxBashTimeoutSec {
+		return maxBashTimeoutSec
+	}
+	return timeout
 }
 
 func truncate(s string, max int) string {
