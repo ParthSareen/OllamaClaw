@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/parth/ollamaclaw/internal/agent"
+	"github.com/ParthSareen/OllamaClaw/internal/agent"
 )
 
 func TestParseOnOff(t *testing.T) {

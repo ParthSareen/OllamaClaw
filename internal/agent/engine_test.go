@@ -10,10 +10,10 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/parth/ollamaclaw/internal/config"
-	"github.com/parth/ollamaclaw/internal/db"
-	"github.com/parth/ollamaclaw/internal/ollama"
-	"github.com/parth/ollamaclaw/internal/plugin"
+	"github.com/ParthSareen/OllamaClaw/internal/config"
+	"github.com/ParthSareen/OllamaClaw/internal/db"
+	"github.com/ParthSareen/OllamaClaw/internal/ollama"
+	"github.com/ParthSareen/OllamaClaw/internal/plugin"
 )
 
 func TestHandleTextWithReadFileToolTrace(t *testing.T) {
@@ -82,7 +82,12 @@ func TestHandleTextWithReadFileToolTrace(t *testing.T) {
 	engine, store := newTestEngine(t, srv.URL)
 	defer store.Close()
 
-	res, err := engine.HandleText(ctx, "repl", "default", "read that file")
+	events := make([]ToolEvent, 0, 2)
+	res, err := engine.HandleTextWithOptions(ctx, "repl", "default", "read that file", HandleOptions{
+		OnToolEvent: func(ev ToolEvent) {
+			events = append(events, ev)
+		},
+	})
 	if err != nil {
 		t.Fatalf("HandleText error: %v", err)
 	}
@@ -101,6 +106,18 @@ func TestHandleTextWithReadFileToolTrace(t *testing.T) {
 	}
 	if !strings.Contains(trace.ResultJSON, "hello from file") {
 		t.Fatalf("expected tool result to include file content, got %q", trace.ResultJSON)
+	}
+	if len(events) != 2 {
+		t.Fatalf("expected 2 tool events, got %d", len(events))
+	}
+	if events[0].Phase != ToolEventStart || events[0].Name != "read_file" {
+		t.Fatalf("unexpected first event: %+v", events[0])
+	}
+	if events[1].Phase != ToolEventFinish || events[1].Name != "read_file" {
+		t.Fatalf("unexpected second event: %+v", events[1])
+	}
+	if strings.TrimSpace(events[1].ResultJSON) == "" {
+		t.Fatalf("expected finish event to include result payload")
 	}
 	if callCount != 2 {
 		t.Fatalf("expected 2 chat calls, got %d", callCount)
@@ -165,6 +182,61 @@ func TestHandleTextUnknownToolTraceError(t *testing.T) {
 	}
 }
 
+func TestHandleTextDoesNotPromoteToolStepContentToFinal(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	ctx := context.Background()
+	filePath := filepath.Join(t.TempDir(), "sample.txt")
+	if err := os.WriteFile(filePath, []byte("hello"), 0o644); err != nil {
+		t.Fatalf("write temp file: %v", err)
+	}
+	callCount := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		var resp ollama.ChatResponse
+		if callCount == 1 {
+			resp = ollama.ChatResponse{
+				Message: ollama.ChatMessage{
+					Role:    "assistant",
+					Content: "internal reasoning preamble that should not be final output",
+					ToolCalls: []ollama.ToolCall{
+						{
+							Function: ollama.ToolCallFunction{
+								Name:      "read_file",
+								Arguments: map[string]interface{}{"path": filePath},
+							},
+						},
+					},
+				},
+				PromptEvalCount: 14,
+				EvalCount:       2,
+			}
+		} else {
+			resp = ollama.ChatResponse{
+				Message:         ollama.ChatMessage{Role: "assistant", Content: ""},
+				PromptEvalCount: 16,
+				EvalCount:       2,
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer srv.Close()
+
+	engine, store := newTestEngine(t, srv.URL)
+	defer store.Close()
+
+	res, err := engine.HandleText(ctx, "repl", "default", "read that file")
+	if err != nil {
+		t.Fatalf("HandleText error: %v", err)
+	}
+	if strings.TrimSpace(res.AssistantContent) != "" {
+		t.Fatalf("expected empty final assistant content, got %q", res.AssistantContent)
+	}
+	if len(res.ToolTrace) != 1 {
+		t.Fatalf("expected one tool trace entry, got %d", len(res.ToolTrace))
+	}
+}
+
 func TestSessionVerboseRoundTrip(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	ctx := context.Background()
@@ -199,6 +271,43 @@ func TestSessionVerboseRoundTrip(t *testing.T) {
 	}
 	if enabled {
 		t.Fatalf("expected verbose=false after unsetting")
+	}
+}
+
+func TestSessionShowToolsRoundTrip(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	ctx := context.Background()
+	engine, store := newTestEngine(t, "http://127.0.0.1:65535")
+	defer store.Close()
+
+	enabled, err := engine.IsSessionShowTools(ctx, "telegram", "123")
+	if err != nil {
+		t.Fatalf("IsSessionShowTools error: %v", err)
+	}
+	if enabled {
+		t.Fatalf("expected default show_tools=false")
+	}
+
+	if err := engine.SetSessionShowTools(ctx, "telegram", "123", true); err != nil {
+		t.Fatalf("SetSessionShowTools(true) error: %v", err)
+	}
+	enabled, err = engine.IsSessionShowTools(ctx, "telegram", "123")
+	if err != nil {
+		t.Fatalf("IsSessionShowTools error: %v", err)
+	}
+	if !enabled {
+		t.Fatalf("expected show_tools=true after setting")
+	}
+
+	if err := engine.SetSessionShowTools(ctx, "telegram", "123", false); err != nil {
+		t.Fatalf("SetSessionShowTools(false) error: %v", err)
+	}
+	enabled, err = engine.IsSessionShowTools(ctx, "telegram", "123")
+	if err != nil {
+		t.Fatalf("IsSessionShowTools error: %v", err)
+	}
+	if enabled {
+		t.Fatalf("expected show_tools=false after unsetting")
 	}
 }
 

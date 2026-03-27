@@ -32,6 +32,7 @@ func Init(ctx context.Context, token string) error {
 		{"command": "reset", "description": "Reset chat session"},
 		{"command": "model", "description": "Show/set active model"},
 		{"command": "tools", "description": "List available tools"},
+		{"command": "show", "description": "Show/toggle tools or thinking"},
 		{"command": "verbose", "description": "Show or set tool-call tracing"},
 		{"command": "think", "description": "Show or set thinking mode"},
 		{"command": "status", "description": "Show status and token usage"},

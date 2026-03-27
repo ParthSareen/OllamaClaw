@@ -7,11 +7,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/parth/ollamaclaw/internal/config"
-	"github.com/parth/ollamaclaw/internal/db"
-	"github.com/parth/ollamaclaw/internal/ollama"
-	"github.com/parth/ollamaclaw/internal/plugin"
-	"github.com/parth/ollamaclaw/internal/tools"
+	"github.com/ParthSareen/OllamaClaw/internal/config"
+	"github.com/ParthSareen/OllamaClaw/internal/db"
+	"github.com/ParthSareen/OllamaClaw/internal/ollama"
+	"github.com/ParthSareen/OllamaClaw/internal/plugin"
+	"github.com/ParthSareen/OllamaClaw/internal/tools"
 )
 
 const systemPrompt = `You are OllamaClaw, a coding agent.
@@ -38,6 +38,27 @@ type HandleResult struct {
 	ToolTrace        []ToolTraceEntry
 }
 
+type HandleOptions struct {
+	OnToolEvent func(ToolEvent)
+}
+
+type ToolEventPhase string
+
+const (
+	ToolEventStart  ToolEventPhase = "start"
+	ToolEventFinish ToolEventPhase = "finish"
+)
+
+type ToolEvent struct {
+	Phase      ToolEventPhase
+	Index      int
+	Name       string
+	ArgsJSON   string
+	ResultJSON string
+	Error      string
+	DurationMs int64
+}
+
 type ToolTraceEntry struct {
 	Name       string
 	ArgsJSON   string
@@ -57,6 +78,10 @@ func New(cfg config.Config, store *db.Store, client *ollama.Client, pm *plugin.M
 }
 
 func (e *Engine) HandleText(ctx context.Context, transport, sessionKey, input string) (HandleResult, error) {
+	return e.HandleTextWithOptions(ctx, transport, sessionKey, input, HandleOptions{})
+}
+
+func (e *Engine) HandleTextWithOptions(ctx context.Context, transport, sessionKey, input string, opts HandleOptions) (HandleResult, error) {
 	ctx = tools.WithSessionInfo(ctx, transport, sessionKey)
 	sess, err := e.store.GetOrCreateActiveSession(ctx, transport, sessionKey, e.cfg.DefaultModel)
 	if err != nil {
@@ -78,8 +103,12 @@ func (e *Engine) HandleText(ctx context.Context, transport, sessionKey, input st
 	var evalTokens int
 	compacted := false
 	toolTrace := []ToolTraceEntry{}
+	toolCallIndex := 0
 
 	for i := 0; i < 12; i++ {
+		if err := ctx.Err(); err != nil {
+			return HandleResult{}, err
+		}
 		combined, err := e.combinedTools(ctx)
 		if err != nil {
 			return HandleResult{}, err
@@ -91,6 +120,9 @@ func (e *Engine) HandleText(ctx context.Context, transport, sessionKey, input st
 		}
 		resp, err := e.client.Chat(ctx, ollama.ChatRequest{Model: model, Messages: msgList, Tools: toolDefs, Stream: false, Think: thinkEnabled})
 		if err != nil {
+			if cerr := ctx.Err(); cerr != nil {
+				return HandleResult{}, cerr
+			}
 			return HandleResult{}, err
 		}
 		promptTokens = resp.PromptEvalCount
@@ -115,7 +147,7 @@ func (e *Engine) HandleText(ctx context.Context, transport, sessionKey, input st
 			return HandleResult{}, err
 		}
 
-		if strings.TrimSpace(resp.Message.Content) != "" {
+		if len(resp.Message.ToolCalls) == 0 && strings.TrimSpace(resp.Message.Content) != "" {
 			lastReply = resp.Message.Content
 		}
 
@@ -133,10 +165,20 @@ func (e *Engine) HandleText(ctx context.Context, transport, sessionKey, input st
 
 		toolMap := tools.ToolMap(combined)
 		for _, call := range resp.Message.ToolCalls {
+			if err := ctx.Err(); err != nil {
+				return HandleResult{}, err
+			}
+			toolCallIndex++
 			name := call.Function.Name
 			args := call.Function.Arguments
 			result := map[string]interface{}{}
 			trace := ToolTraceEntry{Name: name, ArgsJSON: mustJSON(args)}
+			e.emitToolEvent(opts.OnToolEvent, ToolEvent{
+				Phase:    ToolEventStart,
+				Index:    toolCallIndex,
+				Name:     name,
+				ArgsJSON: trace.ArgsJSON,
+			})
 			startedAt := time.Now()
 			if t, ok := toolMap[name]; ok {
 				r, err := func() (map[string]interface{}, error) {
@@ -148,6 +190,19 @@ func (e *Engine) HandleText(ctx context.Context, transport, sessionKey, input st
 					return t.Execute(ctxTool, args)
 				}()
 				if err != nil {
+					if cerr := ctx.Err(); cerr != nil {
+						trace.DurationMs = time.Since(startedAt).Milliseconds()
+						trace.Error = cerr.Error()
+						e.emitToolEvent(opts.OnToolEvent, ToolEvent{
+							Phase:      ToolEventFinish,
+							Index:      toolCallIndex,
+							Name:       name,
+							ArgsJSON:   trace.ArgsJSON,
+							Error:      trace.Error,
+							DurationMs: trace.DurationMs,
+						})
+						return HandleResult{}, cerr
+					}
 					errMsg := err.Error()
 					result["error"] = errMsg
 					trace.Error = errMsg
@@ -165,6 +220,15 @@ func (e *Engine) HandleText(ctx context.Context, transport, sessionKey, input st
 				payload = payload[:e.cfg.ToolOutputMaxBytes]
 			}
 			trace.ResultJSON = truncateForTrace(string(payload), 2000)
+			e.emitToolEvent(opts.OnToolEvent, ToolEvent{
+				Phase:      ToolEventFinish,
+				Index:      toolCallIndex,
+				Name:       name,
+				ArgsJSON:   trace.ArgsJSON,
+				ResultJSON: trace.ResultJSON,
+				Error:      trace.Error,
+				DurationMs: trace.DurationMs,
+			})
 			toolTrace = append(toolTrace, trace)
 			if err := e.store.InsertMessage(ctx, &db.Message{
 				SessionID:    sess.ID,
@@ -186,6 +250,16 @@ func (e *Engine) HandleText(ctx context.Context, transport, sessionKey, input st
 		Compacted:        compacted,
 		ToolTrace:        toolTrace,
 	}, nil
+}
+
+func (e *Engine) emitToolEvent(cb func(ToolEvent), ev ToolEvent) {
+	if cb == nil {
+		return
+	}
+	defer func() {
+		_ = recover()
+	}()
+	cb(ev)
 }
 
 func (e *Engine) ListTools(ctx context.Context) ([]tools.Tool, error) {
@@ -226,6 +300,30 @@ func (e *Engine) SetSessionVerbose(ctx context.Context, transport, sessionKey st
 		val = "1"
 	}
 	return e.store.SetSetting(ctx, verboseSettingKey(transport, sessionKey), val)
+}
+
+func (e *Engine) IsSessionShowTools(ctx context.Context, transport, sessionKey string) (bool, error) {
+	v, ok, err := e.store.GetSetting(ctx, showToolsSettingKey(transport, sessionKey))
+	if err != nil {
+		return false, err
+	}
+	if !ok {
+		return false, nil
+	}
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "1", "true", "on", "yes":
+		return true, nil
+	default:
+		return false, nil
+	}
+}
+
+func (e *Engine) SetSessionShowTools(ctx context.Context, transport, sessionKey string, enabled bool) error {
+	val := "0"
+	if enabled {
+		val = "1"
+	}
+	return e.store.SetSetting(ctx, showToolsSettingKey(transport, sessionKey), val)
 }
 
 func (e *Engine) IsSessionThink(ctx context.Context, transport, sessionKey string) (bool, error) {
@@ -398,6 +496,10 @@ func mustJSON(v interface{}) string {
 
 func verboseSettingKey(transport, sessionKey string) string {
 	return fmt.Sprintf("session_verbose:%s:%s", transport, sessionKey)
+}
+
+func showToolsSettingKey(transport, sessionKey string) string {
+	return fmt.Sprintf("session_show_tools:%s:%s", transport, sessionKey)
 }
 
 func thinkSettingKey(transport, sessionKey string) string {

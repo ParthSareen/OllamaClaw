@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/parth/ollamaclaw/internal/cli"
+	"github.com/ParthSareen/OllamaClaw/internal/cli"
 )
 
 func main() {

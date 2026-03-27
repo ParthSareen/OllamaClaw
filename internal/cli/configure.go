@@ -7,11 +7,11 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/ParthSareen/OllamaClaw/internal/config"
+	"github.com/ParthSareen/OllamaClaw/internal/telegram"
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
-	"github.com/parth/ollamaclaw/internal/config"
-	"github.com/parth/ollamaclaw/internal/telegram"
 )
 
 func (a *App) runConfigure(args []string) error {

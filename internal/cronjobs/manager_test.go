@@ -5,8 +5,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/parth/ollamaclaw/internal/db"
-	"github.com/parth/ollamaclaw/internal/tools"
+	"github.com/ParthSareen/OllamaClaw/internal/db"
+	"github.com/ParthSareen/OllamaClaw/internal/tools"
 )
 
 func TestAddListRemoveJob(t *testing.T) {

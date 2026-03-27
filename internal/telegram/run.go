@@ -14,12 +14,12 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/ParthSareen/OllamaClaw/internal/agent"
+	"github.com/ParthSareen/OllamaClaw/internal/config"
+	"github.com/ParthSareen/OllamaClaw/internal/cronjobs"
+	"github.com/ParthSareen/OllamaClaw/internal/db"
 	"github.com/go-telegram/bot"
 	"github.com/go-telegram/bot/models"
-	"github.com/parth/ollamaclaw/internal/agent"
-	"github.com/parth/ollamaclaw/internal/config"
-	"github.com/parth/ollamaclaw/internal/cronjobs"
-	"github.com/parth/ollamaclaw/internal/db"
 )
 
 type Runner struct {
@@ -29,14 +29,24 @@ type Runner struct {
 	Scheduler *cronjobs.Manager
 
 	lastUpdateID atomic.Int64
+	nextTurnID   atomic.Uint64
 	logMu        sync.Mutex
 	logFile      *os.File
+	turnMu       sync.Mutex
+	inFlight     map[string]inFlightTurn
 }
 
 const (
 	settingOffsetKey = "telegram_last_update_id"
 	maxLogPreview    = 280
+	maxToolPreview   = 700
 )
+
+type inFlightTurn struct {
+	id     uint64
+	chatID int64
+	cancel context.CancelFunc
+}
 
 func (r *Runner) Run(ctx context.Context) error {
 	if err := r.openLogFile(); err != nil {
@@ -199,15 +209,52 @@ func (r *Runner) handleUpdate(ctx context.Context, b *bot.Bot, update *models.Up
 		return
 	}
 
+	sessionKey := strconv.FormatInt(chatID, 10)
+	turnCtx, turnCancel := context.WithCancel(ctx)
+	turnID, started := r.beginTurn(sessionKey, chatID, turnCancel)
+	if !started {
+		turnCancel()
+		r.logf("agent turn rejected: chat=%d session_key=%s reason=in_progress", chatID, sessionKey)
+		_, _ = b.SendMessage(ctx, &bot.SendMessageParams{ChatID: chatID, Text: "a turn is already running. send /stop to interrupt it first."})
+		return
+	}
+	defer r.endTurn(sessionKey, turnID)
+
 	progress, _ := b.SendMessage(ctx, &bot.SendMessageParams{ChatID: chatID, Text: "Thinking..."})
 	if progress != nil {
 		r.logf("progress message sent: chat=%d message_id=%d", chatID, progress.ID)
 	}
-	sessionKey := strconv.FormatInt(chatID, 10)
 	r.logf("agent turn start: chat=%d session_key=%s", chatID, sessionKey)
 	startedAt := time.Now()
-	res, err := r.Engine.HandleText(ctx, "telegram", sessionKey, text)
+	showTools, _ := r.Engine.IsSessionShowTools(ctx, "telegram", sessionKey)
+	if showTools {
+		r.logf("live tool stream enabled: chat=%d session_key=%s", chatID, sessionKey)
+	}
+	res, err := r.Engine.HandleTextWithOptions(turnCtx, "telegram", sessionKey, text, agent.HandleOptions{
+		OnToolEvent: func(ev agent.ToolEvent) {
+			if !showTools || ev.Phase != agent.ToolEventFinish {
+				return
+			}
+			line := formatLiveToolEvent(ev)
+			r.logf("tool event: chat=%d %s", chatID, previewForLog(line))
+			sendCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_, sendErr := b.SendMessage(sendCtx, &bot.SendMessageParams{ChatID: chatID, Text: line})
+			if sendErr != nil {
+				r.logf("tool event send failed: chat=%d error=%v", chatID, sendErr)
+			}
+		},
+	})
 	if err != nil {
+		if isContextCanceledErr(err) {
+			r.logf("agent turn canceled: chat=%d session_key=%s elapsed_ms=%d", chatID, sessionKey, time.Since(startedAt).Milliseconds())
+			if progress != nil {
+				_, _ = b.EditMessageText(ctx, &bot.EditMessageTextParams{ChatID: chatID, MessageID: progress.ID, Text: "stopped."})
+			} else {
+				_, _ = b.SendMessage(ctx, &bot.SendMessageParams{ChatID: chatID, Text: "stopped."})
+			}
+			return
+		}
 		r.logf("agent turn failed: chat=%d error=%v", chatID, err)
 		r.replyError(ctx, b, chatID, progress, err)
 		return
@@ -235,6 +282,18 @@ func (r *Runner) handleUpdate(ctx context.Context, b *bot.Bot, update *models.Up
 		res.AssistantContent = "(empty response)"
 	}
 	r.logf("response send: chat=%d chars=%d", chatID, len(res.AssistantContent))
+	if showTools {
+		if progress != nil {
+			deleted, err := b.DeleteMessage(ctx, &bot.DeleteMessageParams{ChatID: chatID, MessageID: progress.ID})
+			if err != nil || !deleted {
+				r.logf("delete progress failed: chat=%d message_id=%d deleted=%t error=%v", chatID, progress.ID, deleted, err)
+			} else {
+				r.logf("progress message deleted: chat=%d message_id=%d", chatID, progress.ID)
+			}
+		}
+		r.sendChunked(ctx, b, chatID, nil, res.AssistantContent)
+		return
+	}
 	r.sendChunked(ctx, b, chatID, progress, res.AssistantContent)
 }
 
@@ -267,7 +326,14 @@ func parseCommand(raw string) string {
 	if len(parts) == 0 {
 		return ""
 	}
-	cmd := strings.ToLower(strings.TrimPrefix(parts[0], "/"))
+	token := parts[0]
+	if token == "/" && len(parts) > 1 {
+		token = "/" + parts[1]
+	}
+	cmd := strings.ToLower(strings.TrimPrefix(token, "/"))
+	if cmd == "" {
+		return ""
+	}
 	if at := strings.Index(cmd, "@"); at > 0 {
 		cmd = cmd[:at]
 	}
@@ -289,7 +355,13 @@ func (r *Runner) handleCommand(ctx context.Context, b *bot.Bot, chatID int64, ra
 	if len(parts) == 0 {
 		return
 	}
-	cmd := parseCommand(parts[0])
+	if parts[0] == "/" {
+		parts = parts[1:]
+		if len(parts) == 0 {
+			return
+		}
+	}
+	cmd := parseCommand(raw)
 
 	send := func(text string) {
 		_, _ = b.SendMessage(ctx, &bot.SendMessageParams{ChatID: chatID, Text: text})
@@ -305,10 +377,10 @@ func (r *Runner) handleCommand(ctx context.Context, b *bot.Bot, chatID int64, ra
 	switch cmd {
 	case "start":
 		r.logf("command start: chat=%d", chatID)
-		send("OllamaClaw is ready.\nCommands:\n/start\n/help\n/model [name]\n/tools\n/verbose [on|off]\n/think [on|off]\n/status\n/reset")
+		send("OllamaClaw is ready.\nCommands:\n/start\n/help\n/model [name]\n/tools\n/show tools [on|off]\n/show thinking [on|off]\n/verbose [on|off]\n/think [on|off]\n/status\n/reset\n/stop")
 	case "help":
 		r.logf("command help: chat=%d", chatID)
-		send("Commands:\n/start\n/help\n/model [name]\n/tools\n/verbose [on|off]\n/think [on|off]\n/status\n/reset\n\nSend any text to chat with OllamaClaw.")
+		send("Commands:\n/start\n/help\n/model [name]\n/tools\n/show tools [on|off]\n/show thinking [on|off]\n/verbose [on|off]\n/think [on|off]\n/status\n/reset\n/stop\n\nSend any text to chat with OllamaClaw.")
 	case "reset":
 		r.logf("command reset: chat=%d", chatID)
 		newSess, err := r.Engine.ResetSession(ctx, "telegram", sessionKey)
@@ -378,6 +450,61 @@ func (r *Runner) handleCommand(ctx context.Context, b *bot.Bot, chatID int64, ra
 		}
 		r.logf("command verbose set: chat=%d enabled=%t", chatID, enabled)
 		send(fmt.Sprintf("verbose: %t", enabled))
+	case "show":
+		r.logf("command show: chat=%d args=%q", chatID, previewForLog(strings.Join(parts[1:], " ")))
+		if len(parts) < 2 {
+			send("usage: /show <tools|thinking> [on|off]")
+			return
+		}
+		target := strings.ToLower(strings.TrimSpace(parts[1]))
+		switch target {
+		case "tools":
+			if len(parts) == 2 {
+				if err := r.Engine.SetSessionShowTools(ctx, "telegram", sessionKey, true); err != nil {
+					r.logf("command show tools set failed: chat=%d error=%v", chatID, err)
+					send("error: " + err.Error())
+					return
+				}
+				send("show tools: true")
+				return
+			}
+			enabled, ok := parseOnOff(parts[2])
+			if !ok {
+				send("usage: /show tools [on|off]")
+				return
+			}
+			if err := r.Engine.SetSessionShowTools(ctx, "telegram", sessionKey, enabled); err != nil {
+				r.logf("command show tools set failed: chat=%d error=%v", chatID, err)
+				send("error: " + err.Error())
+				return
+			}
+			r.logf("command show tools set: chat=%d enabled=%t", chatID, enabled)
+			send(fmt.Sprintf("show tools: %t", enabled))
+		case "thinking", "think":
+			if len(parts) == 2 {
+				if err := r.Engine.SetSessionThink(ctx, "telegram", sessionKey, true); err != nil {
+					r.logf("command show thinking set failed: chat=%d error=%v", chatID, err)
+					send("error: " + err.Error())
+					return
+				}
+				send("thinking: true")
+				return
+			}
+			enabled, ok := parseOnOff(parts[2])
+			if !ok {
+				send("usage: /show thinking [on|off]")
+				return
+			}
+			if err := r.Engine.SetSessionThink(ctx, "telegram", sessionKey, enabled); err != nil {
+				r.logf("command show thinking set failed: chat=%d error=%v", chatID, err)
+				send("error: " + err.Error())
+				return
+			}
+			r.logf("command show thinking set: chat=%d enabled=%t", chatID, enabled)
+			send(fmt.Sprintf("thinking: %t", enabled))
+		default:
+			send("usage: /show <tools|thinking> [on|off]")
+		}
 	case "think":
 		r.logf("command think: chat=%d args=%q", chatID, previewForLog(strings.Join(parts[1:], " ")))
 		if len(parts) == 1 {
@@ -406,13 +533,62 @@ func (r *Runner) handleCommand(ctx context.Context, b *bot.Bot, chatID int64, ra
 		r.logf("command status: chat=%d", chatID)
 		enabledPlugins, _ := r.Store.ListPlugins(ctx, true)
 		verbose, _ := r.Engine.IsSessionVerbose(ctx, "telegram", sessionKey)
+		showTools, _ := r.Engine.IsSessionShowTools(ctx, "telegram", sessionKey)
 		think, _ := r.Engine.IsSessionThink(ctx, "telegram", sessionKey)
-		text := fmt.Sprintf("status:\nmodel: %s\nverbose: %t\nthink: %t\nprompt_tokens: %d\ncompletion_tokens: %d\ncompactions: %d\nenabled_plugins: %d\ndb: %s\nlog: %s", sess.ModelOverride, verbose, think, sess.TotalPromptToken, sess.TotalEvalToken, sess.CompactionCount, len(enabledPlugins), r.Cfg.DBPath, strings.TrimSpace(r.Cfg.LogPath))
+		text := fmt.Sprintf("status:\nmodel: %s\nverbose: %t\nshow_tools: %t\nthink: %t\nprompt_tokens: %d\ncompletion_tokens: %d\ncompactions: %d\nenabled_plugins: %d\ndb: %s\nlog: %s", sess.ModelOverride, verbose, showTools, think, sess.TotalPromptToken, sess.TotalEvalToken, sess.CompactionCount, len(enabledPlugins), r.Cfg.DBPath, strings.TrimSpace(r.Cfg.LogPath))
 		send(text)
+	case "stop":
+		r.logf("command stop: chat=%d", chatID)
+		turn, ok := r.stopTurn(sessionKey)
+		if !ok {
+			send("no active turn to stop")
+			return
+		}
+		r.logf("command stop signaled: chat=%d session_key=%s turn_id=%d", chatID, sessionKey, turn.id)
+		send("stopping current turn...")
 	default:
 		r.logf("unknown command: chat=%d cmd=%s", chatID, cmd)
 		send("unknown command")
 	}
+}
+
+func (r *Runner) beginTurn(sessionKey string, chatID int64, cancel context.CancelFunc) (uint64, bool) {
+	r.turnMu.Lock()
+	defer r.turnMu.Unlock()
+	if r.inFlight == nil {
+		r.inFlight = map[string]inFlightTurn{}
+	}
+	if _, exists := r.inFlight[sessionKey]; exists {
+		return 0, false
+	}
+	id := r.nextTurnID.Add(1)
+	r.inFlight[sessionKey] = inFlightTurn{
+		id:     id,
+		chatID: chatID,
+		cancel: cancel,
+	}
+	return id, true
+}
+
+func (r *Runner) endTurn(sessionKey string, id uint64) {
+	r.turnMu.Lock()
+	defer r.turnMu.Unlock()
+	turn, ok := r.inFlight[sessionKey]
+	if !ok || turn.id != id {
+		return
+	}
+	delete(r.inFlight, sessionKey)
+}
+
+func (r *Runner) stopTurn(sessionKey string) (inFlightTurn, bool) {
+	r.turnMu.Lock()
+	turn, ok := r.inFlight[sessionKey]
+	r.turnMu.Unlock()
+	if !ok {
+		return inFlightTurn{}, false
+	}
+	turn.cancel()
+	return turn, true
 }
 
 func (r *Runner) sendChunked(ctx context.Context, b *bot.Bot, chatID int64, progress *models.Message, text string) {
@@ -470,6 +646,27 @@ func parseOnOff(raw string) (bool, bool) {
 	}
 }
 
+func formatLiveToolEvent(ev agent.ToolEvent) string {
+	if ev.Phase == agent.ToolEventStart {
+		return fmt.Sprintf("tool start %d: %s args=%s", ev.Index, ev.Name, truncateForLive(ev.ArgsJSON))
+	}
+	if strings.TrimSpace(ev.Error) != "" {
+		return fmt.Sprintf("tool done %d: %s (%d ms) error=%s", ev.Index, ev.Name, ev.DurationMs, truncateForLive(ev.Error))
+	}
+	return fmt.Sprintf("tool done %d: %s (%d ms) result=%s", ev.Index, ev.Name, ev.DurationMs, truncateForLive(ev.ResultJSON))
+}
+
+func truncateForLive(v string) string {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return "{}"
+	}
+	if len(v) <= maxToolPreview {
+		return v
+	}
+	return v[:maxToolPreview-3] + "..."
+}
+
 func formatToolTrace(trace []agent.ToolTraceEntry) string {
 	if len(trace) == 0 {
 		return "tool calls: (none)"
@@ -488,6 +685,13 @@ func formatToolTrace(trace []agent.ToolTraceEntry) string {
 		lines = append(lines, line)
 	}
 	return strings.Join(lines, "\n")
+}
+
+func isContextCanceledErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	return errors.Is(err, context.Canceled) || strings.Contains(strings.ToLower(err.Error()), "context canceled")
 }
 
 func isPollingConflictErr(err error) bool {

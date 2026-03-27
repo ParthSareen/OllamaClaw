@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/parth/ollamaclaw/internal/ollama"
+	"github.com/ParthSareen/OllamaClaw/internal/ollama"
 )
 
 func TestTruncate(t *testing.T) {

@@ -8,8 +8,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/parth/ollamaclaw/internal/db"
-	"github.com/parth/ollamaclaw/internal/tools"
+	"github.com/ParthSareen/OllamaClaw/internal/db"
+	"github.com/ParthSareen/OllamaClaw/internal/tools"
 	"github.com/robfig/cron/v3"
 )
 

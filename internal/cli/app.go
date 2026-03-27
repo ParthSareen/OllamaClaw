@@ -14,13 +14,13 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/parth/ollamaclaw/internal/agent"
-	"github.com/parth/ollamaclaw/internal/config"
-	"github.com/parth/ollamaclaw/internal/cronjobs"
-	"github.com/parth/ollamaclaw/internal/db"
-	"github.com/parth/ollamaclaw/internal/ollama"
-	"github.com/parth/ollamaclaw/internal/plugin"
-	"github.com/parth/ollamaclaw/internal/telegram"
+	"github.com/ParthSareen/OllamaClaw/internal/agent"
+	"github.com/ParthSareen/OllamaClaw/internal/config"
+	"github.com/ParthSareen/OllamaClaw/internal/cronjobs"
+	"github.com/ParthSareen/OllamaClaw/internal/db"
+	"github.com/ParthSareen/OllamaClaw/internal/ollama"
+	"github.com/ParthSareen/OllamaClaw/internal/plugin"
+	"github.com/ParthSareen/OllamaClaw/internal/telegram"
 )
 
 type App struct{}

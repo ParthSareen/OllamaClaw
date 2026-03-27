@@ -7,7 +7,7 @@ import (
 	"os"
 	"strings"
 
-	"github.com/parth/ollamaclaw/internal/agent"
+	"github.com/ParthSareen/OllamaClaw/internal/agent"
 )
 
 func runREPL(ctx context.Context, eng *agent.Engine) error {

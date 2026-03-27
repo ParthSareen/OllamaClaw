@@ -1,4 +1,4 @@
-module github.com/parth/ollamaclaw
+module github.com/ParthSareen/OllamaClaw
 
 go 1.25.4
 

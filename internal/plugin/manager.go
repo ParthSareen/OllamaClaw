@@ -14,10 +14,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/parth/ollamaclaw/internal/config"
-	"github.com/parth/ollamaclaw/internal/db"
-	"github.com/parth/ollamaclaw/internal/tools"
-	"github.com/parth/ollamaclaw/internal/util"
+	"github.com/ParthSareen/OllamaClaw/internal/config"
+	"github.com/ParthSareen/OllamaClaw/internal/db"
+	"github.com/ParthSareen/OllamaClaw/internal/tools"
+	"github.com/ParthSareen/OllamaClaw/internal/util"
 )
 
 const manifestName = "claw.plugin.json"

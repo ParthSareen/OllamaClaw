@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/parth/ollamaclaw/internal/config"
+	"github.com/ParthSareen/OllamaClaw/internal/config"
 )
 
 func TestLaunchRejectsArgs(t *testing.T) {

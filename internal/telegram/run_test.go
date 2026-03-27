@@ -1,11 +1,13 @@
 package telegram
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strings"
 	"testing"
 
+	"github.com/ParthSareen/OllamaClaw/internal/agent"
 	"github.com/go-telegram/bot"
 )
 
@@ -30,6 +32,11 @@ func TestParseCommand(t *testing.T) {
 		{in: "/help", want: "help"},
 		{in: "/help@my_bot", want: "help"},
 		{in: " /model kimi-k2.5:cloud ", want: "model"},
+		{in: "/ show tools", want: "show"},
+		{in: "/show tools", want: "show"},
+		{in: "/ show thinking on", want: "show"},
+		{in: "/show thinking off", want: "show"},
+		{in: "/stop", want: "stop"},
 		{in: "plain text", want: ""},
 		{in: "", want: ""},
 	}
@@ -117,5 +124,89 @@ func TestParsePollerCandidates(t *testing.T) {
 	}
 	if got[2].pid != 445 || !strings.Contains(got[2].cmd, "plugins-official/telegram") {
 		t.Fatalf("unexpected third candidate: %+v", got[2])
+	}
+}
+
+func TestRunnerTurnLifecycle(t *testing.T) {
+	r := &Runner{}
+	canceled := false
+	id, ok := r.beginTurn("8750063231", 8750063231, func() {
+		canceled = true
+	})
+	if !ok || id == 0 {
+		t.Fatalf("expected beginTurn to acquire turn")
+	}
+	if _, ok := r.beginTurn("8750063231", 8750063231, func() {}); ok {
+		t.Fatalf("expected second beginTurn on same session to be rejected")
+	}
+	turn, ok := r.stopTurn("8750063231")
+	if !ok {
+		t.Fatalf("expected stopTurn to find in-flight turn")
+	}
+	if turn.id != id {
+		t.Fatalf("stopTurn returned wrong turn id: got %d want %d", turn.id, id)
+	}
+	if !canceled {
+		t.Fatalf("expected cancel func to be called")
+	}
+	r.endTurn("8750063231", id)
+	if _, ok := r.stopTurn("8750063231"); ok {
+		t.Fatalf("expected no in-flight turn after endTurn")
+	}
+}
+
+func TestRunnerEndTurnRequiresMatchingID(t *testing.T) {
+	r := &Runner{}
+	id, ok := r.beginTurn("123", 123, func() {})
+	if !ok {
+		t.Fatalf("beginTurn failed")
+	}
+	r.endTurn("123", id+1)
+	if _, ok := r.stopTurn("123"); !ok {
+		t.Fatalf("turn should remain active when endTurn uses stale id")
+	}
+}
+
+func TestFormatLiveToolEvent(t *testing.T) {
+	start := formatLiveToolEvent(agent.ToolEvent{
+		Phase:    agent.ToolEventStart,
+		Index:    1,
+		Name:     "read_file",
+		ArgsJSON: `{"path":"a.txt"}`,
+	})
+	if !strings.Contains(start, "tool start 1") || !strings.Contains(start, "read_file") {
+		t.Fatalf("unexpected start event format: %q", start)
+	}
+	done := formatLiveToolEvent(agent.ToolEvent{
+		Phase:      agent.ToolEventFinish,
+		Index:      2,
+		Name:       "bash",
+		DurationMs: 12,
+		ResultJSON: `{"exit_code":0}`,
+	})
+	if !strings.Contains(done, "tool done 2") || !strings.Contains(done, "result=") {
+		t.Fatalf("unexpected finish event format: %q", done)
+	}
+	errLine := formatLiveToolEvent(agent.ToolEvent{
+		Phase:      agent.ToolEventFinish,
+		Index:      3,
+		Name:       "bash",
+		DurationMs: 2,
+		Error:      "context canceled",
+	})
+	if !strings.Contains(errLine, "error=context canceled") {
+		t.Fatalf("unexpected error event format: %q", errLine)
+	}
+}
+
+func TestIsContextCanceledErr(t *testing.T) {
+	if !isContextCanceledErr(context.Canceled) {
+		t.Fatalf("expected context.Canceled to be treated as canceled")
+	}
+	if !isContextCanceledErr(errors.New("request failed: context canceled while reading body")) {
+		t.Fatalf("expected textual context canceled error to match")
+	}
+	if isContextCanceledErr(errors.New("network timeout")) {
+		t.Fatalf("unexpected match for non-cancel error")
 	}
 }

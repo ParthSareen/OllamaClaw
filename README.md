@@ -12,6 +12,10 @@ It supports:
 ## Install
 
 ```bash
+# install from source repo
+go install github.com/ParthSareen/OllamaClaw@latest
+
+# or build locally in the repo
 go build -o ollamaclaw .
 ```
 

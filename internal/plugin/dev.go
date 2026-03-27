@@ -8,7 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/parth/ollamaclaw/internal/util"
+	"github.com/ParthSareen/OllamaClaw/internal/util"
 )
 
 func Scaffold(name string) (string, error) {

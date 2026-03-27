@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/parth/ollamaclaw/internal/ollama"
+	"github.com/ParthSareen/OllamaClaw/internal/ollama"
 )
 
 type Executor func(ctx context.Context, args map[string]interface{}) (map[string]interface{}, error)
