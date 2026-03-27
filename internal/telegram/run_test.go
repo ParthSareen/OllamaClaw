@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/ParthSareen/OllamaClaw/internal/agent"
 	"github.com/go-telegram/bot"
@@ -164,6 +165,24 @@ func TestRunnerEndTurnRequiresMatchingID(t *testing.T) {
 	r.endTurn("123", id+1)
 	if _, ok := r.stopTurn("123"); !ok {
 		t.Fatalf("turn should remain active when endTurn uses stale id")
+	}
+}
+
+func TestUnauthorizedReplyCooldown(t *testing.T) {
+	r := &Runner{}
+	now := time.Unix(100, 0)
+
+	if !r.shouldSendUnauthorizedReply(1, 2, now) {
+		t.Fatalf("expected first unauthorized reply to be allowed")
+	}
+	if r.shouldSendUnauthorizedReply(1, 2, now.Add(unauthorizedReplyCooldown/2)) {
+		t.Fatalf("expected repeated unauthorized reply to be throttled")
+	}
+	if !r.shouldSendUnauthorizedReply(1, 2, now.Add(unauthorizedReplyCooldown+time.Second)) {
+		t.Fatalf("expected unauthorized reply after cooldown to be allowed again")
+	}
+	if !r.shouldSendUnauthorizedReply(1, 3, now.Add(unauthorizedReplyCooldown/2)) {
+		t.Fatalf("expected different user to have independent cooldown")
 	}
 }
 

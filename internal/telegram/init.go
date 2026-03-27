@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 )
 
 type tgResp struct {
@@ -16,17 +17,59 @@ type tgResp struct {
 	Result      json.RawMessage `json:"result,omitempty"`
 }
 
+var (
+	telegramAPIBaseURL     = "https://api.telegram.org"
+	telegramAPICallTimeout = 10 * time.Second
+)
+
+type redactedError struct {
+	msg string
+	err error
+}
+
+func (e redactedError) Error() string {
+	return e.msg
+}
+
+func (e redactedError) Unwrap() error {
+	return e.err
+}
+
 func Init(ctx context.Context, token string) error {
 	if strings.TrimSpace(token) == "" {
 		return fmt.Errorf("token is required")
 	}
-	if _, err := call(token, "getMe", nil); err != nil {
-		return fmt.Errorf("token validation failed: %w", err)
+	if _, err := call(ctx, token, "getMe", nil); err != nil {
+		return fmt.Errorf("token validation failed: %w", redactTelegramError(token, err))
 	}
-	if _, err := call(token, "setWebhook", map[string]interface{}{"url": ""}); err != nil {
-		return fmt.Errorf("clear webhook failed: %w", err)
+	if _, err := call(ctx, token, "setWebhook", map[string]interface{}{"url": ""}); err != nil {
+		return fmt.Errorf("clear webhook failed: %w", redactTelegramError(token, err))
 	}
-	commands := []map[string]string{
+	if err := SyncCommands(ctx, token); err != nil {
+		return fmt.Errorf("set commands failed: %w", err)
+	}
+	return nil
+}
+
+func SyncCommands(ctx context.Context, token string) error {
+	commands := botCommandDefinitions()
+	if _, err := call(ctx, token, "setMyCommands", map[string]interface{}{
+		"commands": commands,
+	}); err != nil {
+		return redactTelegramError(token, err)
+	}
+	// Mirror command list for private chats explicitly so Telegram clients reliably refresh DM command menus.
+	if _, err := call(ctx, token, "setMyCommands", map[string]interface{}{
+		"scope":    map[string]string{"type": "all_private_chats"},
+		"commands": commands,
+	}); err != nil {
+		return redactTelegramError(token, err)
+	}
+	return nil
+}
+
+func botCommandDefinitions() []map[string]string {
+	return []map[string]string{
 		{"command": "start", "description": "Show onboarding and usage"},
 		{"command": "help", "description": "Show usage and examples"},
 		{"command": "reset", "description": "Reset chat session"},
@@ -36,47 +79,70 @@ func Init(ctx context.Context, token string) error {
 		{"command": "verbose", "description": "Show or set tool-call tracing"},
 		{"command": "think", "description": "Show or set thinking mode"},
 		{"command": "status", "description": "Show status and token usage"},
+		{"command": "stop", "description": "Stop the active turn"},
 	}
-	if _, err := call(token, "setMyCommands", map[string]interface{}{"commands": commands}); err != nil {
-		return fmt.Errorf("set commands failed: %w", err)
-	}
-	_ = ctx
-	return nil
 }
 
-func call(token, method string, payload interface{}) (json.RawMessage, error) {
-	url := fmt.Sprintf("https://api.telegram.org/bot%s/%s", token, method)
+func call(ctx context.Context, token, method string, payload interface{}) (json.RawMessage, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	callCtx, cancel := context.WithTimeout(ctx, telegramAPICallTimeout)
+	defer cancel()
+
+	url := fmt.Sprintf("%s/bot%s/%s", telegramAPIBaseURL, token, method)
 	body := []byte("{}")
 	if payload != nil {
 		b, err := json.Marshal(payload)
 		if err != nil {
-			return nil, err
+			return nil, redactTelegramError(token, fmt.Errorf("marshal telegram payload for %s: %w", method, err))
 		}
 		body = b
 	}
-	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(callCtx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
-		return nil, err
+		return nil, redactTelegramError(token, fmt.Errorf("create telegram request for %s: %w", method, err))
 	}
 	req.Header.Set("Content-Type", "application/json")
 	res, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, redactTelegramError(token, fmt.Errorf("do telegram request for %s: %w", method, err))
 	}
 	defer res.Body.Close()
 	b, err := io.ReadAll(res.Body)
 	if err != nil {
-		return nil, err
+		return nil, redactTelegramError(token, fmt.Errorf("read telegram response for %s: %w", method, err))
 	}
 	if res.StatusCode >= 300 {
-		return nil, fmt.Errorf("status %d: %s", res.StatusCode, strings.TrimSpace(string(b)))
+		return nil, redactTelegramError(token, fmt.Errorf("status %d: %s", res.StatusCode, strings.TrimSpace(string(b))))
 	}
 	var tr tgResp
 	if err := json.Unmarshal(b, &tr); err != nil {
-		return nil, err
+		return nil, redactTelegramError(token, fmt.Errorf("decode telegram response for %s: %w", method, err))
 	}
 	if !tr.OK {
-		return nil, fmt.Errorf("telegram error: %s", tr.Description)
+		return nil, redactTelegramError(token, fmt.Errorf("telegram error: %s", tr.Description))
 	}
 	return tr.Result, nil
+}
+
+func redactTelegramError(token string, err error) error {
+	if err == nil || strings.TrimSpace(token) == "" {
+		return err
+	}
+	msg := redactTelegramToken(token, err.Error())
+	if msg == err.Error() {
+		return err
+	}
+	return redactedError{
+		msg: msg,
+		err: err,
+	}
+}
+
+func redactTelegramToken(token, s string) string {
+	if strings.TrimSpace(token) == "" || s == "" {
+		return s
+	}
+	return strings.ReplaceAll(s, token, "***")
 }

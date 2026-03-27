@@ -34,12 +34,16 @@ type Runner struct {
 	logFile      *os.File
 	turnMu       sync.Mutex
 	inFlight     map[string]inFlightTurn
+	unauthMu     sync.Mutex
+	unauthAt     map[string]time.Time
 }
 
 const (
-	settingOffsetKey = "telegram_last_update_id"
-	maxLogPreview    = 280
-	maxToolPreview   = 700
+	settingOffsetKey          = "telegram_last_update_id"
+	maxLogPreview             = 280
+	maxToolPreview            = 700
+	updateWorkers             = 8
+	unauthorizedReplyCooldown = time.Minute
 )
 
 type inFlightTurn struct {
@@ -58,8 +62,8 @@ func (r *Runner) Run(ctx context.Context) error {
 	r.lastUpdateID.Store(int64(offset))
 	r.logf("launch starting: db=%s owner_chat_id=%d owner_user_id=%d initial_offset=%d", r.Cfg.DBPath, r.Cfg.Telegram.OwnerChatID, r.Cfg.Telegram.OwnerUserID, offset)
 
-	if err := r.ensurePollingOwnership(offset); err != nil {
-		r.logf("telegram polling preflight failed: %v", err)
+	if err := r.ensurePollingOwnership(ctx, offset); err != nil {
+		r.logf("telegram polling preflight failed: %v", r.redactError(err))
 		return err
 	}
 	r.logf("telegram polling preflight passed")
@@ -69,6 +73,8 @@ func (r *Runner) Run(ctx context.Context) error {
 
 	opts := []bot.Option{
 		bot.WithDefaultHandler(r.handleUpdate),
+		// Keep updates concurrent so /stop can be processed while a long tool call is running.
+		bot.WithWorkers(updateWorkers),
 		bot.WithAllowedUpdates([]string{"message"}),
 		bot.WithInitialOffset(int64(offset)),
 		bot.WithErrorsHandler(func(err error) {
@@ -80,18 +86,23 @@ func (r *Runner) Run(ctx context.Context) error {
 				if hint == "" {
 					hint = "no local ollamaclaw poller candidates detected"
 				}
-				r.logf("telegram long polling conflict detected; waiting and retrying (%s): %v", hint, err)
+				r.logf("telegram long polling conflict detected; waiting and retrying (%s): %v", hint, r.redactError(err))
 				return
 			}
-			r.logf("telegram polling error: %v", err)
+			r.logf("telegram polling error: %v", r.redactError(err))
 		}),
 	}
 	b, err := bot.New(r.Cfg.Telegram.BotToken, opts...)
 	if err != nil {
-		r.logf("bot init failed: %v", err)
-		return err
+		r.logf("bot init failed: %v", r.redactError(err))
+		return r.redactError(err)
 	}
 	r.logf("telegram client initialized (long polling, private chats)")
+	if err := SyncCommands(runCtx, r.Cfg.Telegram.BotToken); err != nil {
+		r.logf("telegram command sync warning: %v", r.redactError(err))
+	} else {
+		r.logf("telegram commands synced")
+	}
 	if r.Scheduler != nil {
 		jobs, err := r.Scheduler.ListJobs(ctx, true)
 		if err != nil {
@@ -105,10 +116,10 @@ func (r *Runner) Run(ctx context.Context) error {
 			}
 			chatID, err := strconv.ParseInt(sessionKey, 10, 64)
 			if err != nil {
-				r.logf("cron output drop: invalid session_key=%q error=%v", sessionKey, err)
+				r.logf("cron output drop: invalid session_key=%q error=%v", sessionKey, r.redactError(err))
 				return err
 			}
-			r.logf("cron output -> chat=%d bytes=%d preview=%q", chatID, len(content), previewForLog(content))
+			r.logf("cron output -> chat=%d bytes=%d preview=%q", chatID, len(content), r.previewForLog(content))
 			r.sendChunked(ctx, b, chatID, nil, content)
 			return nil
 		})
@@ -126,8 +137,8 @@ func (r *Runner) Run(ctx context.Context) error {
 	return nil
 }
 
-func (r *Runner) ensurePollingOwnership(offset int) error {
-	_, err := call(r.Cfg.Telegram.BotToken, "getUpdates", map[string]interface{}{
+func (r *Runner) ensurePollingOwnership(ctx context.Context, offset int) error {
+	_, err := call(ctx, r.Cfg.Telegram.BotToken, "getUpdates", map[string]interface{}{
 		"offset":          int64(offset + 1),
 		"limit":           1,
 		"timeout":         0,
@@ -139,7 +150,7 @@ func (r *Runner) ensurePollingOwnership(offset int) error {
 	if isPollingConflictErr(err) {
 		return fmt.Errorf("another bot instance is currently polling this token")
 	}
-	return fmt.Errorf("telegram getUpdates preflight failed: %w", err)
+	return fmt.Errorf("telegram getUpdates preflight failed: %w", r.redactError(err))
 }
 
 func (r *Runner) readOffset(ctx context.Context) int {
@@ -196,15 +207,14 @@ func (r *Runner) handleUpdate(ctx context.Context, b *bot.Bot, update *models.Up
 		r.logf("message ignored: empty text chat=%d user=%d", chatID, userID)
 		return
 	}
-	r.logf("message received: chat=%d user=%d chars=%d preview=%q", chatID, userID, len(text), previewForLog(text))
 	cmd := parseCommand(text)
 	if !r.authorize(ctx, b, chatID, userID, cmd) {
-		r.logf("authorization denied: chat=%d user=%d command=%q", chatID, userID, cmd)
 		return
 	}
 	r.logf("authorization accepted: chat=%d user=%d command=%q", chatID, userID, cmd)
+	r.logf("message received: chat=%d user=%d chars=%d preview=%q", chatID, userID, len(text), r.previewForLog(text))
 	if cmd != "" {
-		r.logf("command dispatch: chat=%d cmd=%s raw=%q", chatID, cmd, previewForLog(text))
+		r.logf("command dispatch: chat=%d cmd=%s raw=%q", chatID, cmd, r.previewForLog(text))
 		r.handleCommand(ctx, b, chatID, text)
 		return
 	}
@@ -236,12 +246,12 @@ func (r *Runner) handleUpdate(ctx context.Context, b *bot.Bot, update *models.Up
 				return
 			}
 			line := formatLiveToolEvent(ev)
-			r.logf("tool event: chat=%d %s", chatID, previewForLog(line))
+			r.logf("tool event: chat=%d %s", chatID, r.previewForLog(line))
 			sendCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 			_, sendErr := b.SendMessage(sendCtx, &bot.SendMessageParams{ChatID: chatID, Text: line})
 			if sendErr != nil {
-				r.logf("tool event send failed: chat=%d error=%v", chatID, sendErr)
+				r.logf("tool event send failed: chat=%d error=%v", chatID, r.redactError(sendErr))
 			}
 		},
 	})
@@ -255,17 +265,17 @@ func (r *Runner) handleUpdate(ctx context.Context, b *bot.Bot, update *models.Up
 			}
 			return
 		}
-		r.logf("agent turn failed: chat=%d error=%v", chatID, err)
+		r.logf("agent turn failed: chat=%d error=%v", chatID, r.redactError(err))
 		r.replyError(ctx, b, chatID, progress, err)
 		return
 	}
 	r.logf("agent turn complete: chat=%d model=%s prompt_tokens=%d eval_tokens=%d compacted=%t tool_calls=%d elapsed_ms=%d", chatID, res.Session.ModelOverride, res.PromptTokens, res.EvalTokens, res.Compacted, len(res.ToolTrace), time.Since(startedAt).Milliseconds())
 	for i, tr := range res.ToolTrace {
-		line := fmt.Sprintf("tool trace [%d/%d]: chat=%d name=%s duration_ms=%d args=%q", i+1, len(res.ToolTrace), chatID, tr.Name, tr.DurationMs, previewForLog(tr.ArgsJSON))
+		line := fmt.Sprintf("tool trace [%d/%d]: chat=%d name=%s duration_ms=%d args=%q", i+1, len(res.ToolTrace), chatID, tr.Name, tr.DurationMs, r.previewForLog(tr.ArgsJSON))
 		if strings.TrimSpace(tr.Error) != "" {
-			line += fmt.Sprintf(" error=%q", previewForLog(tr.Error))
+			line += fmt.Sprintf(" error=%q", r.previewForLog(tr.Error))
 		} else {
-			line += fmt.Sprintf(" result=%q", previewForLog(tr.ResultJSON))
+			line += fmt.Sprintf(" result=%q", r.previewForLog(tr.ResultJSON))
 		}
 		r.logf("%s", line)
 	}
@@ -286,7 +296,7 @@ func (r *Runner) handleUpdate(ctx context.Context, b *bot.Bot, update *models.Up
 		if progress != nil {
 			deleted, err := b.DeleteMessage(ctx, &bot.DeleteMessageParams{ChatID: chatID, MessageID: progress.ID})
 			if err != nil || !deleted {
-				r.logf("delete progress failed: chat=%d message_id=%d deleted=%t error=%v", chatID, progress.ID, deleted, err)
+				r.logf("delete progress failed: chat=%d message_id=%d deleted=%t error=%v", chatID, progress.ID, deleted, r.redactError(err))
 			} else {
 				r.logf("progress message deleted: chat=%d message_id=%d", chatID, progress.ID)
 			}
@@ -307,13 +317,18 @@ func (r *Runner) authorize(ctx context.Context, b *bot.Bot, chatID, userID int64
 	if ownerChatID == chatID && ownerUserID == userID {
 		return true
 	}
+	shouldReply := r.shouldSendUnauthorizedReply(chatID, userID, time.Now())
 	if cmd == "start" {
-		r.logf("unauthorized /start attempt: chat=%d user=%d", chatID, userID)
-		send("Unauthorized DM. This bot is restricted to the server allowlist.")
+		r.logf("unauthorized /start attempt: chat=%d user=%d reply=%t", chatID, userID, shouldReply)
+		if shouldReply {
+			send("Unauthorized DM. This bot is restricted to the server allowlist.")
+		}
 		return false
 	}
-	r.logf("unauthorized message: chat=%d user=%d", chatID, userID)
-	send("Unauthorized DM. This bot only accepts messages from the allowlisted owner.")
+	r.logf("unauthorized message: chat=%d user=%d command=%q reply=%t", chatID, userID, cmd, shouldReply)
+	if shouldReply {
+		send("Unauthorized DM. This bot only accepts messages from the allowlisted owner.")
+	}
 	return false
 }
 
@@ -341,8 +356,9 @@ func parseCommand(raw string) string {
 }
 
 func (r *Runner) replyError(ctx context.Context, b *bot.Bot, chatID int64, progress *models.Message, err error) {
+	err = r.redactError(err)
 	msg := "error: " + err.Error()
-	r.logf("reply error: chat=%d message=%q", chatID, previewForLog(msg))
+	r.logf("reply error: chat=%d message=%q", chatID, r.previewForLog(msg))
 	if progress != nil {
 		_, _ = b.EditMessageText(ctx, &bot.EditMessageTextParams{ChatID: chatID, MessageID: progress.ID, Text: msg})
 		return
@@ -366,11 +382,15 @@ func (r *Runner) handleCommand(ctx context.Context, b *bot.Bot, chatID int64, ra
 	send := func(text string) {
 		_, _ = b.SendMessage(ctx, &bot.SendMessageParams{ChatID: chatID, Text: text})
 	}
+	sendErr := func(err error) {
+		err = r.redactError(err)
+		send("error: " + err.Error())
+	}
 
 	sessionKey := strconv.FormatInt(chatID, 10)
 	sess, err := r.Engine.GetOrCreateSession(ctx, "telegram", sessionKey)
 	if err != nil {
-		send("error: " + err.Error())
+		sendErr(err)
 		return
 	}
 
@@ -385,16 +405,16 @@ func (r *Runner) handleCommand(ctx context.Context, b *bot.Bot, chatID int64, ra
 		r.logf("command reset: chat=%d", chatID)
 		newSess, err := r.Engine.ResetSession(ctx, "telegram", sessionKey)
 		if err != nil {
-			r.logf("command reset failed: chat=%d error=%v", chatID, err)
-			send("error: " + err.Error())
+			r.logf("command reset failed: chat=%d error=%v", chatID, r.redactError(err))
+			sendErr(err)
 			return
 		}
 		r.logf("command reset complete: chat=%d new_session=%s", chatID, newSess.ID)
 		send("session reset: " + newSess.ID)
 	case "model":
-		r.logf("command model: chat=%d args=%q", chatID, previewForLog(strings.Join(parts[1:], " ")))
+		r.logf("command model: chat=%d args=%q", chatID, r.previewForLog(strings.Join(parts[1:], " ")))
 		if len(parts) == 1 {
-			send("model: " + sess.ModelOverride)
+			send("model: " + redactTelegramToken(r.Cfg.Telegram.BotToken, sess.ModelOverride))
 			return
 		}
 		model := strings.TrimSpace(strings.Join(parts[1:], " "))
@@ -403,18 +423,18 @@ func (r *Runner) handleCommand(ctx context.Context, b *bot.Bot, chatID int64, ra
 			return
 		}
 		if err := r.Engine.SetSessionModel(ctx, sess.ID, model); err != nil {
-			r.logf("command model failed: chat=%d error=%v", chatID, err)
-			send("error: " + err.Error())
+			r.logf("command model failed: chat=%d error=%v", chatID, r.redactError(err))
+			sendErr(err)
 			return
 		}
-		r.logf("command model set: chat=%d model=%s", chatID, model)
-		send("model set to: " + model)
+		r.logf("command model set: chat=%d model=%s", chatID, redactTelegramToken(r.Cfg.Telegram.BotToken, model))
+		send("model set to: " + redactTelegramToken(r.Cfg.Telegram.BotToken, model))
 	case "tools":
 		r.logf("command tools: chat=%d", chatID)
 		all, err := r.Engine.ListTools(ctx)
 		if err != nil {
-			r.logf("command tools failed: chat=%d error=%v", chatID, err)
-			send("error: " + err.Error())
+			r.logf("command tools failed: chat=%d error=%v", chatID, r.redactError(err))
+			sendErr(err)
 			return
 		}
 		lines := []string{"tools:"}
@@ -427,12 +447,12 @@ func (r *Runner) handleCommand(ctx context.Context, b *bot.Bot, chatID int64, ra
 		}
 		send(strings.Join(lines, "\n"))
 	case "verbose":
-		r.logf("command verbose: chat=%d args=%q", chatID, previewForLog(strings.Join(parts[1:], " ")))
+		r.logf("command verbose: chat=%d args=%q", chatID, r.previewForLog(strings.Join(parts[1:], " ")))
 		if len(parts) == 1 {
 			enabled, err := r.Engine.IsSessionVerbose(ctx, "telegram", sessionKey)
 			if err != nil {
-				r.logf("command verbose read failed: chat=%d error=%v", chatID, err)
-				send("error: " + err.Error())
+				r.logf("command verbose read failed: chat=%d error=%v", chatID, r.redactError(err))
+				sendErr(err)
 				return
 			}
 			send(fmt.Sprintf("verbose: %t", enabled))
@@ -444,14 +464,14 @@ func (r *Runner) handleCommand(ctx context.Context, b *bot.Bot, chatID int64, ra
 			return
 		}
 		if err := r.Engine.SetSessionVerbose(ctx, "telegram", sessionKey, enabled); err != nil {
-			r.logf("command verbose set failed: chat=%d error=%v", chatID, err)
-			send("error: " + err.Error())
+			r.logf("command verbose set failed: chat=%d error=%v", chatID, r.redactError(err))
+			sendErr(err)
 			return
 		}
 		r.logf("command verbose set: chat=%d enabled=%t", chatID, enabled)
 		send(fmt.Sprintf("verbose: %t", enabled))
 	case "show":
-		r.logf("command show: chat=%d args=%q", chatID, previewForLog(strings.Join(parts[1:], " ")))
+		r.logf("command show: chat=%d args=%q", chatID, r.previewForLog(strings.Join(parts[1:], " ")))
 		if len(parts) < 2 {
 			send("usage: /show <tools|thinking> [on|off]")
 			return
@@ -461,8 +481,8 @@ func (r *Runner) handleCommand(ctx context.Context, b *bot.Bot, chatID int64, ra
 		case "tools":
 			if len(parts) == 2 {
 				if err := r.Engine.SetSessionShowTools(ctx, "telegram", sessionKey, true); err != nil {
-					r.logf("command show tools set failed: chat=%d error=%v", chatID, err)
-					send("error: " + err.Error())
+					r.logf("command show tools set failed: chat=%d error=%v", chatID, r.redactError(err))
+					sendErr(err)
 					return
 				}
 				send("show tools: true")
@@ -474,8 +494,8 @@ func (r *Runner) handleCommand(ctx context.Context, b *bot.Bot, chatID int64, ra
 				return
 			}
 			if err := r.Engine.SetSessionShowTools(ctx, "telegram", sessionKey, enabled); err != nil {
-				r.logf("command show tools set failed: chat=%d error=%v", chatID, err)
-				send("error: " + err.Error())
+				r.logf("command show tools set failed: chat=%d error=%v", chatID, r.redactError(err))
+				sendErr(err)
 				return
 			}
 			r.logf("command show tools set: chat=%d enabled=%t", chatID, enabled)
@@ -483,8 +503,8 @@ func (r *Runner) handleCommand(ctx context.Context, b *bot.Bot, chatID int64, ra
 		case "thinking", "think":
 			if len(parts) == 2 {
 				if err := r.Engine.SetSessionThink(ctx, "telegram", sessionKey, true); err != nil {
-					r.logf("command show thinking set failed: chat=%d error=%v", chatID, err)
-					send("error: " + err.Error())
+					r.logf("command show thinking set failed: chat=%d error=%v", chatID, r.redactError(err))
+					sendErr(err)
 					return
 				}
 				send("thinking: true")
@@ -496,8 +516,8 @@ func (r *Runner) handleCommand(ctx context.Context, b *bot.Bot, chatID int64, ra
 				return
 			}
 			if err := r.Engine.SetSessionThink(ctx, "telegram", sessionKey, enabled); err != nil {
-				r.logf("command show thinking set failed: chat=%d error=%v", chatID, err)
-				send("error: " + err.Error())
+				r.logf("command show thinking set failed: chat=%d error=%v", chatID, r.redactError(err))
+				sendErr(err)
 				return
 			}
 			r.logf("command show thinking set: chat=%d enabled=%t", chatID, enabled)
@@ -506,12 +526,12 @@ func (r *Runner) handleCommand(ctx context.Context, b *bot.Bot, chatID int64, ra
 			send("usage: /show <tools|thinking> [on|off]")
 		}
 	case "think":
-		r.logf("command think: chat=%d args=%q", chatID, previewForLog(strings.Join(parts[1:], " ")))
+		r.logf("command think: chat=%d args=%q", chatID, r.previewForLog(strings.Join(parts[1:], " ")))
 		if len(parts) == 1 {
 			enabled, err := r.Engine.IsSessionThink(ctx, "telegram", sessionKey)
 			if err != nil {
-				r.logf("command think read failed: chat=%d error=%v", chatID, err)
-				send("error: " + err.Error())
+				r.logf("command think read failed: chat=%d error=%v", chatID, r.redactError(err))
+				sendErr(err)
 				return
 			}
 			send(fmt.Sprintf("think: %t", enabled))
@@ -523,8 +543,8 @@ func (r *Runner) handleCommand(ctx context.Context, b *bot.Bot, chatID int64, ra
 			return
 		}
 		if err := r.Engine.SetSessionThink(ctx, "telegram", sessionKey, enabled); err != nil {
-			r.logf("command think set failed: chat=%d error=%v", chatID, err)
-			send("error: " + err.Error())
+			r.logf("command think set failed: chat=%d error=%v", chatID, r.redactError(err))
+			sendErr(err)
 			return
 		}
 		r.logf("command think set: chat=%d enabled=%t", chatID, enabled)
@@ -535,7 +555,7 @@ func (r *Runner) handleCommand(ctx context.Context, b *bot.Bot, chatID int64, ra
 		verbose, _ := r.Engine.IsSessionVerbose(ctx, "telegram", sessionKey)
 		showTools, _ := r.Engine.IsSessionShowTools(ctx, "telegram", sessionKey)
 		think, _ := r.Engine.IsSessionThink(ctx, "telegram", sessionKey)
-		text := fmt.Sprintf("status:\nmodel: %s\nverbose: %t\nshow_tools: %t\nthink: %t\nprompt_tokens: %d\ncompletion_tokens: %d\ncompactions: %d\nenabled_plugins: %d\ndb: %s\nlog: %s", sess.ModelOverride, verbose, showTools, think, sess.TotalPromptToken, sess.TotalEvalToken, sess.CompactionCount, len(enabledPlugins), r.Cfg.DBPath, strings.TrimSpace(r.Cfg.LogPath))
+		text := fmt.Sprintf("status:\nmodel: %s\nverbose: %t\nshow_tools: %t\nthink: %t\nprompt_tokens: %d\ncompletion_tokens: %d\ncompactions: %d\nenabled_plugins: %d\ndb: %s\nlog: %s", redactTelegramToken(r.Cfg.Telegram.BotToken, sess.ModelOverride), verbose, showTools, think, sess.TotalPromptToken, sess.TotalEvalToken, sess.CompactionCount, len(enabledPlugins), r.Cfg.DBPath, strings.TrimSpace(r.Cfg.LogPath))
 		send(text)
 	case "stop":
 		r.logf("command stop: chat=%d", chatID)
@@ -601,7 +621,7 @@ func (r *Runner) sendChunked(ctx context.Context, b *bot.Bot, chatID int64, prog
 	if progress != nil {
 		_, err := b.EditMessageText(ctx, &bot.EditMessageTextParams{ChatID: chatID, MessageID: progress.ID, Text: chunks[0]})
 		if err != nil {
-			r.logf("edit progress failed, fallback send: chat=%d message_id=%d error=%v", chatID, progress.ID, err)
+			r.logf("edit progress failed, fallback send: chat=%d message_id=%d error=%v", chatID, progress.ID, r.redactError(err))
 			_, _ = b.SendMessage(ctx, &bot.SendMessageParams{ChatID: chatID, Text: chunks[0]})
 		}
 	} else {
@@ -773,6 +793,29 @@ func (r *Runner) logf(format string, args ...interface{}) {
 	if r.logFile != nil {
 		_, _ = r.logFile.WriteString(line + "\n")
 	}
+}
+
+func (r *Runner) redactError(err error) error {
+	return redactTelegramError(r.Cfg.Telegram.BotToken, err)
+}
+
+func (r *Runner) previewForLog(s string) string {
+	return previewForLog(redactTelegramToken(r.Cfg.Telegram.BotToken, s))
+}
+
+func (r *Runner) shouldSendUnauthorizedReply(chatID, userID int64, now time.Time) bool {
+	key := fmt.Sprintf("%d:%d", chatID, userID)
+	r.unauthMu.Lock()
+	defer r.unauthMu.Unlock()
+	if r.unauthAt == nil {
+		r.unauthAt = map[string]time.Time{}
+	}
+	last, ok := r.unauthAt[key]
+	if ok && now.Sub(last) < unauthorizedReplyCooldown {
+		return false
+	}
+	r.unauthAt[key] = now
+	return true
 }
 
 func (r *Runner) openLogFile() error {
