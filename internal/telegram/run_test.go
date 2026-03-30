@@ -10,6 +10,7 @@ import (
 
 	"github.com/ParthSareen/OllamaClaw/internal/agent"
 	"github.com/go-telegram/bot"
+	"github.com/go-telegram/bot/models"
 )
 
 func TestSplitText(t *testing.T) {
@@ -65,6 +66,20 @@ func TestParseOnOff(t *testing.T) {
 	}
 	if _, ok := parseOnOff("maybe"); ok {
 		t.Fatalf("parseOnOff should reject unknown input")
+	}
+}
+
+func TestApprovalCallbackRoundTrip(t *testing.T) {
+	data := formatApprovalCallback("approve", "abc123")
+	action, id, ok := parseApprovalCallback(data)
+	if !ok || action != "approve" || id != "abc123" {
+		t.Fatalf("unexpected parse result: ok=%t action=%q id=%q", ok, action, id)
+	}
+	if _, _, ok := parseApprovalCallback("other:approve:abc123"); ok {
+		t.Fatalf("expected invalid prefix to fail")
+	}
+	if _, _, ok := parseApprovalCallback("appr:maybe:abc123"); ok {
+		t.Fatalf("expected invalid action to fail")
 	}
 }
 
@@ -165,6 +180,59 @@ func TestRunnerEndTurnRequiresMatchingID(t *testing.T) {
 	r.endTurn("123", id+1)
 	if _, ok := r.stopTurn("123"); !ok {
 		t.Fatalf("turn should remain active when endTurn uses stale id")
+	}
+}
+
+func TestResolvePendingApproval(t *testing.T) {
+	r := &Runner{
+		approvals: map[string]*pendingApproval{},
+	}
+	entry := &pendingApproval{
+		ID:         "abc",
+		ChatID:     100,
+		UserID:     200,
+		SessionKey: "100",
+		Command:    "touch /tmp/x",
+		Reason:     "outside allowlist",
+		CreatedAt:  time.Now().UTC(),
+		ExpiresAt:  time.Now().UTC().Add(time.Minute),
+		DecisionCh: make(chan bool, 1),
+	}
+	r.approvals[entry.ID] = entry
+
+	resolved, err := r.resolvePendingApproval(entry.ID, true, 100, 200)
+	if err != nil {
+		t.Fatalf("resolvePendingApproval error: %v", err)
+	}
+	if resolved == nil || resolved.ID != entry.ID {
+		t.Fatalf("unexpected resolved entry: %+v", resolved)
+	}
+	select {
+	case approved := <-entry.DecisionCh:
+		if !approved {
+			t.Fatalf("expected approved decision")
+		}
+	default:
+		t.Fatalf("expected decision to be sent")
+	}
+	if _, exists := r.approvals[entry.ID]; exists {
+		t.Fatalf("expected pending approval to be removed")
+	}
+}
+
+func TestCallbackQueryChatInfo(t *testing.T) {
+	cq := &models.CallbackQuery{
+		Message: models.MaybeInaccessibleMessage{
+			Type: models.MaybeInaccessibleMessageTypeMessage,
+			Message: &models.Message{
+				ID:   77,
+				Chat: models.Chat{ID: 12345},
+			},
+		},
+	}
+	chatID, msgID, ok := callbackQueryChatInfo(cq)
+	if !ok || chatID != 12345 || msgID != 77 {
+		t.Fatalf("unexpected callbackQueryChatInfo result: ok=%t chat=%d msg=%d", ok, chatID, msgID)
 	}
 }
 

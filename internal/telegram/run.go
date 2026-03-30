@@ -19,6 +19,7 @@ import (
 	"github.com/ParthSareen/OllamaClaw/internal/config"
 	"github.com/ParthSareen/OllamaClaw/internal/cronjobs"
 	"github.com/ParthSareen/OllamaClaw/internal/db"
+	"github.com/ParthSareen/OllamaClaw/internal/tools"
 	"github.com/go-telegram/bot"
 	"github.com/go-telegram/bot/models"
 )
@@ -35,6 +36,9 @@ type Runner struct {
 	logFile      *os.File
 	turnMu       sync.Mutex
 	inFlight     map[string]inFlightTurn
+	nextApproval atomic.Uint64
+	approvalMu   sync.Mutex
+	approvals    map[string]*pendingApproval
 	unauthMu     sync.Mutex
 	unauthAt     map[string]time.Time
 }
@@ -44,6 +48,9 @@ const (
 	maxLogPreview             = 280
 	maxToolPreview            = 700
 	updateWorkers             = 8
+	approvalTTL               = 10 * time.Minute
+	maxApprovalCommandPreview = 300
+	approvalCallbackPrefix    = "appr"
 	unauthorizedReplyCooldown = time.Minute
 )
 
@@ -51,6 +58,31 @@ type inFlightTurn struct {
 	id     uint64
 	chatID int64
 	cancel context.CancelFunc
+}
+
+type pendingApproval struct {
+	ID         string
+	ChatID     int64
+	UserID     int64
+	SessionKey string
+	Command    string
+	Reason     string
+	CreatedAt  time.Time
+	ExpiresAt  time.Time
+	MessageID  int
+	DecisionCh chan bool
+}
+
+type telegramBashApprover struct {
+	r          *Runner
+	bot        *bot.Bot
+	chatID     int64
+	userID     int64
+	sessionKey string
+}
+
+func (a *telegramBashApprover) ApproveBashCommand(ctx context.Context, req tools.BashApprovalRequest) error {
+	return a.r.requestBashApproval(ctx, a.bot, a.chatID, a.userID, a.sessionKey, req.Command, req.Reason)
 }
 
 func (r *Runner) Run(ctx context.Context) error {
@@ -76,7 +108,7 @@ func (r *Runner) Run(ctx context.Context) error {
 		bot.WithDefaultHandler(r.handleUpdate),
 		// Keep updates concurrent so /stop can be processed while a long tool call is running.
 		bot.WithWorkers(updateWorkers),
-		bot.WithAllowedUpdates([]string{"message"}),
+		bot.WithAllowedUpdates([]string{"message", "callback_query"}),
 		bot.WithInitialOffset(int64(offset)),
 		bot.WithErrorsHandler(func(err error) {
 			if err == nil {
@@ -143,7 +175,7 @@ func (r *Runner) ensurePollingOwnership(ctx context.Context, offset int) error {
 		"offset":          int64(offset + 1),
 		"limit":           1,
 		"timeout":         0,
-		"allowed_updates": []string{"message"},
+		"allowed_updates": []string{"message", "callback_query"},
 	})
 	if err == nil {
 		return nil
@@ -190,6 +222,11 @@ func (r *Runner) handleUpdate(ctx context.Context, b *bot.Bot, update *models.Up
 	}
 	r.setOffset(ctx, update.ID)
 
+	if update.CallbackQuery != nil {
+		r.handleCallbackQuery(ctx, b, update.CallbackQuery)
+		return
+	}
+
 	if update.Message == nil {
 		r.logf("update ignored: no message id=%d", update.ID)
 		return
@@ -222,6 +259,13 @@ func (r *Runner) handleUpdate(ctx context.Context, b *bot.Bot, update *models.Up
 
 	sessionKey := strconv.FormatInt(chatID, 10)
 	turnCtx, turnCancel := context.WithCancel(ctx)
+	turnCtx = tools.WithBashApprover(turnCtx, &telegramBashApprover{
+		r:          r,
+		bot:        b,
+		chatID:     chatID,
+		userID:     userID,
+		sessionKey: sessionKey,
+	})
 	turnID, started := r.beginTurn(sessionKey, chatID, turnCancel)
 	if !started {
 		turnCancel()
@@ -813,6 +857,217 @@ func parsePollerCandidates(psOutput string, selfPID int) []pollerCandidate {
 		}
 	}
 	return out
+}
+
+func (r *Runner) requestBashApproval(ctx context.Context, b *bot.Bot, chatID, userID int64, sessionKey, command, reason string) error {
+	id := strconv.FormatUint(r.nextApproval.Add(1), 36)
+	now := time.Now().UTC()
+	entry := &pendingApproval{
+		ID:         id,
+		ChatID:     chatID,
+		UserID:     userID,
+		SessionKey: sessionKey,
+		Command:    strings.TrimSpace(command),
+		Reason:     strings.TrimSpace(reason),
+		CreatedAt:  now,
+		ExpiresAt:  now.Add(approvalTTL),
+		DecisionCh: make(chan bool, 1),
+	}
+
+	r.approvalMu.Lock()
+	if r.approvals == nil {
+		r.approvals = map[string]*pendingApproval{}
+	}
+	r.approvals[id] = entry
+	r.approvalMu.Unlock()
+
+	text := fmt.Sprintf("Command requires approval.\nReason: %s\nID: %s\n\nCommand:\n%s\n\nTap Approve or Deny.",
+		entry.Reason,
+		entry.ID,
+		truncateApprovalCommand(entry.Command),
+	)
+	kb := &models.InlineKeyboardMarkup{
+		InlineKeyboard: [][]models.InlineKeyboardButton{
+			{
+				{Text: "Approve", CallbackData: formatApprovalCallback("approve", entry.ID)},
+				{Text: "Deny", CallbackData: formatApprovalCallback("deny", entry.ID)},
+			},
+		},
+	}
+	msg, err := b.SendMessage(ctx, &bot.SendMessageParams{
+		ChatID:      chatID,
+		Text:        text,
+		ReplyMarkup: kb,
+	})
+	if err != nil {
+		r.deletePendingApproval(entry.ID)
+		return fmt.Errorf("approval prompt send failed: %w", r.redactError(err))
+	}
+	if msg != nil {
+		entry.MessageID = msg.ID
+	}
+	r.logf("bash approval requested: id=%s chat=%d user=%d reason=%q", entry.ID, chatID, userID, entry.Reason)
+
+	timer := time.NewTimer(approvalTTL)
+	defer timer.Stop()
+	select {
+	case approved := <-entry.DecisionCh:
+		if approved {
+			r.logf("bash approval granted: id=%s chat=%d", entry.ID, chatID)
+			return nil
+		}
+		return fmt.Errorf("command denied via Telegram approval")
+	case <-ctx.Done():
+		r.deletePendingApproval(entry.ID)
+		r.markApprovalMessage(ctx, b, entry, "Approval canceled (request context ended).")
+		return ctx.Err()
+	case <-timer.C:
+		r.deletePendingApproval(entry.ID)
+		r.markApprovalMessage(ctx, b, entry, "Approval expired.")
+		return fmt.Errorf("command approval timed out")
+	}
+}
+
+func (r *Runner) handleCallbackQuery(ctx context.Context, b *bot.Bot, cq *models.CallbackQuery) {
+	if cq == nil {
+		return
+	}
+	action, approvalID, ok := parseApprovalCallback(cq.Data)
+	if !ok {
+		_, _ = b.AnswerCallbackQuery(ctx, &bot.AnswerCallbackQueryParams{
+			CallbackQueryID: cq.ID,
+			Text:            "Unknown action.",
+		})
+		return
+	}
+	chatID, _, hasMessage := callbackQueryChatInfo(cq)
+	userID := cq.From.ID
+	if !r.isAllowlistedOwner(chatID, userID) {
+		_, _ = b.AnswerCallbackQuery(ctx, &bot.AnswerCallbackQueryParams{
+			CallbackQueryID: cq.ID,
+			Text:            "Unauthorized.",
+			ShowAlert:       true,
+		})
+		r.logf("approval callback unauthorized: id=%s chat=%d user=%d", approvalID, chatID, userID)
+		return
+	}
+
+	entry, err := r.resolvePendingApproval(approvalID, action == "approve", chatID, userID)
+	if err != nil {
+		_, _ = b.AnswerCallbackQuery(ctx, &bot.AnswerCallbackQueryParams{
+			CallbackQueryID: cq.ID,
+			Text:            err.Error(),
+			ShowAlert:       true,
+		})
+		return
+	}
+	if hasMessage {
+		if action == "approve" {
+			r.markApprovalMessage(ctx, b, entry, "Approved. Executing command.")
+		} else {
+			r.markApprovalMessage(ctx, b, entry, "Denied.")
+		}
+	}
+	_, _ = b.AnswerCallbackQuery(ctx, &bot.AnswerCallbackQueryParams{
+		CallbackQueryID: cq.ID,
+		Text:            map[bool]string{true: "Approved.", false: "Denied."}[action == "approve"],
+	})
+}
+
+func (r *Runner) resolvePendingApproval(id string, approved bool, chatID, userID int64) (*pendingApproval, error) {
+	r.approvalMu.Lock()
+	entry, ok := r.approvals[id]
+	if !ok {
+		r.approvalMu.Unlock()
+		return nil, fmt.Errorf("approval not found or already resolved")
+	}
+	if entry.ChatID != chatID || entry.UserID != userID {
+		r.approvalMu.Unlock()
+		return nil, fmt.Errorf("approval identity mismatch")
+	}
+	if time.Now().UTC().After(entry.ExpiresAt) {
+		delete(r.approvals, id)
+		r.approvalMu.Unlock()
+		return nil, fmt.Errorf("approval expired")
+	}
+	delete(r.approvals, id)
+	r.approvalMu.Unlock()
+	select {
+	case entry.DecisionCh <- approved:
+	default:
+	}
+	return entry, nil
+}
+
+func (r *Runner) deletePendingApproval(id string) {
+	r.approvalMu.Lock()
+	delete(r.approvals, id)
+	r.approvalMu.Unlock()
+}
+
+func (r *Runner) markApprovalMessage(ctx context.Context, b *bot.Bot, entry *pendingApproval, status string) {
+	if entry == nil || entry.MessageID == 0 {
+		return
+	}
+	text := fmt.Sprintf("Command approval (%s)\nID: %s\nReason: %s\n\nCommand:\n%s",
+		status,
+		entry.ID,
+		entry.Reason,
+		truncateApprovalCommand(entry.Command),
+	)
+	_, _ = b.EditMessageText(ctx, &bot.EditMessageTextParams{
+		ChatID:    entry.ChatID,
+		MessageID: entry.MessageID,
+		Text:      text,
+	})
+}
+
+func (r *Runner) isAllowlistedOwner(chatID, userID int64) bool {
+	return r.Cfg.Telegram.OwnerChatID == chatID && r.Cfg.Telegram.OwnerUserID == userID
+}
+
+func callbackQueryChatInfo(cq *models.CallbackQuery) (chatID int64, messageID int, ok bool) {
+	if cq == nil {
+		return 0, 0, false
+	}
+	if cq.Message.Message != nil {
+		return cq.Message.Message.Chat.ID, cq.Message.Message.ID, true
+	}
+	if cq.Message.InaccessibleMessage != nil {
+		return cq.Message.InaccessibleMessage.Chat.ID, cq.Message.InaccessibleMessage.MessageID, true
+	}
+	return 0, 0, false
+}
+
+func formatApprovalCallback(action, id string) string {
+	return fmt.Sprintf("%s:%s:%s", approvalCallbackPrefix, action, id)
+}
+
+func parseApprovalCallback(data string) (action, id string, ok bool) {
+	parts := strings.Split(strings.TrimSpace(data), ":")
+	if len(parts) != 3 {
+		return "", "", false
+	}
+	if parts[0] != approvalCallbackPrefix {
+		return "", "", false
+	}
+	switch parts[1] {
+	case "approve", "deny":
+	default:
+		return "", "", false
+	}
+	if strings.TrimSpace(parts[2]) == "" {
+		return "", "", false
+	}
+	return parts[1], parts[2], true
+}
+
+func truncateApprovalCommand(cmd string) string {
+	compact := strings.TrimSpace(cmd)
+	if len(compact) <= maxApprovalCommandPreview {
+		return compact
+	}
+	return compact[:maxApprovalCommandPreview-3] + "..."
 }
 
 func (r *Runner) logf(format string, args ...interface{}) {

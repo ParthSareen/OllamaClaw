@@ -2,6 +2,7 @@ package tools
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -9,6 +10,19 @@ import (
 
 	"github.com/ParthSareen/OllamaClaw/internal/ollama"
 )
+
+type stubBashApprover struct {
+	lastReq BashApprovalRequest
+	err     error
+	called  bool
+}
+
+func (s *stubBashApprover) ApproveBashCommand(ctx context.Context, req BashApprovalRequest) error {
+	_ = ctx
+	s.called = true
+	s.lastReq = req
+	return s.err
+}
 
 func TestTruncate(t *testing.T) {
 	in := "abcdefghijklmnopqrstuvwxyz"
@@ -71,7 +85,7 @@ func TestReadLogsTool(t *testing.T) {
 
 func TestGuardTelegramBashCommand(t *testing.T) {
 	telegramCtx := WithSessionInfo(context.Background(), "telegram", "8750063231")
-	if err := guardTelegramBashCommand(telegramCtx, "ps aux | grep ollamaclaw"); err != nil {
+	if err := guardTelegramBashCommand(telegramCtx, "ps aux"); err != nil {
 		t.Fatalf("expected read-only command to be allowed, got %v", err)
 	}
 
@@ -90,6 +104,42 @@ func TestGuardTelegramBashCommand(t *testing.T) {
 	replCtx := WithSessionInfo(context.Background(), "repl", "default")
 	if err := guardTelegramBashCommand(replCtx, "./ollamaclaw launch"); err != nil {
 		t.Fatalf("expected repl context to allow command, got %v", err)
+	}
+}
+
+func TestGuardTelegramBashCommandRequiresApproval(t *testing.T) {
+	ctx := WithSessionInfo(context.Background(), "telegram", "8750063231")
+	err := guardTelegramBashCommand(ctx, "touch /tmp/test-file")
+	if err == nil || !strings.Contains(err.Error(), "requires approval") {
+		t.Fatalf("expected approval-required error, got %v", err)
+	}
+}
+
+func TestGuardTelegramBashCommandApproverAllows(t *testing.T) {
+	approver := &stubBashApprover{}
+	ctx := WithSessionInfo(context.Background(), "telegram", "8750063231")
+	ctx = WithBashApprover(ctx, approver)
+	if err := guardTelegramBashCommand(ctx, "touch /tmp/test-file"); err != nil {
+		t.Fatalf("expected approver to allow command, got %v", err)
+	}
+	if !approver.called {
+		t.Fatalf("expected approver to be called")
+	}
+	if strings.TrimSpace(approver.lastReq.Command) != "touch /tmp/test-file" {
+		t.Fatalf("unexpected approval command: %q", approver.lastReq.Command)
+	}
+	if approver.lastReq.Reason == "" {
+		t.Fatalf("expected approval reason")
+	}
+}
+
+func TestGuardTelegramBashCommandApproverDenies(t *testing.T) {
+	approver := &stubBashApprover{err: errors.New("denied by user")}
+	ctx := WithSessionInfo(context.Background(), "telegram", "8750063231")
+	ctx = WithBashApprover(ctx, approver)
+	err := guardTelegramBashCommand(ctx, "touch /tmp/test-file")
+	if err == nil || !strings.Contains(err.Error(), "denied by user") {
+		t.Fatalf("expected deny error from approver, got %v", err)
 	}
 }
 

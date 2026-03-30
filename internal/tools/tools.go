@@ -72,6 +72,15 @@ type SessionInfo struct {
 	SessionKey string
 }
 
+type BashApprovalRequest struct {
+	Command string
+	Reason  string
+}
+
+type BashApprover interface {
+	ApproveBashCommand(ctx context.Context, req BashApprovalRequest) error
+}
+
 func WithSessionInfo(ctx context.Context, transport, sessionKey string) context.Context {
 	return context.WithValue(ctx, sessionContextKey{}, SessionInfo{Transport: transport, SessionKey: sessionKey})
 }
@@ -83,6 +92,21 @@ func SessionInfoFromContext(ctx context.Context) (SessionInfo, bool) {
 	}
 	info, ok := v.(SessionInfo)
 	return info, ok
+}
+
+type bashApproverContextKey struct{}
+
+func WithBashApprover(ctx context.Context, approver BashApprover) context.Context {
+	return context.WithValue(ctx, bashApproverContextKey{}, approver)
+}
+
+func BashApproverFromContext(ctx context.Context) (BashApprover, bool) {
+	v := ctx.Value(bashApproverContextKey{})
+	if v == nil {
+		return nil, false
+	}
+	approver, ok := v.(BashApprover)
+	return approver, ok
 }
 
 func BuiltinTools(cfg BuiltinsConfig, client *ollama.Client) []Tool {
@@ -525,10 +549,24 @@ func guardTelegramBashCommand(ctx context.Context, cmd string) error {
 		return nil
 	}
 	reason := disallowedTelegramLifecycleReason(cmd)
-	if reason == "" {
+	if reason != "" {
+		return fmt.Errorf("command blocked in telegram bash: %s", reason)
+	}
+	if isTelegramBashAllowlisted(cmd) {
 		return nil
 	}
-	return fmt.Errorf("command blocked in telegram bash: %s", reason)
+	approvalReason := telegramBashApprovalReason(cmd)
+	approver, ok := BashApproverFromContext(ctx)
+	if !ok {
+		return fmt.Errorf("command requires approval in telegram bash: %s", approvalReason)
+	}
+	if err := approver.ApproveBashCommand(ctx, BashApprovalRequest{
+		Command: cmd,
+		Reason:  approvalReason,
+	}); err != nil {
+		return err
+	}
+	return nil
 }
 
 func disallowedTelegramLifecycleReason(cmd string) string {
@@ -549,6 +587,53 @@ func disallowedTelegramLifecycleReason(cmd string) string {
 		return "starting nested ollamaclaw launch/poller processes is not allowed in telegram sessions"
 	}
 	return ""
+}
+
+func isTelegramBashAllowlisted(cmd string) bool {
+	raw := strings.TrimSpace(cmd)
+	if raw == "" {
+		return false
+	}
+	// Keep auto-execution narrowly scoped to simple read-only commands.
+	if strings.ContainsAny(raw, ";&|><`$") {
+		return false
+	}
+	tokens := strings.Fields(strings.ToLower(raw))
+	if len(tokens) == 0 {
+		return false
+	}
+	switch tokens[0] {
+	case "pwd":
+		return len(tokens) == 1
+	case "ls":
+		return true
+	case "cat", "head", "tail", "stat", "wc":
+		return len(tokens) >= 2
+	case "grep":
+		return len(tokens) >= 3
+	case "find":
+		return len(tokens) >= 2
+	case "ps":
+		return true
+	case "git":
+		if len(tokens) < 2 {
+			return false
+		}
+		return tokens[1] == "status" || tokens[1] == "diff"
+	default:
+		return false
+	}
+}
+
+func telegramBashApprovalReason(cmd string) string {
+	raw := strings.TrimSpace(cmd)
+	if raw == "" {
+		return "empty command"
+	}
+	if strings.ContainsAny(raw, ";&|><`$") {
+		return "contains shell control operators"
+	}
+	return "command is outside the Telegram auto-allowlist"
 }
 
 func mustSchema(s string) json.RawMessage {
