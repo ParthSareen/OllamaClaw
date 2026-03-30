@@ -70,16 +70,21 @@ func TestParseOnOff(t *testing.T) {
 }
 
 func TestApprovalCallbackRoundTrip(t *testing.T) {
-	data := formatApprovalCallback("approve", "abc123")
+	data := formatApprovalCallback("allow", "abc123")
 	action, id, ok := parseApprovalCallback(data)
-	if !ok || action != "approve" || id != "abc123" {
+	if !ok || action != "allow" || id != "abc123" {
 		t.Fatalf("unexpected parse result: ok=%t action=%q id=%q", ok, action, id)
 	}
-	if _, _, ok := parseApprovalCallback("other:approve:abc123"); ok {
+	if _, _, ok := parseApprovalCallback("other:allow:abc123"); ok {
 		t.Fatalf("expected invalid prefix to fail")
 	}
-	if _, _, ok := parseApprovalCallback("appr:maybe:abc123"); ok {
+	if _, _, ok := parseApprovalCallback("appr:approve:abc123"); ok {
 		t.Fatalf("expected invalid action to fail")
+	}
+	data = formatApprovalCallback("always", "def456")
+	action, id, ok = parseApprovalCallback(data)
+	if !ok || action != "always" || id != "def456" {
+		t.Fatalf("unexpected always parse result: ok=%t action=%q id=%q", ok, action, id)
 	}
 }
 
@@ -196,11 +201,11 @@ func TestResolvePendingApproval(t *testing.T) {
 		Reason:     "outside allowlist",
 		CreatedAt:  time.Now().UTC(),
 		ExpiresAt:  time.Now().UTC().Add(time.Minute),
-		DecisionCh: make(chan bool, 1),
+		DecisionCh: make(chan approvalDecision, 1),
 	}
 	r.approvals[entry.ID] = entry
 
-	resolved, err := r.resolvePendingApproval(entry.ID, true, 100, 200)
+	resolved, err := r.resolvePendingApproval(entry.ID, approvalDecisionAllow, 100, 200)
 	if err != nil {
 		t.Fatalf("resolvePendingApproval error: %v", err)
 	}
@@ -208,9 +213,9 @@ func TestResolvePendingApproval(t *testing.T) {
 		t.Fatalf("unexpected resolved entry: %+v", resolved)
 	}
 	select {
-	case approved := <-entry.DecisionCh:
-		if !approved {
-			t.Fatalf("expected approved decision")
+	case decision := <-entry.DecisionCh:
+		if decision != approvalDecisionAllow {
+			t.Fatalf("expected allow decision, got %v", decision)
 		}
 	default:
 		t.Fatalf("expected decision to be sent")

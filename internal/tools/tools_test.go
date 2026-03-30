@@ -131,6 +131,9 @@ func TestGuardTelegramBashCommandApproverAllows(t *testing.T) {
 	if approver.lastReq.Reason == "" {
 		t.Fatalf("expected approval reason")
 	}
+	if !approver.lastReq.AllowAlways {
+		t.Fatalf("expected non-network command to support always-allow")
+	}
 }
 
 func TestGuardTelegramBashCommandApproverDenies(t *testing.T) {
@@ -140,6 +143,54 @@ func TestGuardTelegramBashCommandApproverDenies(t *testing.T) {
 	err := guardTelegramBashCommand(ctx, "touch /tmp/test-file")
 	if err == nil || !strings.Contains(err.Error(), "denied by user") {
 		t.Fatalf("expected deny error from approver, got %v", err)
+	}
+}
+
+func TestClassifyTelegramBashCommand(t *testing.T) {
+	cases := []struct {
+		cmd      string
+		want     telegramBashPolicy
+		reasonIn string
+	}{
+		{cmd: "ls -la", want: telegramBashPolicyAllow},
+		{cmd: "git status", want: telegramBashPolicyAllow},
+		{cmd: "ollama list", want: telegramBashPolicyAllow},
+		{cmd: "curl https://example.com", want: telegramBashPolicyRequireApproval, reasonIn: "network/data"},
+		{cmd: "touch /tmp/x", want: telegramBashPolicyRequireApproval, reasonIn: "outside"},
+		{cmd: "sudo ls", want: telegramBashPolicyDeny, reasonIn: "denied"},
+		{cmd: "rm -f ~/.ollamaclaw/launch.lock", want: telegramBashPolicyDeny, reasonIn: "lock files"},
+	}
+	for _, tc := range cases {
+		got, reason := classifyTelegramBashCommand(normalizeTelegramBashCommand(tc.cmd))
+		if got != tc.want {
+			t.Fatalf("classify(%q)=%v want=%v (reason=%q)", tc.cmd, got, tc.want, reason)
+		}
+		if tc.reasonIn != "" && !strings.Contains(strings.ToLower(reason), strings.ToLower(tc.reasonIn)) {
+			t.Fatalf("classify(%q) reason=%q expected to contain %q", tc.cmd, reason, tc.reasonIn)
+		}
+	}
+}
+
+func TestGuardTelegramBashCommandCurlAlwaysNeedsApproval(t *testing.T) {
+	ctx := WithSessionInfo(context.Background(), "telegram", "8750063231")
+	err := guardTelegramBashCommand(ctx, "curl https://example.com")
+	if err == nil || !strings.Contains(strings.ToLower(err.Error()), "requires approval") {
+		t.Fatalf("expected curl command to require approval, got %v", err)
+	}
+}
+
+func TestGuardTelegramBashCommandCurlDisablesAlwaysAllow(t *testing.T) {
+	approver := &stubBashApprover{}
+	ctx := WithSessionInfo(context.Background(), "telegram", "8750063231")
+	ctx = WithBashApprover(ctx, approver)
+	if err := guardTelegramBashCommand(ctx, "curl https://example.com"); err != nil {
+		t.Fatalf("expected approver path for curl, got %v", err)
+	}
+	if !approver.called {
+		t.Fatalf("expected approver to be called")
+	}
+	if approver.lastReq.AllowAlways {
+		t.Fatalf("expected curl approvals to disable always-allow")
 	}
 }
 

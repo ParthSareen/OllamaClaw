@@ -2,6 +2,7 @@ package telegram
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -44,14 +45,15 @@ type Runner struct {
 }
 
 const (
-	settingOffsetKey          = "telegram_last_update_id"
-	maxLogPreview             = 280
-	maxToolPreview            = 700
-	updateWorkers             = 8
-	approvalTTL               = 10 * time.Minute
-	maxApprovalCommandPreview = 300
-	approvalCallbackPrefix    = "appr"
-	unauthorizedReplyCooldown = time.Minute
+	settingOffsetKey                  = "telegram_last_update_id"
+	settingTelegramBashAlwaysAllowKey = "telegram_bash_always_allow"
+	maxLogPreview                     = 280
+	maxToolPreview                    = 700
+	updateWorkers                     = 8
+	approvalTTL                       = 10 * time.Minute
+	maxApprovalCommandPreview         = 300
+	approvalCallbackPrefix            = "appr"
+	unauthorizedReplyCooldown         = time.Minute
 )
 
 type inFlightTurn struct {
@@ -61,17 +63,27 @@ type inFlightTurn struct {
 }
 
 type pendingApproval struct {
-	ID         string
-	ChatID     int64
-	UserID     int64
-	SessionKey string
-	Command    string
-	Reason     string
-	CreatedAt  time.Time
-	ExpiresAt  time.Time
-	MessageID  int
-	DecisionCh chan bool
+	ID          string
+	ChatID      int64
+	UserID      int64
+	SessionKey  string
+	Command     string
+	Normalized  string
+	Reason      string
+	AllowAlways bool
+	CreatedAt   time.Time
+	ExpiresAt   time.Time
+	MessageID   int
+	DecisionCh  chan approvalDecision
 }
+
+type approvalDecision int
+
+const (
+	approvalDecisionDeny approvalDecision = iota
+	approvalDecisionAllow
+	approvalDecisionAllowAlways
+)
 
 type telegramBashApprover struct {
 	r          *Runner
@@ -82,7 +94,7 @@ type telegramBashApprover struct {
 }
 
 func (a *telegramBashApprover) ApproveBashCommand(ctx context.Context, req tools.BashApprovalRequest) error {
-	return a.r.requestBashApproval(ctx, a.bot, a.chatID, a.userID, a.sessionKey, req.Command, req.Reason)
+	return a.r.requestBashApproval(ctx, a.bot, a.chatID, a.userID, a.sessionKey, req.Command, req.Normalized, req.Reason, req.AllowAlways)
 }
 
 func (r *Runner) Run(ctx context.Context) error {
@@ -859,19 +871,27 @@ func parsePollerCandidates(psOutput string, selfPID int) []pollerCandidate {
 	return out
 }
 
-func (r *Runner) requestBashApproval(ctx context.Context, b *bot.Bot, chatID, userID int64, sessionKey, command, reason string) error {
+func (r *Runner) requestBashApproval(ctx context.Context, b *bot.Bot, chatID, userID int64, sessionKey, command, normalized, reason string, allowAlways bool) error {
+	normalized = strings.TrimSpace(normalized)
+	if allowAlways && normalized != "" && r.isTelegramBashAlwaysAllowed(ctx, chatID, userID, normalized) {
+		r.logf("bash approval bypassed (always allow match): chat=%d user=%d normalized=%q", chatID, userID, normalized)
+		return nil
+	}
+
 	id := strconv.FormatUint(r.nextApproval.Add(1), 36)
 	now := time.Now().UTC()
 	entry := &pendingApproval{
-		ID:         id,
-		ChatID:     chatID,
-		UserID:     userID,
-		SessionKey: sessionKey,
-		Command:    strings.TrimSpace(command),
-		Reason:     strings.TrimSpace(reason),
-		CreatedAt:  now,
-		ExpiresAt:  now.Add(approvalTTL),
-		DecisionCh: make(chan bool, 1),
+		ID:          id,
+		ChatID:      chatID,
+		UserID:      userID,
+		SessionKey:  sessionKey,
+		Command:     strings.TrimSpace(command),
+		Normalized:  normalized,
+		Reason:      strings.TrimSpace(reason),
+		AllowAlways: allowAlways,
+		CreatedAt:   now,
+		ExpiresAt:   now.Add(approvalTTL),
+		DecisionCh:  make(chan approvalDecision, 1),
 	}
 
 	r.approvalMu.Lock()
@@ -881,18 +901,33 @@ func (r *Runner) requestBashApproval(ctx context.Context, b *bot.Bot, chatID, us
 	r.approvals[id] = entry
 	r.approvalMu.Unlock()
 
-	text := fmt.Sprintf("Command requires approval.\nReason: %s\nID: %s\n\nCommand:\n%s\n\nTap Approve or Deny.",
+	choiceHint := "Tap Allow, Always allow, or Deny."
+	keyboardRows := [][]models.InlineKeyboardButton{
+		{
+			{Text: "Allow", CallbackData: formatApprovalCallback("allow", entry.ID)},
+			{Text: "Always allow", CallbackData: formatApprovalCallback("always", entry.ID)},
+		},
+		{
+			{Text: "Deny", CallbackData: formatApprovalCallback("deny", entry.ID)},
+		},
+	}
+	if !entry.AllowAlways {
+		choiceHint = "Tap Allow or Deny. Always allow is disabled for this command."
+		keyboardRows = [][]models.InlineKeyboardButton{
+			{
+				{Text: "Allow", CallbackData: formatApprovalCallback("allow", entry.ID)},
+				{Text: "Deny", CallbackData: formatApprovalCallback("deny", entry.ID)},
+			},
+		}
+	}
+	text := fmt.Sprintf("Command requires approval.\nReason: %s\nID: %s\n\nCommand:\n%s\n\n%s",
 		entry.Reason,
 		entry.ID,
 		truncateApprovalCommand(entry.Command),
+		choiceHint,
 	)
 	kb := &models.InlineKeyboardMarkup{
-		InlineKeyboard: [][]models.InlineKeyboardButton{
-			{
-				{Text: "Approve", CallbackData: formatApprovalCallback("approve", entry.ID)},
-				{Text: "Deny", CallbackData: formatApprovalCallback("deny", entry.ID)},
-			},
-		},
+		InlineKeyboard: keyboardRows,
 	}
 	msg, err := b.SendMessage(ctx, &bot.SendMessageParams{
 		ChatID:      chatID,
@@ -911,9 +946,9 @@ func (r *Runner) requestBashApproval(ctx context.Context, b *bot.Bot, chatID, us
 	timer := time.NewTimer(approvalTTL)
 	defer timer.Stop()
 	select {
-	case approved := <-entry.DecisionCh:
-		if approved {
-			r.logf("bash approval granted: id=%s chat=%d", entry.ID, chatID)
+	case decision := <-entry.DecisionCh:
+		if decision == approvalDecisionAllow || decision == approvalDecisionAllowAlways {
+			r.logf("bash approval granted: id=%s chat=%d decision=%s", entry.ID, chatID, approvalDecisionLabel(decision))
 			return nil
 		}
 		return fmt.Errorf("command denied via Telegram approval")
@@ -952,7 +987,8 @@ func (r *Runner) handleCallbackQuery(ctx context.Context, b *bot.Bot, cq *models
 		return
 	}
 
-	entry, err := r.resolvePendingApproval(approvalID, action == "approve", chatID, userID)
+	decision := approvalDecisionFromAction(action)
+	entry, err := r.resolvePendingApproval(approvalID, decision, chatID, userID)
 	if err != nil {
 		_, _ = b.AnswerCallbackQuery(ctx, &bot.AnswerCallbackQueryParams{
 			CallbackQueryID: cq.ID,
@@ -961,20 +997,37 @@ func (r *Runner) handleCallbackQuery(ctx context.Context, b *bot.Bot, cq *models
 		})
 		return
 	}
-	if hasMessage {
-		if action == "approve" {
-			r.markApprovalMessage(ctx, b, entry, "Approved. Executing command.")
-		} else {
-			r.markApprovalMessage(ctx, b, entry, "Denied.")
+	answerText := "Denied."
+	statusText := "Denied."
+	showAlert := false
+	switch decision {
+	case approvalDecisionAllow:
+		answerText = "Allowed."
+		statusText = "Allowed once. Executing command."
+	case approvalDecisionAllowAlways:
+		answerText = "Always-allow saved."
+		statusText = "Always allow saved. Executing command."
+		if !entry.AllowAlways {
+			answerText = "Allowed once."
+			statusText = "Allowed once. Always allow is disabled for this command."
+		} else if err := r.persistTelegramBashAlwaysAllow(ctx, entry.ChatID, entry.UserID, entry.Normalized); err != nil {
+			r.logf("failed to persist always-allow approval: id=%s chat=%d user=%d error=%v", entry.ID, entry.ChatID, entry.UserID, r.redactError(err))
+			answerText = "Allowed once (failed to save always-allow)."
+			statusText = "Allowed once. Failed to save always allow."
+			showAlert = true
 		}
+	}
+	if hasMessage {
+		r.markApprovalMessage(ctx, b, entry, statusText)
 	}
 	_, _ = b.AnswerCallbackQuery(ctx, &bot.AnswerCallbackQueryParams{
 		CallbackQueryID: cq.ID,
-		Text:            map[bool]string{true: "Approved.", false: "Denied."}[action == "approve"],
+		Text:            answerText,
+		ShowAlert:       showAlert,
 	})
 }
 
-func (r *Runner) resolvePendingApproval(id string, approved bool, chatID, userID int64) (*pendingApproval, error) {
+func (r *Runner) resolvePendingApproval(id string, decision approvalDecision, chatID, userID int64) (*pendingApproval, error) {
 	r.approvalMu.Lock()
 	entry, ok := r.approvals[id]
 	if !ok {
@@ -993,7 +1046,7 @@ func (r *Runner) resolvePendingApproval(id string, approved bool, chatID, userID
 	delete(r.approvals, id)
 	r.approvalMu.Unlock()
 	select {
-	case entry.DecisionCh <- approved:
+	case entry.DecisionCh <- decision:
 	default:
 	}
 	return entry, nil
@@ -1052,7 +1105,7 @@ func parseApprovalCallback(data string) (action, id string, ok bool) {
 		return "", "", false
 	}
 	switch parts[1] {
-	case "approve", "deny":
+	case "allow", "always", "deny":
 	default:
 		return "", "", false
 	}
@@ -1060,6 +1113,54 @@ func parseApprovalCallback(data string) (action, id string, ok bool) {
 		return "", "", false
 	}
 	return parts[1], parts[2], true
+}
+
+func approvalDecisionFromAction(action string) approvalDecision {
+	switch strings.TrimSpace(strings.ToLower(action)) {
+	case "allow":
+		return approvalDecisionAllow
+	case "always":
+		return approvalDecisionAllowAlways
+	default:
+		return approvalDecisionDeny
+	}
+}
+
+func approvalDecisionLabel(decision approvalDecision) string {
+	switch decision {
+	case approvalDecisionAllow:
+		return "allow"
+	case approvalDecisionAllowAlways:
+		return "always"
+	default:
+		return "deny"
+	}
+}
+
+func (r *Runner) isTelegramBashAlwaysAllowed(ctx context.Context, chatID, userID int64, normalized string) bool {
+	if r.Store == nil {
+		return false
+	}
+	key := telegramBashAlwaysAllowSettingKey(chatID, userID, normalized)
+	_, ok, err := r.Store.GetSetting(ctx, key)
+	if err != nil {
+		r.logf("failed to read always-allow setting: key=%s error=%v", key, r.redactError(err))
+		return false
+	}
+	return ok
+}
+
+func (r *Runner) persistTelegramBashAlwaysAllow(ctx context.Context, chatID, userID int64, normalized string) error {
+	if r.Store == nil {
+		return fmt.Errorf("settings store unavailable")
+	}
+	key := telegramBashAlwaysAllowSettingKey(chatID, userID, normalized)
+	return r.Store.SetSetting(ctx, key, time.Now().UTC().Format(time.RFC3339Nano))
+}
+
+func telegramBashAlwaysAllowSettingKey(chatID, userID int64, normalized string) string {
+	hash := sha256.Sum256([]byte(strings.TrimSpace(normalized)))
+	return fmt.Sprintf("%s:%d:%d:%x", settingTelegramBashAlwaysAllowKey, chatID, userID, hash[:])
 }
 
 func truncateApprovalCommand(cmd string) string {

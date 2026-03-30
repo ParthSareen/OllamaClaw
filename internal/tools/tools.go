@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -73,13 +74,50 @@ type SessionInfo struct {
 }
 
 type BashApprovalRequest struct {
-	Command string
-	Reason  string
+	Command     string
+	Normalized  string
+	Reason      string
+	AllowAlways bool
 }
 
 type BashApprover interface {
 	ApproveBashCommand(ctx context.Context, req BashApprovalRequest) error
 }
+
+type telegramBashPolicy int
+
+const (
+	telegramBashPolicyAllow telegramBashPolicy = iota
+	telegramBashPolicyRequireApproval
+	telegramBashPolicyDeny
+)
+
+var (
+	telegramAllowPatterns = []*regexp.Regexp{
+		// Read-only / inspection patterns.
+		regexp.MustCompile(`^pwd$`),
+		regexp.MustCompile(`^ls(?:\s+[-\w./@:=+]+)*$`),
+		regexp.MustCompile(`^(?:cat|head|tail|stat|wc)\s+[-\w./@:=+]+(?:\s+[-\w./@:=+]+)*$`),
+		regexp.MustCompile(`^grep(?:\s+[-\w./@:=+]+)+$`),
+		regexp.MustCompile(`^find(?:\s+[-\w./@:=+]+)+$`),
+		regexp.MustCompile(`^ps(?:\s+[-\w./@:=+]+)*$`),
+		regexp.MustCompile(`^git\s+(?:status|diff)(?:\s+[-\w./@:=+]+)*$`),
+		regexp.MustCompile(`^ollama(?:\s+[-\w./@:=+]+)*$`),
+	}
+	telegramApprovalPatterns = []*regexp.Regexp{
+		// Network/data tooling: always require explicit confirmation.
+		regexp.MustCompile(`^curl(?:\s|$)`),
+		regexp.MustCompile(`^wget(?:\s|$)`),
+		regexp.MustCompile(`^http(?:\s|$)`), // httpie
+		regexp.MustCompile(`^scp(?:\s|$)`),
+		regexp.MustCompile(`^ssh(?:\s|$)`),
+	}
+	telegramDenyPatterns = []*regexp.Regexp{
+		regexp.MustCompile(`\bsudo\b`),
+		regexp.MustCompile(`\bdoas\b`),
+		regexp.MustCompile(`\brm\s+-rf\s+/(?:\s|$)`),
+	}
+)
 
 func WithSessionInfo(ctx context.Context, transport, sessionKey string) context.Context {
 	return context.WithValue(ctx, sessionContextKey{}, SessionInfo{Transport: transport, SessionKey: sessionKey})
@@ -548,29 +586,84 @@ func guardTelegramBashCommand(ctx context.Context, cmd string) error {
 	if !ok || !strings.EqualFold(strings.TrimSpace(info.Transport), "telegram") {
 		return nil
 	}
-	reason := disallowedTelegramLifecycleReason(cmd)
-	if reason != "" {
+	normalized := normalizeTelegramBashCommand(cmd)
+	decision, reason := classifyTelegramBashCommand(normalized)
+	switch decision {
+	case telegramBashPolicyDeny:
 		return fmt.Errorf("command blocked in telegram bash: %s", reason)
-	}
-	if isTelegramBashAllowlisted(cmd) {
+	case telegramBashPolicyAllow:
+		return nil
+	default:
+		approver, ok := BashApproverFromContext(ctx)
+		if !ok {
+			return fmt.Errorf("command requires approval in telegram bash: %s", reason)
+		}
+		if err := approver.ApproveBashCommand(ctx, BashApprovalRequest{
+			Command:     cmd,
+			Normalized:  normalized,
+			Reason:      reason,
+			AllowAlways: canAlwaysAllowTelegramCommand(normalized),
+		}); err != nil {
+			return err
+		}
 		return nil
 	}
-	approvalReason := telegramBashApprovalReason(cmd)
-	approver, ok := BashApproverFromContext(ctx)
-	if !ok {
-		return fmt.Errorf("command requires approval in telegram bash: %s", approvalReason)
-	}
-	if err := approver.ApproveBashCommand(ctx, BashApprovalRequest{
-		Command: cmd,
-		Reason:  approvalReason,
-	}); err != nil {
-		return err
-	}
-	return nil
 }
 
-func disallowedTelegramLifecycleReason(cmd string) string {
-	norm := strings.ToLower(strings.Join(strings.Fields(cmd), " "))
+func classifyTelegramBashCommand(normalized string) (telegramBashPolicy, string) {
+	if normalized == "" {
+		return telegramBashPolicyRequireApproval, "empty command"
+	}
+	if containsShellControlOperators(normalized) {
+		return telegramBashPolicyRequireApproval, "contains shell control operators"
+	}
+	if reason := disallowedTelegramLifecycleReason(normalized); reason != "" {
+		return telegramBashPolicyDeny, reason
+	}
+	for _, rx := range telegramDenyPatterns {
+		if rx.MatchString(normalized) {
+			return telegramBashPolicyDeny, "matches a denied command pattern"
+		}
+	}
+	for _, rx := range telegramApprovalPatterns {
+		if rx.MatchString(normalized) {
+			// Explicit user requirement: curl always asks for approval.
+			return telegramBashPolicyRequireApproval, "network/data command requires explicit approval"
+		}
+	}
+	for _, rx := range telegramAllowPatterns {
+		if rx.MatchString(normalized) {
+			return telegramBashPolicyAllow, ""
+		}
+	}
+	return telegramBashPolicyRequireApproval, "command is outside the Telegram auto-allowlist"
+}
+
+func normalizeTelegramBashCommand(cmd string) string {
+	return strings.ToLower(strings.Join(strings.Fields(strings.TrimSpace(cmd)), " "))
+}
+
+func containsShellControlOperators(normalized string) bool {
+	return strings.ContainsAny(normalized, ";&|><`$")
+}
+
+func canAlwaysAllowTelegramCommand(normalized string) bool {
+	if normalized == "" {
+		return false
+	}
+	if containsShellControlOperators(normalized) {
+		return false
+	}
+	for _, rx := range telegramApprovalPatterns {
+		if rx.MatchString(normalized) {
+			return false
+		}
+	}
+	return true
+}
+
+func disallowedTelegramLifecycleReason(normalized string) string {
+	norm := normalized
 	if norm == "" {
 		return ""
 	}
@@ -587,53 +680,6 @@ func disallowedTelegramLifecycleReason(cmd string) string {
 		return "starting nested ollamaclaw launch/poller processes is not allowed in telegram sessions"
 	}
 	return ""
-}
-
-func isTelegramBashAllowlisted(cmd string) bool {
-	raw := strings.TrimSpace(cmd)
-	if raw == "" {
-		return false
-	}
-	// Keep auto-execution narrowly scoped to simple read-only commands.
-	if strings.ContainsAny(raw, ";&|><`$") {
-		return false
-	}
-	tokens := strings.Fields(strings.ToLower(raw))
-	if len(tokens) == 0 {
-		return false
-	}
-	switch tokens[0] {
-	case "pwd":
-		return len(tokens) == 1
-	case "ls":
-		return true
-	case "cat", "head", "tail", "stat", "wc":
-		return len(tokens) >= 2
-	case "grep":
-		return len(tokens) >= 3
-	case "find":
-		return len(tokens) >= 2
-	case "ps":
-		return true
-	case "git":
-		if len(tokens) < 2 {
-			return false
-		}
-		return tokens[1] == "status" || tokens[1] == "diff"
-	default:
-		return false
-	}
-}
-
-func telegramBashApprovalReason(cmd string) string {
-	raw := strings.TrimSpace(cmd)
-	if raw == "" {
-		return "empty command"
-	}
-	if strings.ContainsAny(raw, ";&|><`$") {
-		return "contains shell control operators"
-	}
-	return "command is outside the Telegram auto-allowlist"
 }
 
 func mustSchema(s string) json.RawMessage {
