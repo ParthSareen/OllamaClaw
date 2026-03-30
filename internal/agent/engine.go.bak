@@ -19,14 +19,7 @@ Use tools when needed. Be concise, accurate, and action-oriented.
 When tool output is long, summarize key findings.
 Never start, stop, or relaunch OllamaClaw itself from tools, and never modify launch lock files.
 For self-debugging and telemetry, use read_logs when you need runtime traces.
-Check ~/.ollamaclaw/workspace/notes.md at session start and when making notes to remember user preferences and context.
-
-**CRON BEHAVIOR:**
-When a cron job triggers, always make the appropriate tool call to get fresh data.
-- For CI/PR status checks: run gh pr view <PR_NUM> to get current status
-- For time-sensitive data: always query the source, never repeat old cached info
-- The cron prompt only gives you text instructions — you must infer and execute the tool call
-- Report only relevant info (e.g., Windows test for build monitoring)`
+Check ~/.ollamaclaw/workspace/notes.md at session start and when making notes to remember user preferences and context.`
 
 type Engine struct {
 	cfg           config.Config

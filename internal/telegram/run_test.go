@@ -200,21 +200,29 @@ func TestFormatLiveToolEvent(t *testing.T) {
 		Phase:      agent.ToolEventFinish,
 		Index:      2,
 		Name:       "bash",
+		ArgsJSON:   `{"command":"git remote show origin"}`,
 		DurationMs: 12,
 		ResultJSON: `{"exit_code":0}`,
 	})
 	if !strings.Contains(done, "tool done 2") || !strings.Contains(done, "result=") {
 		t.Fatalf("unexpected finish event format: %q", done)
 	}
+	if !strings.Contains(done, "git remote show origin") {
+		t.Fatalf("expected bash command preview in finish event, got %q", done)
+	}
 	errLine := formatLiveToolEvent(agent.ToolEvent{
 		Phase:      agent.ToolEventFinish,
 		Index:      3,
 		Name:       "bash",
+		ArgsJSON:   `{"command":"sleep 10"}`,
 		DurationMs: 2,
 		Error:      "context canceled",
 	})
 	if !strings.Contains(errLine, "error=context canceled") {
 		t.Fatalf("unexpected error event format: %q", errLine)
+	}
+	if !strings.Contains(errLine, "sleep 10") {
+		t.Fatalf("expected bash command preview in error event, got %q", errLine)
 	}
 }
 

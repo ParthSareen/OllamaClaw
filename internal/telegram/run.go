@@ -2,6 +2,7 @@ package telegram
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -667,13 +668,43 @@ func parseOnOff(raw string) (bool, bool) {
 }
 
 func formatLiveToolEvent(ev agent.ToolEvent) string {
+	label := liveToolLabel(ev)
 	if ev.Phase == agent.ToolEventStart {
-		return fmt.Sprintf("tool start %d: %s args=%s", ev.Index, ev.Name, truncateForLive(ev.ArgsJSON))
+		if label != ev.Name {
+			return fmt.Sprintf("tool start %d: %s", ev.Index, label)
+		}
+		return fmt.Sprintf("tool start %d: %s args=%s", ev.Index, label, truncateForLive(ev.ArgsJSON))
 	}
 	if strings.TrimSpace(ev.Error) != "" {
-		return fmt.Sprintf("tool done %d: %s (%d ms) error=%s", ev.Index, ev.Name, ev.DurationMs, truncateForLive(ev.Error))
+		return fmt.Sprintf("tool done %d: %s (%d ms) error=%s", ev.Index, label, ev.DurationMs, truncateForLive(ev.Error))
 	}
-	return fmt.Sprintf("tool done %d: %s (%d ms) result=%s", ev.Index, ev.Name, ev.DurationMs, truncateForLive(ev.ResultJSON))
+	return fmt.Sprintf("tool done %d: %s (%d ms) result=%s", ev.Index, label, ev.DurationMs, truncateForLive(ev.ResultJSON))
+}
+
+func liveToolLabel(ev agent.ToolEvent) string {
+	if !strings.EqualFold(strings.TrimSpace(ev.Name), "bash") {
+		return ev.Name
+	}
+	cmd := bashCommandFromArgs(ev.ArgsJSON)
+	if cmd == "" {
+		return ev.Name
+	}
+	return fmt.Sprintf("bash [%s]", truncateForLive(cmd))
+}
+
+func bashCommandFromArgs(argsJSON string) string {
+	if strings.TrimSpace(argsJSON) == "" {
+		return ""
+	}
+	var args map[string]interface{}
+	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
+		return ""
+	}
+	cmd, ok := args["command"].(string)
+	if !ok {
+		return ""
+	}
+	return strings.Join(strings.Fields(strings.TrimSpace(cmd)), " ")
 }
 
 func truncateForLive(v string) string {
