@@ -65,6 +65,7 @@ type HandleResult struct {
 	EvalTokens       int
 	Compacted        bool
 	ToolTrace        []ToolTraceEntry
+	ThinkingTrace    []ThinkingTraceEntry
 }
 
 type HandleOptions struct {
@@ -96,6 +97,12 @@ type ToolTraceEntry struct {
 	DurationMs int64
 }
 
+type ThinkingTraceEntry struct {
+	Step          int
+	Thinking      string
+	ToolCallCount int
+}
+
 func New(cfg config.Config, store *db.Store, client *ollama.Client, pm *plugin.Manager, cronCtrl tools.CronController) *Engine {
 	builtin := tools.BuiltinTools(tools.BuiltinsConfig{
 		ToolOutputMaxBytes: cfg.ToolOutputMaxBytes,
@@ -125,13 +132,15 @@ func (e *Engine) HandleTextWithOptions(ctx context.Context, transport, sessionKe
 		model = e.cfg.DefaultModel
 	}
 
-	thinkEnabled, _ := e.IsSessionThink(ctx, transport, sessionKey)
+	thinkSetting, _ := e.SessionThinkValue(ctx, transport, sessionKey)
+	thinkParam := thinkSettingToAPIValue(thinkSetting)
 
 	var lastReply string
 	var promptTokens int
 	var evalTokens int
 	compacted := false
 	toolTrace := []ToolTraceEntry{}
+	thinkingTrace := []ThinkingTraceEntry{}
 	toolCallIndex := 0
 
 	for i := 0; i < 12; i++ {
@@ -147,7 +156,7 @@ func (e *Engine) HandleTextWithOptions(ctx context.Context, transport, sessionKe
 		if err != nil {
 			return HandleResult{}, err
 		}
-		resp, err := e.client.Chat(ctx, ollama.ChatRequest{Model: model, Messages: msgList, Tools: toolDefs, Stream: false, Think: thinkEnabled})
+		resp, err := e.client.Chat(ctx, ollama.ChatRequest{Model: model, Messages: msgList, Tools: toolDefs, Stream: false, Think: thinkParam})
 		if err != nil {
 			if cerr := ctx.Err(); cerr != nil {
 				return HandleResult{}, cerr
@@ -175,12 +184,19 @@ func (e *Engine) HandleTextWithOptions(ctx context.Context, transport, sessionKe
 		if err := e.store.InsertMessage(ctx, &assistantMsg); err != nil {
 			return HandleResult{}, err
 		}
+		if strings.TrimSpace(resp.Message.Thinking) != "" {
+			thinkingTrace = append(thinkingTrace, ThinkingTraceEntry{
+				Step:          i + 1,
+				Thinking:      resp.Message.Thinking,
+				ToolCallCount: len(resp.Message.ToolCalls),
+			})
+		}
 
 		if len(resp.Message.ToolCalls) == 0 && strings.TrimSpace(resp.Message.Content) != "" {
 			lastReply = resp.Message.Content
 		}
 
-		justCompacted, err := e.maybeCompact(ctx, sess, model, resp.PromptEvalCount, thinkEnabled)
+		justCompacted, err := e.maybeCompact(ctx, sess, model, resp.PromptEvalCount, thinkParam)
 		if err != nil {
 			return HandleResult{}, err
 		}
@@ -278,6 +294,7 @@ func (e *Engine) HandleTextWithOptions(ctx context.Context, transport, sessionKe
 		EvalTokens:       evalTokens,
 		Compacted:        compacted,
 		ToolTrace:        toolTrace,
+		ThinkingTrace:    thinkingTrace,
 	}, nil
 }
 
@@ -356,15 +373,12 @@ func (e *Engine) SetSessionShowTools(ctx context.Context, transport, sessionKey 
 }
 
 func (e *Engine) IsSessionThink(ctx context.Context, transport, sessionKey string) (bool, error) {
-	v, ok, err := e.store.GetSetting(ctx, thinkSettingKey(transport, sessionKey))
+	value, err := e.SessionThinkValue(ctx, transport, sessionKey)
 	if err != nil {
 		return false, err
 	}
-	if !ok {
-		return false, nil
-	}
-	switch strings.ToLower(strings.TrimSpace(v)) {
-	case "1", "true", "on", "yes":
+	switch value {
+	case "on", "low", "medium", "high":
 		return true, nil
 	default:
 		return false, nil
@@ -372,11 +386,33 @@ func (e *Engine) IsSessionThink(ctx context.Context, transport, sessionKey strin
 }
 
 func (e *Engine) SetSessionThink(ctx context.Context, transport, sessionKey string, enabled bool) error {
-	val := "0"
 	if enabled {
-		val = "1"
+		return e.SetSessionThinkValue(ctx, transport, sessionKey, "on")
 	}
-	return e.store.SetSetting(ctx, thinkSettingKey(transport, sessionKey), val)
+	return e.SetSessionThinkValue(ctx, transport, sessionKey, "off")
+}
+
+func (e *Engine) SessionThinkValue(ctx context.Context, transport, sessionKey string) (string, error) {
+	v, ok, err := e.store.GetSetting(ctx, thinkSettingKey(transport, sessionKey))
+	if err != nil {
+		return "", err
+	}
+	if !ok {
+		return "off", nil
+	}
+	normalized, valid := normalizeThinkSetting(v)
+	if !valid {
+		return "off", nil
+	}
+	return normalized, nil
+}
+
+func (e *Engine) SetSessionThinkValue(ctx context.Context, transport, sessionKey, value string) error {
+	normalized, valid := normalizeThinkSetting(value)
+	if !valid {
+		return fmt.Errorf("invalid think value: %q", value)
+	}
+	return e.store.SetSetting(ctx, thinkSettingKey(transport, sessionKey), normalized)
 }
 
 func (e *Engine) combinedTools(ctx context.Context) ([]tools.Tool, error) {
@@ -444,7 +480,7 @@ func (e *Engine) runtimeSystemPrompt() string {
 	return defaultSystemPrompt
 }
 
-func (e *Engine) maybeCompact(ctx context.Context, sess db.Session, model string, promptEvalCount int, thinkEnabled bool) (bool, error) {
+func (e *Engine) maybeCompact(ctx context.Context, sess db.Session, model string, promptEvalCount int, thinkParam interface{}) (bool, error) {
 	thresholdTokens := int(float64(e.cfg.ContextWindowTokens) * e.cfg.CompactionThreshold)
 	if promptEvalCount < thresholdTokens {
 		return false, nil
@@ -493,7 +529,7 @@ func (e *Engine) maybeCompact(ctx context.Context, sess db.Session, model string
 		{Role: "system", Content: "Summarize the archived conversation for future continuation. Include decisions, constraints, file/task state, and unresolved items."},
 		{Role: "user", Content: "Previous summary:\n" + latestSummary + "\n\nMessages to summarize:\n" + string(b)},
 	}
-	summaryResp, err := e.client.Chat(ctx, ollama.ChatRequest{Model: model, Messages: summaryPrompt, Stream: false, Think: thinkEnabled})
+	summaryResp, err := e.client.Chat(ctx, ollama.ChatRequest{Model: model, Messages: summaryPrompt, Stream: false, Think: thinkParam})
 	if err != nil {
 		return false, err
 	}
@@ -552,6 +588,36 @@ func showToolsSettingKey(transport, sessionKey string) string {
 
 func thinkSettingKey(transport, sessionKey string) string {
 	return fmt.Sprintf("session_think:%s:%s", transport, sessionKey)
+}
+
+func normalizeThinkSetting(raw string) (string, bool) {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "1", "true", "on", "yes":
+		return "on", true
+	case "0", "false", "off", "no":
+		return "off", true
+	case "low", "medium", "high":
+		return strings.ToLower(strings.TrimSpace(raw)), true
+	case "default", "auto":
+		return "default", true
+	default:
+		return "", false
+	}
+}
+
+func thinkSettingToAPIValue(value string) interface{} {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "on":
+		return true
+	case "off":
+		return false
+	case "low", "medium", "high":
+		return strings.ToLower(strings.TrimSpace(value))
+	case "default":
+		return nil
+	default:
+		return false
+	}
 }
 
 func truncateForTrace(v string, max int) string {

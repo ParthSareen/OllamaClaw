@@ -304,7 +304,12 @@ func (r *Runner) handleUpdate(ctx context.Context, b *bot.Bot, update *models.Up
 	}
 	defer r.endTurn(sessionKey, turnID)
 
-	progress, _ := b.SendMessage(ctx, &bot.SendMessageParams{ChatID: chatID, Text: "Thinking..."})
+	thinkValue, _ := r.Engine.SessionThinkValue(ctx, "telegram", sessionKey)
+	progressText := "Working..."
+	if thinkValue != "off" {
+		progressText = "Thinking..."
+	}
+	progress, _ := b.SendMessage(ctx, &bot.SendMessageParams{ChatID: chatID, Text: progressText})
 	if progress != nil {
 		r.logf("progress message sent: chat=%d message_id=%d", chatID, progress.ID)
 	}
@@ -354,12 +359,21 @@ func (r *Runner) handleUpdate(ctx context.Context, b *bot.Bot, update *models.Up
 		r.logf("%s", line)
 	}
 	verbose, _ := r.Engine.IsSessionVerbose(ctx, "telegram", sessionKey)
-	if verbose && len(res.ToolTrace) > 0 {
-		trace := formatToolTrace(res.ToolTrace)
-		if strings.TrimSpace(res.AssistantContent) == "" {
-			res.AssistantContent = trace
-		} else {
-			res.AssistantContent += "\n\n" + trace
+	if verbose {
+		sections := make([]string, 0, 2)
+		if len(res.ThinkingTrace) > 0 {
+			sections = append(sections, formatThinkingTrace(res.ThinkingTrace))
+		}
+		if len(res.ToolTrace) > 0 {
+			sections = append(sections, formatToolTrace(res.ToolTrace))
+		}
+		if len(sections) > 0 {
+			trace := strings.Join(sections, "\n\n")
+			if strings.TrimSpace(res.AssistantContent) == "" {
+				res.AssistantContent = trace
+			} else {
+				res.AssistantContent += "\n\n" + trace
+			}
 		}
 	}
 	if strings.TrimSpace(res.AssistantContent) == "" {
@@ -471,10 +485,10 @@ func (r *Runner) handleCommand(ctx context.Context, b *bot.Bot, chatID int64, ra
 	switch cmd {
 	case "start":
 		r.logf("command start: chat=%d", chatID)
-		send("OllamaClaw is ready.\nCommands:\n/start\n/help\n/model [name]\n/tools\n/show tools [on|off]\n/show thinking [on|off]\n/verbose [on|off]\n/think [on|off]\n/status\n/reset\n/stop\n/restart")
+		send("OllamaClaw is ready.\nCommands:\n/start\n/help\n/model [name]\n/tools\n/show tools [on|off]\n/show thinking [on|off]\n/verbose [on|off]\n/think [on|off|low|medium|high|default]\n/status\n/reset\n/stop\n/restart")
 	case "help":
 		r.logf("command help: chat=%d", chatID)
-		send("Commands:\n/start\n/help\n/model [name]\n/tools\n/show tools [on|off]\n/show thinking [on|off]\n/verbose [on|off]\n/think [on|off]\n/status\n/reset\n/stop\n/restart\n\nSend any text to chat with OllamaClaw.")
+		send("Commands:\n/start\n/help\n/model [name]\n/tools\n/show tools [on|off]\n/show thinking [on|off]\n/verbose [on|off]\n/think [on|off|low|medium|high|default]\n/status\n/reset\n/stop\n/restart\n\nSend any text to chat with OllamaClaw.")
 	case "reset":
 		r.logf("command reset: chat=%d", chatID)
 		newSess, err := r.Engine.ResetSession(ctx, "telegram", sessionKey)
@@ -602,38 +616,38 @@ func (r *Runner) handleCommand(ctx context.Context, b *bot.Bot, chatID int64, ra
 	case "think":
 		r.logf("command think: chat=%d args=%q", chatID, r.previewForLog(strings.Join(parts[1:], " ")))
 		if len(parts) == 1 {
-			enabled, err := r.Engine.IsSessionThink(ctx, "telegram", sessionKey)
+			value, err := r.Engine.SessionThinkValue(ctx, "telegram", sessionKey)
 			if err != nil {
 				r.logf("command think read failed: chat=%d error=%v", chatID, r.redactError(err))
 				sendErr(err)
 				return
 			}
-			send(fmt.Sprintf("think: %t", enabled))
+			send(fmt.Sprintf("think: %s", value))
 			return
 		}
-		enabled, ok := parseOnOff(parts[1])
+		value, ok := parseThinkValue(parts[1])
 		if !ok {
-			send("usage: /think [on|off]")
+			send("usage: /think [on|off|low|medium|high|default]")
 			return
 		}
-		if err := r.Engine.SetSessionThink(ctx, "telegram", sessionKey, enabled); err != nil {
+		if err := r.Engine.SetSessionThinkValue(ctx, "telegram", sessionKey, value); err != nil {
 			r.logf("command think set failed: chat=%d error=%v", chatID, r.redactError(err))
 			sendErr(err)
 			return
 		}
-		r.logf("command think set: chat=%d enabled=%t", chatID, enabled)
-		send(fmt.Sprintf("think: %t", enabled))
+		r.logf("command think set: chat=%d value=%s", chatID, value)
+		send(fmt.Sprintf("think: %s", value))
 	case "status":
 		r.logf("command status: chat=%d", chatID)
 		enabledPlugins, _ := r.Store.ListPlugins(ctx, true)
 		verbose, _ := r.Engine.IsSessionVerbose(ctx, "telegram", sessionKey)
 		showTools, _ := r.Engine.IsSessionShowTools(ctx, "telegram", sessionKey)
-		think, _ := r.Engine.IsSessionThink(ctx, "telegram", sessionKey)
+		thinkValue, _ := r.Engine.SessionThinkValue(ctx, "telegram", sessionKey)
 		version := strings.TrimSpace(r.AppVersion)
 		if version == "" {
 			version = "dev"
 		}
-		text := fmt.Sprintf("status:\nversion: %s\nmodel: %s\nverbose: %t\nshow_tools: %t\nthink: %t\nprompt_tokens: %d\ncompletion_tokens: %d\ncompactions: %d\nenabled_plugins: %d\ndb: %s\nlog: %s", version, redactTelegramToken(r.Cfg.Telegram.BotToken, sess.ModelOverride), verbose, showTools, think, sess.TotalPromptToken, sess.TotalEvalToken, sess.CompactionCount, len(enabledPlugins), r.Cfg.DBPath, strings.TrimSpace(r.Cfg.LogPath))
+		text := fmt.Sprintf("status:\nversion: %s\nmodel: %s\nverbose: %t\nshow_tools: %t\nthink: %s\nprompt_tokens: %d\ncompletion_tokens: %d\ncompactions: %d\nenabled_plugins: %d\ndb: %s\nlog: %s", version, redactTelegramToken(r.Cfg.Telegram.BotToken, sess.ModelOverride), verbose, showTools, thinkValue, sess.TotalPromptToken, sess.TotalEvalToken, sess.CompactionCount, len(enabledPlugins), r.Cfg.DBPath, strings.TrimSpace(r.Cfg.LogPath))
 		send(text)
 	case "stop":
 		r.logf("command stop: chat=%d", chatID)
@@ -779,6 +793,21 @@ func parseOnOff(raw string) (bool, bool) {
 	}
 }
 
+func parseThinkValue(raw string) (string, bool) {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "on", "1", "true", "yes":
+		return "on", true
+	case "off", "0", "false", "no":
+		return "off", true
+	case "low", "medium", "high":
+		return strings.ToLower(strings.TrimSpace(raw)), true
+	case "default", "auto":
+		return "default", true
+	default:
+		return "", false
+	}
+}
+
 func formatLiveToolEvent(ev agent.ToolEvent) string {
 	label := liveToolLabel(ev)
 	if ev.Phase == agent.ToolEventStart {
@@ -846,6 +875,23 @@ func formatToolTrace(trace []agent.ToolTraceEntry) string {
 			line += " result=" + entry.ResultJSON
 		}
 		lines = append(lines, line)
+	}
+	return strings.Join(lines, "\n")
+}
+
+func formatThinkingTrace(trace []agent.ThinkingTraceEntry) string {
+	if len(trace) == 0 {
+		return "thinking trace: (none)"
+	}
+	lines := []string{"thinking trace:"}
+	for i, entry := range trace {
+		mode := "final"
+		if entry.ToolCallCount > 0 {
+			mode = fmt.Sprintf("tool-step (%d tool calls)", entry.ToolCallCount)
+		}
+		thinking := strings.Join(strings.Fields(strings.TrimSpace(entry.Thinking)), " ")
+		thinking = truncateForLive(thinking)
+		lines = append(lines, fmt.Sprintf("%d. step=%d %s: %s", i+1, entry.Step, mode, thinking))
 	}
 	return strings.Join(lines, "\n")
 }

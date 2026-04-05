@@ -85,8 +85,8 @@ ollamaclaw plugin update [plugin-id]
 - `/tools` lists built-in + enabled plugin tools
 - `/show tools [on|off]` toggles live tool event messages
 - `/show thinking [on|off]` toggles thinking visibility mode
-- `/verbose [on|off]` enables/disables tool-call tracing for this chat session
-- `/think [on|off]` shows/sets thinking mode
+- `/verbose [on|off]` enables/disables tool + thinking traces for this chat session
+- `/think [on|off|low|medium|high|default]` shows/sets think value
 - `/status` shows model, token counters, compactions, enabled plugin count, DB path
 - `/reset` archives current session and starts a fresh one
 - `/stop` interrupts the active turn
@@ -218,7 +218,7 @@ Example:
 {
   "id": "acme.echo",
   "name": "Echo",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "apiVersion": "1.0",
   "entrypoint": {"command": "python3", "args": ["plugin.py"]},
   "protocol": {"jsonrpc": "2.0", "transport": "stdio", "framing": "ndjson"},

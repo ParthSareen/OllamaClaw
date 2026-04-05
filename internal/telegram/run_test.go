@@ -70,6 +70,31 @@ func TestParseOnOff(t *testing.T) {
 	}
 }
 
+func TestParseThinkValue(t *testing.T) {
+	tests := []struct {
+		in   string
+		want string
+		ok   bool
+	}{
+		{in: "on", want: "on", ok: true},
+		{in: "off", want: "off", ok: true},
+		{in: "low", want: "low", ok: true},
+		{in: "medium", want: "medium", ok: true},
+		{in: "high", want: "high", ok: true},
+		{in: "default", want: "default", ok: true},
+		{in: "auto", want: "default", ok: true},
+		{in: "false", want: "off", ok: true},
+		{in: "true", want: "on", ok: true},
+		{in: "invalid", want: "", ok: false},
+	}
+	for _, tc := range tests {
+		got, ok := parseThinkValue(tc.in)
+		if ok != tc.ok || got != tc.want {
+			t.Fatalf("parseThinkValue(%q) = (%q,%t), want (%q,%t)", tc.in, got, ok, tc.want, tc.ok)
+		}
+	}
+}
+
 func TestApprovalCallbackRoundTrip(t *testing.T) {
 	data := formatApprovalCallback("allow", "abc123")
 	action, id, ok := parseApprovalCallback(data)
@@ -324,6 +349,23 @@ func TestFormatLiveToolEvent(t *testing.T) {
 	}
 	if !strings.Contains(errLine, "sleep 10") {
 		t.Fatalf("expected bash command preview in error event, got %q", errLine)
+	}
+}
+
+func TestFormatThinkingTrace(t *testing.T) {
+	trace := []agent.ThinkingTraceEntry{
+		{Step: 1, Thinking: " plan first, then run tools ", ToolCallCount: 2},
+		{Step: 2, Thinking: "finalize answer", ToolCallCount: 0},
+	}
+	out := formatThinkingTrace(trace)
+	if !strings.Contains(out, "thinking trace:") {
+		t.Fatalf("missing thinking trace header: %q", out)
+	}
+	if !strings.Contains(out, "step=1") || !strings.Contains(out, "tool-step (2 tool calls)") {
+		t.Fatalf("missing step/tool-step details: %q", out)
+	}
+	if !strings.Contains(out, "step=2") || !strings.Contains(out, "final") {
+		t.Fatalf("missing final-step details: %q", out)
 	}
 }
 

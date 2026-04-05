@@ -311,6 +311,173 @@ func TestSessionShowToolsRoundTrip(t *testing.T) {
 	}
 }
 
+func TestSessionThinkValueRoundTrip(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	ctx := context.Background()
+	engine, store := newTestEngine(t, "http://127.0.0.1:65535")
+	defer store.Close()
+
+	value, err := engine.SessionThinkValue(ctx, "telegram", "123")
+	if err != nil {
+		t.Fatalf("SessionThinkValue error: %v", err)
+	}
+	if value != "off" {
+		t.Fatalf("expected default think value off, got %q", value)
+	}
+
+	if err := engine.SetSessionThinkValue(ctx, "telegram", "123", "low"); err != nil {
+		t.Fatalf("SetSessionThinkValue(low) error: %v", err)
+	}
+	value, err = engine.SessionThinkValue(ctx, "telegram", "123")
+	if err != nil {
+		t.Fatalf("SessionThinkValue error: %v", err)
+	}
+	if value != "low" {
+		t.Fatalf("expected think value low, got %q", value)
+	}
+	enabled, err := engine.IsSessionThink(ctx, "telegram", "123")
+	if err != nil {
+		t.Fatalf("IsSessionThink error: %v", err)
+	}
+	if !enabled {
+		t.Fatalf("expected low think value to be treated as enabled")
+	}
+
+	if err := engine.SetSessionThinkValue(ctx, "telegram", "123", "default"); err != nil {
+		t.Fatalf("SetSessionThinkValue(default) error: %v", err)
+	}
+	value, err = engine.SessionThinkValue(ctx, "telegram", "123")
+	if err != nil {
+		t.Fatalf("SessionThinkValue error: %v", err)
+	}
+	if value != "default" {
+		t.Fatalf("expected think value default, got %q", value)
+	}
+
+	if err := engine.SetSessionThinkValue(ctx, "telegram", "123", "nope"); err == nil {
+		t.Fatalf("expected invalid think value to error")
+	}
+}
+
+func TestHandleTextSendsExplicitThinkFalse(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	ctx := context.Background()
+
+	var seenThink interface{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req ollama.ChatRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		seenThink = req.Think
+		resp := ollama.ChatResponse{
+			Message:         ollama.ChatMessage{Role: "assistant", Content: "ok"},
+			PromptEvalCount: 4,
+			EvalCount:       1,
+			Done:            true,
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer srv.Close()
+
+	engine, store := newTestEngine(t, srv.URL)
+	defer store.Close()
+
+	if _, err := engine.HandleText(ctx, "repl", "default", "hello"); err != nil {
+		t.Fatalf("HandleText error: %v", err)
+	}
+	v, ok := seenThink.(bool)
+	if !ok {
+		t.Fatalf("expected think field to decode as bool, got %T", seenThink)
+	}
+	if v {
+		t.Fatalf("expected explicit think=false by default")
+	}
+}
+
+func TestHandleTextSendsThinkLevelString(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	ctx := context.Background()
+
+	var seenThink interface{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req ollama.ChatRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		seenThink = req.Think
+		resp := ollama.ChatResponse{
+			Message:         ollama.ChatMessage{Role: "assistant", Content: "ok"},
+			PromptEvalCount: 4,
+			EvalCount:       1,
+			Done:            true,
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer srv.Close()
+
+	engine, store := newTestEngine(t, srv.URL)
+	defer store.Close()
+	if err := engine.SetSessionThinkValue(ctx, "repl", "default", "high"); err != nil {
+		t.Fatalf("SetSessionThinkValue(high) error: %v", err)
+	}
+
+	if _, err := engine.HandleText(ctx, "repl", "default", "hello"); err != nil {
+		t.Fatalf("HandleText error: %v", err)
+	}
+	v, ok := seenThink.(string)
+	if !ok {
+		t.Fatalf("expected think field to decode as string, got %T", seenThink)
+	}
+	if v != "high" {
+		t.Fatalf("expected think=high, got %q", v)
+	}
+}
+
+func TestHandleTextCollectsThinkingTrace(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	ctx := context.Background()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		resp := ollama.ChatResponse{
+			Message: ollama.ChatMessage{
+				Role:     "assistant",
+				Content:  "ok",
+				Thinking: "first, check the request quickly",
+			},
+			PromptEvalCount: 4,
+			EvalCount:       1,
+			Done:            true,
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer srv.Close()
+
+	engine, store := newTestEngine(t, srv.URL)
+	defer store.Close()
+
+	res, err := engine.HandleText(ctx, "repl", "default", "hello")
+	if err != nil {
+		t.Fatalf("HandleText error: %v", err)
+	}
+	if len(res.ThinkingTrace) != 1 {
+		t.Fatalf("expected 1 thinking trace entry, got %d", len(res.ThinkingTrace))
+	}
+	entry := res.ThinkingTrace[0]
+	if entry.Step != 1 {
+		t.Fatalf("expected thinking trace step=1, got %d", entry.Step)
+	}
+	if !strings.Contains(entry.Thinking, "check the request") {
+		t.Fatalf("unexpected thinking trace content: %q", entry.Thinking)
+	}
+	if entry.ToolCallCount != 0 {
+		t.Fatalf("expected thinking trace tool count 0, got %d", entry.ToolCallCount)
+	}
+}
+
 func TestHandleTextUsesSystemPromptFromHomeFile(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)

@@ -43,8 +43,13 @@ func runREPL(ctx context.Context, eng *agent.Engine) error {
 			fmt.Printf("\n%s\n", res.AssistantContent)
 		}
 		verbose, _ := eng.IsSessionVerbose(ctx, "repl", "default")
-		if verbose && len(res.ToolTrace) > 0 {
-			fmt.Printf("\n%s\n", formatToolTrace(res.ToolTrace))
+		if verbose {
+			if len(res.ThinkingTrace) > 0 {
+				fmt.Printf("\n%s\n", formatThinkingTrace(res.ThinkingTrace))
+			}
+			if len(res.ToolTrace) > 0 {
+				fmt.Printf("\n%s\n", formatToolTrace(res.ToolTrace))
+			}
 		}
 	}
 	if err := scanner.Err(); err != nil {
@@ -63,7 +68,7 @@ func handleREPLCommand(ctx context.Context, eng *agent.Engine, cmd string) error
 		fmt.Println("bye")
 		return nil
 	case "/help":
-		fmt.Println("Commands: /help /model [name] /tools /verbose [on|off] /think [on|off] /status /reset /exit")
+		fmt.Println("Commands: /help /model [name] /tools /verbose [on|off] /think [on|off|low|medium|high|default] /status /reset /exit")
 		return nil
 	case "/model":
 		sess, err := eng.GetOrCreateSession(ctx, "repl", "default")
@@ -103,8 +108,8 @@ func handleREPLCommand(ctx context.Context, eng *agent.Engine, cmd string) error
 			return err
 		}
 		verbose, _ := eng.IsSessionVerbose(ctx, "repl", "default")
-		think, _ := eng.IsSessionThink(ctx, "repl", "default")
-		fmt.Printf("session: %s\nmodel: %s\nverbose: %t\nthink: %t\nprompt_tokens: %d\ncompletion_tokens: %d\ncompactions: %d\n", sess.ID, sess.ModelOverride, verbose, think, sess.TotalPromptToken, sess.TotalEvalToken, sess.CompactionCount)
+		thinkValue, _ := eng.SessionThinkValue(ctx, "repl", "default")
+		fmt.Printf("session: %s\nmodel: %s\nverbose: %t\nthink: %s\nprompt_tokens: %d\ncompletion_tokens: %d\ncompactions: %d\n", sess.ID, sess.ModelOverride, verbose, thinkValue, sess.TotalPromptToken, sess.TotalEvalToken, sess.CompactionCount)
 		return nil
 	case "/verbose":
 		const transport = "repl"
@@ -131,22 +136,22 @@ func handleREPLCommand(ctx context.Context, eng *agent.Engine, cmd string) error
 		const transport = "repl"
 		const sessionKey = "default"
 		if len(parts) == 1 {
-			enabled, err := eng.IsSessionThink(ctx, transport, sessionKey)
+			value, err := eng.SessionThinkValue(ctx, transport, sessionKey)
 			if err != nil {
 				return err
 			}
-			fmt.Printf("think: %t\n", enabled)
+			fmt.Printf("think: %s\n", value)
 			return nil
 		}
-		enabled, ok := parseOnOff(parts[1])
+		value, ok := parseThinkValue(parts[1])
 		if !ok {
-			fmt.Println("usage: /think [on|off]")
+			fmt.Println("usage: /think [on|off|low|medium|high|default]")
 			return nil
 		}
-		if err := eng.SetSessionThink(ctx, transport, sessionKey, enabled); err != nil {
+		if err := eng.SetSessionThinkValue(ctx, transport, sessionKey, value); err != nil {
 			return err
 		}
-		fmt.Printf("think: %t\n", enabled)
+		fmt.Printf("think: %s\n", value)
 		return nil
 	case "/reset":
 		sess, err := eng.ResetSession(ctx, "repl", "default")
@@ -172,6 +177,21 @@ func parseOnOff(raw string) (bool, bool) {
 	}
 }
 
+func parseThinkValue(raw string) (string, bool) {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "on", "1", "true", "yes":
+		return "on", true
+	case "off", "0", "false", "no":
+		return "off", true
+	case "low", "medium", "high":
+		return strings.ToLower(strings.TrimSpace(raw)), true
+	case "default", "auto":
+		return "default", true
+	default:
+		return "", false
+	}
+}
+
 func formatToolTrace(trace []agent.ToolTraceEntry) string {
 	if len(trace) == 0 {
 		return "tool calls: (none)"
@@ -188,6 +208,22 @@ func formatToolTrace(trace []agent.ToolTraceEntry) string {
 			line += " result=" + entry.ResultJSON
 		}
 		lines = append(lines, line)
+	}
+	return strings.Join(lines, "\n")
+}
+
+func formatThinkingTrace(trace []agent.ThinkingTraceEntry) string {
+	if len(trace) == 0 {
+		return "thinking trace: (none)"
+	}
+	lines := []string{"thinking trace:"}
+	for i, entry := range trace {
+		mode := "final"
+		if entry.ToolCallCount > 0 {
+			mode = fmt.Sprintf("tool-step (%d tool calls)", entry.ToolCallCount)
+		}
+		thinking := strings.Join(strings.Fields(strings.TrimSpace(entry.Thinking)), " ")
+		lines = append(lines, fmt.Sprintf("%d. step=%d %s: %s", i+1, entry.Step, mode, thinking))
 	}
 	return strings.Join(lines, "\n")
 }

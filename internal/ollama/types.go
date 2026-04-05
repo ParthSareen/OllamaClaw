@@ -37,7 +37,7 @@ type ChatRequest struct {
 	Messages []ChatMessage    `json:"messages"`
 	Tools    []ToolDefinition `json:"tools,omitempty"`
 	Stream   bool             `json:"stream"`
-	Think    bool             `json:"think,omitempty"`
+	Think    interface{}      `json:"think,omitempty"`
 }
 
 type ChatResponse struct {
