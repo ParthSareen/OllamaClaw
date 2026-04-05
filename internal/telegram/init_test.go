@@ -116,13 +116,13 @@ func TestCallHonorsBoundedTimeout(t *testing.T) {
 	}
 }
 
-func TestBotCommandDefinitionsIncludesStopAndShow(t *testing.T) {
+func TestBotCommandDefinitionsIncludesStopShowAndRestart(t *testing.T) {
 	cmds := botCommandDefinitions()
 	got := map[string]bool{}
 	for _, c := range cmds {
 		got[c["command"]] = true
 	}
-	for _, want := range []string{"start", "help", "show", "status", "stop"} {
+	for _, want := range []string{"start", "help", "show", "status", "stop", "restart"} {
 		if !got[want] {
 			t.Fatalf("expected command %q to be present", want)
 		}

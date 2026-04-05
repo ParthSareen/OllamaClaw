@@ -218,3 +218,28 @@ func TestPreviewCommandForError(t *testing.T) {
 		t.Fatalf("expected truncated preview of length 180 with ellipsis, got len=%d value=%q", len(got), got)
 	}
 }
+
+func TestRuntimeBuildLabel(t *testing.T) {
+	origVersion := BuildVersion
+	origCommit := BuildCommit
+	origDate := BuildDate
+	t.Cleanup(func() {
+		BuildVersion = origVersion
+		BuildCommit = origCommit
+		BuildDate = origDate
+	})
+
+	BuildVersion = "1.2.3"
+	BuildCommit = "0123456789abcdef"
+	BuildDate = "2026-04-04T00:00:00Z"
+	if got := runtimeBuildLabel(); got != "1.2.3 commit=0123456789ab built=2026-04-04T00:00:00Z" {
+		t.Fatalf("unexpected build label: %q", got)
+	}
+
+	BuildVersion = ""
+	BuildCommit = "unknown"
+	BuildDate = ""
+	if got := runtimeBuildLabel(); got != "0.1.0" {
+		t.Fatalf("expected fallback build label 0.1.0, got %q", got)
+	}
+}

@@ -311,6 +311,58 @@ func TestSessionShowToolsRoundTrip(t *testing.T) {
 	}
 }
 
+func TestHandleTextUsesSystemPromptFromHomeFile(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	ctx := context.Background()
+
+	promptPath, err := config.SystemPromptPath()
+	if err != nil {
+		t.Fatalf("SystemPromptPath error: %v", err)
+	}
+	custom := "You are a custom prompt for testing."
+	if err := os.MkdirAll(filepath.Dir(promptPath), 0o755); err != nil {
+		t.Fatalf("mkdir prompt dir: %v", err)
+	}
+	if err := os.WriteFile(promptPath, []byte(custom), 0o600); err != nil {
+		t.Fatalf("write prompt file: %v", err)
+	}
+
+	var firstSystem string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req ollama.ChatRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		if len(req.Messages) > 0 {
+			firstSystem = req.Messages[0].Content
+		}
+		resp := ollama.ChatResponse{
+			Message:         ollama.ChatMessage{Role: "assistant", Content: "ok"},
+			PromptEvalCount: 4,
+			EvalCount:       1,
+			Done:            true,
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer srv.Close()
+
+	engine, store := newTestEngine(t, srv.URL)
+	defer store.Close()
+
+	res, err := engine.HandleText(ctx, "repl", "default", "hello")
+	if err != nil {
+		t.Fatalf("HandleText error: %v", err)
+	}
+	if res.AssistantContent != "ok" {
+		t.Fatalf("unexpected assistant content: %q", res.AssistantContent)
+	}
+	if firstSystem != custom {
+		t.Fatalf("expected system prompt %q, got %q", custom, firstSystem)
+	}
+}
+
 func newTestEngine(t *testing.T, ollamaHost string) (*Engine, *db.Store) {
 	t.Helper()
 	cfg := config.Default()

@@ -80,6 +80,7 @@ func botCommandDefinitions() []map[string]string {
 		{"command": "think", "description": "Show or set thinking mode"},
 		{"command": "status", "description": "Show status and token usage"},
 		{"command": "stop", "description": "Stop the active turn"},
+		{"command": "restart", "description": "Restart the launch loop"},
 	}
 }
 

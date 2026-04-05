@@ -15,6 +15,7 @@ const (
 	defaultStateDBFile   = "state.db"
 	defaultLogFile       = "ollamaclaw.log"
 	defaultLockFile      = "plugins.lock.json"
+	defaultPromptFile    = "system_prompt.txt"
 )
 
 // Config stores runtime settings for OllamaClaw.
@@ -48,7 +49,7 @@ func Default() Config {
 		LogPath:              filepath.Join(base, defaultLogFile),
 		CompactionThreshold:  0.8,
 		KeepRecentTurns:      8,
-		ContextWindowTokens:  128000,
+		ContextWindowTokens:  252000,
 		ToolOutputMaxBytes:   16 * 1024,
 		BashTimeoutSeconds:   120,
 		PluginCallTimeoutSec: 60,
@@ -86,6 +87,14 @@ func PluginsDir() (string, error) {
 		return "", err
 	}
 	return filepath.Join(dir, "plugins"), nil
+}
+
+func SystemPromptPath() (string, error) {
+	dir, err := ConfigDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, defaultPromptFile), nil
 }
 
 func EnsureBaseDir() error {

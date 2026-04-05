@@ -25,6 +25,12 @@ import (
 
 type App struct{}
 
+var (
+	BuildVersion = "0.1.0"
+	BuildCommit  = "unknown"
+	BuildDate    = "unknown"
+)
+
 func New() *App { return &App{} }
 
 func (a *App) Run(args []string) error {
@@ -43,6 +49,9 @@ func (a *App) Run(args []string) error {
 		return a.runTelegram(args[1:])
 	case "plugin":
 		return a.runPlugin(args[1:])
+	case "version", "--version":
+		fmt.Println(runtimeBuildLabel())
+		return nil
 	case "help", "--help", "-h":
 		a.printUsage()
 		return nil
@@ -69,6 +78,7 @@ Usage:
   ollamaclaw plugin disable <plugin-id>
   ollamaclaw plugin remove <plugin-id>
   ollamaclaw plugin update [plugin-id]
+  ollamaclaw version
 `)
 }
 
@@ -163,6 +173,8 @@ func (a *App) runLaunch(args []string) error {
 	if len(args) != 0 {
 		return errors.New("launch takes no arguments")
 	}
+	buildLabel := runtimeBuildLabel()
+	fmt.Printf("ollamaclaw %s\n", buildLabel)
 	cfg, err := config.Load()
 	if err != nil {
 		return err
@@ -203,12 +215,40 @@ func (a *App) runLaunch(args []string) error {
 		return launchConfigError(r.cfg)
 	}
 	runner := telegram.Runner{
-		Cfg:       r.cfg,
-		Store:     r.store,
-		Engine:    r.engine,
-		Scheduler: r.cron,
+		Cfg:        r.cfg,
+		Store:      r.store,
+		Engine:     r.engine,
+		Scheduler:  r.cron,
+		AppVersion: buildLabel,
 	}
-	return runner.Run(context.Background())
+	for {
+		err := runner.Run(context.Background())
+		if errors.Is(err, telegram.ErrRestartRequested) {
+			fmt.Println("launch restart requested from Telegram; relaunching...")
+			continue
+		}
+		return err
+	}
+}
+
+func runtimeBuildLabel() string {
+	version := strings.TrimSpace(BuildVersion)
+	if version == "" {
+		version = "0.1.0"
+	}
+	parts := []string{version}
+	commit := strings.TrimSpace(BuildCommit)
+	if commit != "" && !strings.EqualFold(commit, "unknown") {
+		if len(commit) > 12 {
+			commit = commit[:12]
+		}
+		parts = append(parts, "commit="+commit)
+	}
+	buildDate := strings.TrimSpace(BuildDate)
+	if buildDate != "" && !strings.EqualFold(buildDate, "unknown") {
+		parts = append(parts, "built="+buildDate)
+	}
+	return strings.Join(parts, " ")
 }
 
 func (a *App) runPlugin(args []string) error {

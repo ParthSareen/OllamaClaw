@@ -39,6 +39,7 @@ func TestParseCommand(t *testing.T) {
 		{in: "/ show thinking on", want: "show"},
 		{in: "/show thinking off", want: "show"},
 		{in: "/stop", want: "stop"},
+		{in: "/restart", want: "restart"},
 		{in: "plain text", want: ""},
 		{in: "", want: ""},
 	}
@@ -185,6 +186,33 @@ func TestRunnerEndTurnRequiresMatchingID(t *testing.T) {
 	r.endTurn("123", id+1)
 	if _, ok := r.stopTurn("123"); !ok {
 		t.Fatalf("turn should remain active when endTurn uses stale id")
+	}
+}
+
+func TestRunnerRequestRestart(t *testing.T) {
+	r := &Runner{}
+	if r.requestRestart() {
+		t.Fatalf("expected requestRestart without active run context to return false")
+	}
+
+	canceled := make(chan struct{}, 1)
+	r.setRunCancel(func() {
+		select {
+		case canceled <- struct{}{}:
+		default:
+		}
+	})
+
+	if !r.requestRestart() {
+		t.Fatalf("expected requestRestart to return true when run cancel is set")
+	}
+	if !r.restarting.Load() {
+		t.Fatalf("expected restarting flag to be set")
+	}
+	select {
+	case <-canceled:
+	case <-time.After(100 * time.Millisecond):
+		t.Fatalf("expected requestRestart to call run cancel")
 	}
 }
 

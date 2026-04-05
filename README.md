@@ -83,9 +83,14 @@ ollamaclaw plugin update [plugin-id]
 - `/help` shows usage
 - `/model [name]` shows/sets per-chat model
 - `/tools` lists built-in + enabled plugin tools
+- `/show tools [on|off]` toggles live tool event messages
+- `/show thinking [on|off]` toggles thinking visibility mode
 - `/verbose [on|off]` enables/disables tool-call tracing for this chat session
+- `/think [on|off]` shows/sets thinking mode
 - `/status` shows model, token counters, compactions, enabled plugin count, DB path
 - `/reset` archives current session and starts a fresh one
+- `/stop` interrupts the active turn
+- `/restart` restarts the launch loop from Telegram
 
 ## Built-in tools
 
@@ -149,6 +154,8 @@ export OLLAMA_API_KEY=...
 
 File: `~/.ollamaclaw/config.json`
 
+Runtime system prompt file: `~/.ollamaclaw/system_prompt.txt` (read dynamically each turn; falls back to built-in prompt if missing/empty)
+
 Defaults:
 
 ```json
@@ -158,7 +165,7 @@ Defaults:
   "db_path": "~/.ollamaclaw/state.db",
   "compaction_threshold": 0.8,
   "keep_recent_turns": 8,
-  "context_window_tokens": 128000,
+  "context_window_tokens": 252000,
   "tool_output_max_bytes": 16384,
   "bash_timeout_seconds": 120,
   "plugin_call_timeout_sec": 60,

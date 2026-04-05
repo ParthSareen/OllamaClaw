@@ -26,15 +26,19 @@ import (
 )
 
 type Runner struct {
-	Cfg       config.Config
-	Store     *db.Store
-	Engine    *agent.Engine
-	Scheduler *cronjobs.Manager
+	Cfg        config.Config
+	Store      *db.Store
+	Engine     *agent.Engine
+	Scheduler  *cronjobs.Manager
+	AppVersion string
 
 	lastUpdateID atomic.Int64
 	nextTurnID   atomic.Uint64
+	restarting   atomic.Bool
 	logMu        sync.Mutex
 	logFile      *os.File
+	runMu        sync.Mutex
+	runCancel    context.CancelFunc
 	turnMu       sync.Mutex
 	inFlight     map[string]inFlightTurn
 	nextApproval atomic.Uint64
@@ -55,6 +59,8 @@ const (
 	approvalCallbackPrefix            = "appr"
 	unauthorizedReplyCooldown         = time.Minute
 )
+
+var ErrRestartRequested = errors.New("telegram restart requested")
 
 type inFlightTurn struct {
 	id     uint64
@@ -105,7 +111,11 @@ func (r *Runner) Run(ctx context.Context) error {
 
 	offset := r.readOffset(ctx)
 	r.lastUpdateID.Store(int64(offset))
-	r.logf("launch starting: db=%s owner_chat_id=%d owner_user_id=%d initial_offset=%d", r.Cfg.DBPath, r.Cfg.Telegram.OwnerChatID, r.Cfg.Telegram.OwnerUserID, offset)
+	version := strings.TrimSpace(r.AppVersion)
+	if version == "" {
+		version = "dev"
+	}
+	r.logf("launch starting: version=%s db=%s owner_chat_id=%d owner_user_id=%d initial_offset=%d", version, r.Cfg.DBPath, r.Cfg.Telegram.OwnerChatID, r.Cfg.Telegram.OwnerUserID, offset)
 
 	if err := r.ensurePollingOwnership(ctx, offset); err != nil {
 		r.logf("telegram polling preflight failed: %v", r.redactError(err))
@@ -114,7 +124,10 @@ func (r *Runner) Run(ctx context.Context) error {
 	r.logf("telegram polling preflight passed")
 
 	runCtx, cancel := context.WithCancel(ctx)
+	r.restarting.Store(false)
+	r.setRunCancel(cancel)
 	defer cancel()
+	defer r.setRunCancel(nil)
 
 	opts := []bot.Option{
 		bot.WithDefaultHandler(r.handleUpdate),
@@ -178,6 +191,10 @@ func (r *Runner) Run(ctx context.Context) error {
 	}
 	r.logf("telegram bot running")
 	b.Start(runCtx)
+	if r.restarting.Load() {
+		r.logf("telegram runner stopped: restart requested")
+		return ErrRestartRequested
+	}
 	r.logf("telegram runner stopped")
 	return nil
 }
@@ -454,10 +471,10 @@ func (r *Runner) handleCommand(ctx context.Context, b *bot.Bot, chatID int64, ra
 	switch cmd {
 	case "start":
 		r.logf("command start: chat=%d", chatID)
-		send("OllamaClaw is ready.\nCommands:\n/start\n/help\n/model [name]\n/tools\n/show tools [on|off]\n/show thinking [on|off]\n/verbose [on|off]\n/think [on|off]\n/status\n/reset\n/stop")
+		send("OllamaClaw is ready.\nCommands:\n/start\n/help\n/model [name]\n/tools\n/show tools [on|off]\n/show thinking [on|off]\n/verbose [on|off]\n/think [on|off]\n/status\n/reset\n/stop\n/restart")
 	case "help":
 		r.logf("command help: chat=%d", chatID)
-		send("Commands:\n/start\n/help\n/model [name]\n/tools\n/show tools [on|off]\n/show thinking [on|off]\n/verbose [on|off]\n/think [on|off]\n/status\n/reset\n/stop\n\nSend any text to chat with OllamaClaw.")
+		send("Commands:\n/start\n/help\n/model [name]\n/tools\n/show tools [on|off]\n/show thinking [on|off]\n/verbose [on|off]\n/think [on|off]\n/status\n/reset\n/stop\n/restart\n\nSend any text to chat with OllamaClaw.")
 	case "reset":
 		r.logf("command reset: chat=%d", chatID)
 		newSess, err := r.Engine.ResetSession(ctx, "telegram", sessionKey)
@@ -612,7 +629,11 @@ func (r *Runner) handleCommand(ctx context.Context, b *bot.Bot, chatID int64, ra
 		verbose, _ := r.Engine.IsSessionVerbose(ctx, "telegram", sessionKey)
 		showTools, _ := r.Engine.IsSessionShowTools(ctx, "telegram", sessionKey)
 		think, _ := r.Engine.IsSessionThink(ctx, "telegram", sessionKey)
-		text := fmt.Sprintf("status:\nmodel: %s\nverbose: %t\nshow_tools: %t\nthink: %t\nprompt_tokens: %d\ncompletion_tokens: %d\ncompactions: %d\nenabled_plugins: %d\ndb: %s\nlog: %s", redactTelegramToken(r.Cfg.Telegram.BotToken, sess.ModelOverride), verbose, showTools, think, sess.TotalPromptToken, sess.TotalEvalToken, sess.CompactionCount, len(enabledPlugins), r.Cfg.DBPath, strings.TrimSpace(r.Cfg.LogPath))
+		version := strings.TrimSpace(r.AppVersion)
+		if version == "" {
+			version = "dev"
+		}
+		text := fmt.Sprintf("status:\nversion: %s\nmodel: %s\nverbose: %t\nshow_tools: %t\nthink: %t\nprompt_tokens: %d\ncompletion_tokens: %d\ncompactions: %d\nenabled_plugins: %d\ndb: %s\nlog: %s", version, redactTelegramToken(r.Cfg.Telegram.BotToken, sess.ModelOverride), verbose, showTools, think, sess.TotalPromptToken, sess.TotalEvalToken, sess.CompactionCount, len(enabledPlugins), r.Cfg.DBPath, strings.TrimSpace(r.Cfg.LogPath))
 		send(text)
 	case "stop":
 		r.logf("command stop: chat=%d", chatID)
@@ -623,10 +644,45 @@ func (r *Runner) handleCommand(ctx context.Context, b *bot.Bot, chatID int64, ra
 		}
 		r.logf("command stop signaled: chat=%d session_key=%s turn_id=%d", chatID, sessionKey, turn.id)
 		send("stopping current turn...")
+	case "restart":
+		r.logf("command restart: chat=%d", chatID)
+		turn, ok := r.stopTurn(sessionKey)
+		if ok {
+			r.logf("command restart interrupted turn: chat=%d session_key=%s turn_id=%d", chatID, sessionKey, turn.id)
+		}
+		if !r.requestRestart() {
+			send("restart unavailable right now")
+			return
+		}
+		msg := "restarting now..."
+		if ok {
+			msg = "restarting now (active turn interrupted)..."
+		}
+		sendCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_, _ = b.SendMessage(sendCtx, &bot.SendMessageParams{ChatID: chatID, Text: msg})
 	default:
 		r.logf("unknown command: chat=%d cmd=%s", chatID, cmd)
 		send("unknown command")
 	}
+}
+
+func (r *Runner) setRunCancel(cancel context.CancelFunc) {
+	r.runMu.Lock()
+	defer r.runMu.Unlock()
+	r.runCancel = cancel
+}
+
+func (r *Runner) requestRestart() bool {
+	r.runMu.Lock()
+	cancel := r.runCancel
+	r.runMu.Unlock()
+	if cancel == nil {
+		return false
+	}
+	r.restarting.Store(true)
+	cancel()
+	return true
 }
 
 func (r *Runner) beginTurn(sessionKey string, chatID int64, cancel context.CancelFunc) (uint64, bool) {

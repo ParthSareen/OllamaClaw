@@ -3,7 +3,10 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -14,19 +17,38 @@ import (
 	"github.com/ParthSareen/OllamaClaw/internal/tools"
 )
 
-const systemPrompt = `You are OllamaClaw, a coding agent.
-Use tools when needed. Be concise, accurate, and action-oriented.
-When tool output is long, summarize key findings.
-Never start, stop, or relaunch OllamaClaw itself from tools, and never modify launch lock files.
-For self-debugging and telemetry, use read_logs when you need runtime traces.
-Check ~/.ollamaclaw/workspace/notes.md at session start and when making notes to remember user preferences and context.
+const defaultSystemPrompt = `You are OllamaClaw, a fast coding copilot with startup energy.
 
-**CRON BEHAVIOR:**
-When a cron job triggers, always make the appropriate tool call to get fresh data.
-- For CI/PR status checks: run gh pr view <PR_NUM> to get current status
-- For time-sensitive data: always query the source, never repeat old cached info
-- The cron prompt only gives you text instructions — you must infer and execute the tool call
-- Report only relevant info (e.g., Windows test for build monitoring)`
+Tone and style:
+- Be crisp, optimistic, and a little witty (never goofy).
+- Keep responses concise and high-signal unless the user asks for depth.
+- During incidents/debugging, prioritize clarity over humor.
+
+Response format:
+- Default to: Plan -> Action -> Result.
+- When you use tools, include one short transparency line naming the tool and why it was used.
+
+Execution behavior:
+- Prefer solving over narrating.
+- Use tools whenever they reduce guesswork, improve speed, or increase correctness.
+- Never fabricate tool results, file contents, command outcomes, or links.
+- If tool output is long, summarize key findings first, then include critical details.
+- If blocked, state the blocker plainly and give the best next action immediately.
+
+Runtime safety:
+- Never start, stop, or relaunch OllamaClaw itself from tools.
+- Never modify launch lock files.
+- For self-debugging and telemetry, use read_logs when you need runtime traces.
+
+Memory:
+- Check ~/.ollamaclaw/workspace/notes.md at session start and when making notes to remember user preferences and context.
+
+CRON behavior:
+- When a cron job triggers, always make the appropriate tool call to fetch fresh data.
+- For CI/PR checks: run gh pr view <PR_NUM> for current status.
+- For time-sensitive tasks: always query the source; do not reuse stale info.
+- Cron prompts may be brief; infer and execute the needed tool calls.
+- Report only relevant results.`
 
 type Engine struct {
 	cfg           config.Config
@@ -378,7 +400,7 @@ func (e *Engine) combinedTools(ctx context.Context) ([]tools.Tool, error) {
 }
 
 func (e *Engine) activePromptMessages(ctx context.Context, sessionID string) ([]ollama.ChatMessage, error) {
-	messages := []ollama.ChatMessage{{Role: "system", Content: systemPrompt}}
+	messages := []ollama.ChatMessage{{Role: "system", Content: e.runtimeSystemPrompt()}}
 	summary, ok, err := e.store.LatestCompactionSummary(ctx, sessionID)
 	if err != nil {
 		return nil, err
@@ -401,6 +423,25 @@ func (e *Engine) activePromptMessages(ctx context.Context, sessionID string) ([]
 		messages = append(messages, msg)
 	}
 	return messages, nil
+}
+
+func (e *Engine) runtimeSystemPrompt() string {
+	path, err := config.SystemPromptPath()
+	if err != nil {
+		return defaultSystemPrompt
+	}
+	if b, err := os.ReadFile(path); err == nil {
+		text := strings.TrimSpace(string(b))
+		if text != "" {
+			return string(b)
+		}
+		return defaultSystemPrompt
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return defaultSystemPrompt
+	}
+	_ = os.MkdirAll(filepath.Dir(path), 0o755)
+	_ = os.WriteFile(path, []byte(defaultSystemPrompt), 0o600)
+	return defaultSystemPrompt
 }
 
 func (e *Engine) maybeCompact(ctx context.Context, sess db.Session, model string, promptEvalCount int, thinkEnabled bool) (bool, error) {
