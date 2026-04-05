@@ -1,7 +1,7 @@
 # OllamaClaw
 
 OllamaClaw is a Telegram-first Go coding agent which uses Ollama. Hacking on this to use as a playground for different ideas and experiements. Currently using it to run crons, reminders, and small tasks.
-Current app version: `0.1.2`.
+Current app version: `0.1.3`.
 
 It supports:
 - Shared agent core for `repl` and `telegram` modes
@@ -161,6 +161,7 @@ export OLLAMA_API_KEY=...
 File: `~/.ollamaclaw/config.json`
 
 Runtime system prompt file: `~/.ollamaclaw/system_prompt.txt` (read dynamically each turn; falls back to built-in prompt if missing/empty)
+Core memories file: `~/.ollamaclaw/core_memories.md` (updated in background every 10 user turns and injected as a system context block)
 
 Defaults:
 
@@ -206,6 +207,15 @@ Compaction archives old rows (`archived=1`) and keeps raw history in SQLite.
 - Result: save summary in `compactions`, archive old messages, keep recent turns active
 - Active prompt: `system + latest summary + unarchived recent messages`
 
+## Core memories behavior
+
+- Trigger: every `10` user turns per session (`role=user` messages only)
+- Runs in background (non-blocking to active chat/cron turn)
+- Summarizes stable preferences/workflows/constraints from recent dialogue
+- Writes to `~/.ollamaclaw/core_memories.md` using managed markers
+- Enforces a hard cap of `4000` characters for stored/injected core memory content
+- Injects managed core memories into prompt context as a dedicated system message
+
 ## Plugin system (v1)
 
 Runtime:
@@ -226,7 +236,7 @@ Example:
 {
   "id": "acme.echo",
   "name": "Echo",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "apiVersion": "1.0",
   "entrypoint": {"command": "python3", "args": ["plugin.py"]},
   "protocol": {"jsonrpc": "2.0", "transport": "stdio", "framing": "ndjson"},

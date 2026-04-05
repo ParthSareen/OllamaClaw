@@ -530,6 +530,143 @@ func TestHandleTextUsesSystemPromptFromHomeFile(t *testing.T) {
 	}
 }
 
+func TestHandleTextInjectsCoreMemoriesFromFile(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	ctx := context.Background()
+
+	corePath, err := config.CoreMemoriesPath()
+	if err != nil {
+		t.Fatalf("CoreMemoriesPath error: %v", err)
+	}
+	core := coreMemoriesStartMarker + "\n- prefers terse answers\n- uses telegram heavily\n" + coreMemoriesEndMarker + "\n"
+	if err := os.MkdirAll(filepath.Dir(corePath), 0o755); err != nil {
+		t.Fatalf("mkdir core memory dir: %v", err)
+	}
+	if err := os.WriteFile(corePath, []byte(core), 0o600); err != nil {
+		t.Fatalf("write core memory file: %v", err)
+	}
+
+	var messages []ollama.ChatMessage
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req ollama.ChatRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		messages = req.Messages
+		resp := ollama.ChatResponse{
+			Message:         ollama.ChatMessage{Role: "assistant", Content: "ok"},
+			PromptEvalCount: 4,
+			EvalCount:       1,
+			Done:            true,
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer srv.Close()
+
+	engine, store := newTestEngine(t, srv.URL)
+	defer store.Close()
+
+	if _, err := engine.HandleText(ctx, "repl", "default", "hello"); err != nil {
+		t.Fatalf("HandleText error: %v", err)
+	}
+	if len(messages) < 2 {
+		t.Fatalf("expected at least 2 prompt messages, got %d", len(messages))
+	}
+	if !strings.HasPrefix(messages[1].Content, "Core memories:\n") {
+		t.Fatalf("expected core memory system message, got %q", messages[1].Content)
+	}
+	if strings.Contains(messages[1].Content, coreMemoriesStartMarker) {
+		t.Fatalf("expected markers to be stripped from injected memory, got %q", messages[1].Content)
+	}
+	if !strings.Contains(messages[1].Content, "prefers terse answers") {
+		t.Fatalf("expected injected memory content, got %q", messages[1].Content)
+	}
+}
+
+func TestUpsertManagedCoreMemoriesPreservesUserContent(t *testing.T) {
+	existing := strings.Join([]string{
+		"# Notes",
+		"Keep this line",
+		"",
+		coreMemoriesStartMarker,
+		"- old memory",
+		coreMemoriesEndMarker,
+		"",
+		"Manual footer",
+	}, "\n")
+	updated := upsertManagedCoreMemories(existing, "- new memory")
+	if !strings.Contains(updated, "Keep this line") || !strings.Contains(updated, "Manual footer") {
+		t.Fatalf("expected non-managed content to be preserved, got %q", updated)
+	}
+	if strings.Contains(updated, "- old memory") {
+		t.Fatalf("expected managed section to be replaced, got %q", updated)
+	}
+	if !strings.Contains(updated, "- new memory") {
+		t.Fatalf("expected new managed content, got %q", updated)
+	}
+}
+
+func TestClampToMaxChars(t *testing.T) {
+	in := strings.Repeat("a", coreMemoriesMaxChars+37)
+	got := clampToMaxChars(in, coreMemoriesMaxChars)
+	if len([]rune(got)) != coreMemoriesMaxChars {
+		t.Fatalf("expected %d chars, got %d", coreMemoriesMaxChars, len([]rune(got)))
+	}
+}
+
+func TestHandleTextInjectsClampedCoreMemories(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	ctx := context.Background()
+
+	corePath, err := config.CoreMemoriesPath()
+	if err != nil {
+		t.Fatalf("CoreMemoriesPath error: %v", err)
+	}
+	longMem := "- " + strings.Repeat("x", coreMemoriesMaxChars+250)
+	core := coreMemoriesStartMarker + "\n" + longMem + "\n" + coreMemoriesEndMarker + "\n"
+	if err := os.MkdirAll(filepath.Dir(corePath), 0o755); err != nil {
+		t.Fatalf("mkdir core memory dir: %v", err)
+	}
+	if err := os.WriteFile(corePath, []byte(core), 0o600); err != nil {
+		t.Fatalf("write core memory file: %v", err)
+	}
+
+	var messages []ollama.ChatMessage
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req ollama.ChatRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		messages = req.Messages
+		resp := ollama.ChatResponse{
+			Message:         ollama.ChatMessage{Role: "assistant", Content: "ok"},
+			PromptEvalCount: 4,
+			EvalCount:       1,
+			Done:            true,
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer srv.Close()
+
+	engine, store := newTestEngine(t, srv.URL)
+	defer store.Close()
+
+	if _, err := engine.HandleText(ctx, "repl", "default", "hello"); err != nil {
+		t.Fatalf("HandleText error: %v", err)
+	}
+	if len(messages) < 2 {
+		t.Fatalf("expected at least 2 prompt messages, got %d", len(messages))
+	}
+	injected := strings.TrimPrefix(messages[1].Content, "Core memories:\n")
+	if len([]rune(injected)) > coreMemoriesMaxChars {
+		t.Fatalf("expected injected core memories <= %d chars, got %d", coreMemoriesMaxChars, len([]rune(injected)))
+	}
+}
+
 func newTestEngine(t *testing.T, ollamaHost string) (*Engine, *db.Store) {
 	t.Helper()
 	cfg := config.Default()

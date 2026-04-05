@@ -363,6 +363,15 @@ func (s *Store) NextMessageSeq(ctx context.Context, sessionID string) (int, erro
 	return seq, nil
 }
 
+func (s *Store) CountMessagesByRole(ctx context.Context, sessionID, role string) (int, error) {
+	row := s.db.QueryRowContext(ctx, `SELECT COUNT(1) FROM messages WHERE session_id = ? AND role = ?`, sessionID, role)
+	var count int
+	if err := row.Scan(&count); err != nil {
+		return 0, fmt.Errorf("count messages by role: %w", err)
+	}
+	return count, nil
+}
+
 func (s *Store) InsertMessage(ctx context.Context, m *Message) error {
 	if m.Seq == 0 {
 		seq, err := s.NextMessageSeq(ctx, m.SessionID)

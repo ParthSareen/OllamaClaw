@@ -16,6 +16,7 @@ const (
 	defaultLogFile       = "ollamaclaw.log"
 	defaultLockFile      = "plugins.lock.json"
 	defaultPromptFile    = "system_prompt.txt"
+	defaultCoreMemFile   = "core_memories.md"
 )
 
 // Config stores runtime settings for OllamaClaw.
@@ -95,6 +96,14 @@ func SystemPromptPath() (string, error) {
 		return "", err
 	}
 	return filepath.Join(dir, defaultPromptFile), nil
+}
+
+func CoreMemoriesPath() (string, error) {
+	dir, err := ConfigDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, defaultCoreMemFile), nil
 }
 
 func EnsureBaseDir() error {

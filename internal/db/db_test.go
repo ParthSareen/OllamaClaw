@@ -77,6 +77,20 @@ func TestMessageArchiveAndCompactionSummary(t *testing.T) {
 	if summary != "summary" {
 		t.Fatalf("unexpected summary %q", summary)
 	}
+	countUser, err := store.CountMessagesByRole(ctx, sess.ID, "user")
+	if err != nil {
+		t.Fatalf("CountMessagesByRole(user) error: %v", err)
+	}
+	if countUser != 1 {
+		t.Fatalf("expected 1 user message, got %d", countUser)
+	}
+	countTool, err := store.CountMessagesByRole(ctx, sess.ID, "tool")
+	if err != nil {
+		t.Fatalf("CountMessagesByRole(tool) error: %v", err)
+	}
+	if countTool != 0 {
+		t.Fatalf("expected 0 tool messages, got %d", countTool)
+	}
 }
 
 func TestCronJobSafePersistence(t *testing.T) {

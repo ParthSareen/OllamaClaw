@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/ParthSareen/OllamaClaw/internal/config"
@@ -17,12 +19,23 @@ import (
 	"github.com/ParthSareen/OllamaClaw/internal/tools"
 )
 
+const (
+	coreMemoriesTurnInterval = 10
+	coreMemoriesMaxMessages  = 40
+	coreMemoriesTimeout      = 30 * time.Second
+	coreMemoriesMaxChars     = 4000
+	coreMemoriesStartMarker  = "<!-- OLLAMACLAW_CORE_MEMORIES_START -->"
+	coreMemoriesEndMarker    = "<!-- OLLAMACLAW_CORE_MEMORIES_END -->"
+)
+
 const defaultSystemPrompt = `You are OllamaClaw, a fast coding copilot with startup energy.
 
 Tone and style:
 - Be crisp, optimistic, and a little witty (never goofy).
 - Keep responses concise and high-signal unless the user asks for depth.
 - During incidents/debugging, prioritize clarity over humor.
+- Add brief playful color when it helps morale, but keep technical guidance precise.
+- Celebrate progress with short confidence-boosting lines when work lands cleanly.
 
 Response format:
 - Default to: Plan -> Action -> Result.
@@ -40,22 +53,23 @@ Runtime safety:
 - Never modify launch lock files.
 - For self-debugging and telemetry, use read_logs when you need runtime traces.
 
-Memory:
-- Check ~/.ollamaclaw/workspace/notes.md at session start and when making notes to remember user preferences and context.
-
 CRON behavior:
-- When a cron job triggers, always make the appropriate tool call to fetch fresh data.
+- When a cron job includes prefetched command outputs, treat them as primary run data.
+- Reuse prefetched outputs when sufficient; call extra tools only for missing or stale data.
+- Prefer stable read-only commands for recurring cron tasks so they can be auto-prefetched.
 - For CI/PR checks: run gh pr view <PR_NUM> for current status.
 - For time-sensitive tasks: always query the source; do not reuse stale info.
 - Cron prompts may be brief; infer and execute the needed tool calls.
 - Report only relevant results.`
 
 type Engine struct {
-	cfg           config.Config
-	store         *db.Store
-	client        *ollama.Client
-	pluginManager *plugin.Manager
-	builtinTools  []tools.Tool
+	cfg            config.Config
+	store          *db.Store
+	client         *ollama.Client
+	pluginManager  *plugin.Manager
+	builtinTools   []tools.Tool
+	memoryMu       sync.Mutex
+	memoryInFlight map[string]struct{}
 }
 
 type HandleResult struct {
@@ -110,7 +124,14 @@ func New(cfg config.Config, store *db.Store, client *ollama.Client, pm *plugin.M
 		LogPath:            cfg.LogPath,
 		Cron:               cronCtrl,
 	}, client)
-	return &Engine{cfg: cfg, store: store, client: client, pluginManager: pm, builtinTools: builtin}
+	return &Engine{
+		cfg:            cfg,
+		store:          store,
+		client:         client,
+		pluginManager:  pm,
+		builtinTools:   builtin,
+		memoryInFlight: map[string]struct{}{},
+	}
 }
 
 func (e *Engine) HandleText(ctx context.Context, transport, sessionKey, input string) (HandleResult, error) {
@@ -287,7 +308,7 @@ func (e *Engine) HandleTextWithOptions(ctx context.Context, transport, sessionKe
 		}
 	}
 
-	return HandleResult{
+	result := HandleResult{
 		Session:          sess,
 		AssistantContent: lastReply,
 		PromptTokens:     promptTokens,
@@ -295,7 +316,9 @@ func (e *Engine) HandleTextWithOptions(ctx context.Context, transport, sessionKe
 		Compacted:        compacted,
 		ToolTrace:        toolTrace,
 		ThinkingTrace:    thinkingTrace,
-	}, nil
+	}
+	e.maybeScheduleCoreMemoriesRefresh(sess, model)
+	return result, nil
 }
 
 func (e *Engine) emitToolEvent(cb func(ToolEvent), ev ToolEvent) {
@@ -437,6 +460,9 @@ func (e *Engine) combinedTools(ctx context.Context) ([]tools.Tool, error) {
 
 func (e *Engine) activePromptMessages(ctx context.Context, sessionID string) ([]ollama.ChatMessage, error) {
 	messages := []ollama.ChatMessage{{Role: "system", Content: e.runtimeSystemPrompt()}}
+	if core := strings.TrimSpace(e.runtimeCoreMemories()); core != "" {
+		messages = append(messages, ollama.ChatMessage{Role: "system", Content: "Core memories:\n" + core})
+	}
 	summary, ok, err := e.store.LatestCompactionSummary(ctx, sessionID)
 	if err != nil {
 		return nil, err
@@ -478,6 +504,174 @@ func (e *Engine) runtimeSystemPrompt() string {
 	_ = os.MkdirAll(filepath.Dir(path), 0o755)
 	_ = os.WriteFile(path, []byte(defaultSystemPrompt), 0o600)
 	return defaultSystemPrompt
+}
+
+func (e *Engine) runtimeCoreMemories() string {
+	path, err := config.CoreMemoriesPath()
+	if err != nil {
+		return ""
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	return clampToMaxChars(extractManagedCoreMemories(string(b)), coreMemoriesMaxChars)
+}
+
+func (e *Engine) maybeScheduleCoreMemoriesRefresh(sess db.Session, model string) {
+	userTurnCount, err := e.store.CountMessagesByRole(context.Background(), sess.ID, "user")
+	if err != nil || userTurnCount <= 0 || userTurnCount%coreMemoriesTurnInterval != 0 {
+		return
+	}
+	settingKey := coreMemoriesLastTurnSettingKey(sess.ID)
+	lastTurn := 0
+	if v, ok, err := e.store.GetSetting(context.Background(), settingKey); err == nil && ok {
+		if n, convErr := strconv.Atoi(strings.TrimSpace(v)); convErr == nil {
+			lastTurn = n
+		}
+	}
+	if lastTurn >= userTurnCount {
+		return
+	}
+
+	e.memoryMu.Lock()
+	if _, exists := e.memoryInFlight[sess.ID]; exists {
+		e.memoryMu.Unlock()
+		return
+	}
+	e.memoryInFlight[sess.ID] = struct{}{}
+	e.memoryMu.Unlock()
+
+	go func() {
+		defer func() {
+			e.memoryMu.Lock()
+			delete(e.memoryInFlight, sess.ID)
+			e.memoryMu.Unlock()
+		}()
+		ctx, cancel := context.WithTimeout(context.Background(), coreMemoriesTimeout)
+		defer cancel()
+		if err := e.refreshCoreMemories(ctx, sess, model); err != nil {
+			return
+		}
+		_ = e.store.SetSetting(ctx, settingKey, strconv.Itoa(userTurnCount))
+	}()
+}
+
+func (e *Engine) refreshCoreMemories(ctx context.Context, sess db.Session, model string) error {
+	rows, err := e.store.ListMessages(ctx, sess.ID, false)
+	if err != nil {
+		return err
+	}
+	conversation := compactConversationForCoreMemory(rows, coreMemoriesMaxMessages)
+	if strings.TrimSpace(conversation) == "" {
+		return nil
+	}
+	path, err := config.CoreMemoriesPath()
+	if err != nil {
+		return err
+	}
+	existing := ""
+	if b, readErr := os.ReadFile(path); readErr == nil {
+		existing = string(b)
+	}
+	existingCore := clampToMaxChars(extractManagedCoreMemories(existing), coreMemoriesMaxChars)
+	memModel := strings.TrimSpace(model)
+	if memModel == "" {
+		memModel = e.cfg.DefaultModel
+	}
+	req := []ollama.ChatMessage{
+		{
+			Role:    "system",
+			Content: "Update the assistant's durable core memories from conversation logs. Keep only stable preferences, communication style, workflows, constraints, and long-term context. Exclude ephemeral details. Output concise Markdown bullets only. Keep total output at or below 4000 characters.",
+		},
+		{
+			Role:    "user",
+			Content: fmt.Sprintf("Existing core memories:\n%s\n\nRecent conversation:\n%s\n\nReturn only updated core memories as Markdown bullets (max 20 bullets, max 4000 characters).", existingCore, conversation),
+		},
+	}
+	resp, err := e.client.Chat(ctx, ollama.ChatRequest{
+		Model:    memModel,
+		Messages: req,
+		Stream:   false,
+		Think:    false,
+	})
+	if err != nil {
+		return err
+	}
+	updatedCore := clampToMaxChars(strings.TrimSpace(resp.Message.Content), coreMemoriesMaxChars)
+	if updatedCore == "" {
+		return nil
+	}
+	merged := upsertManagedCoreMemories(existing, updatedCore)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(path, []byte(merged), 0o600)
+}
+
+func compactConversationForCoreMemory(rows []db.Message, maxMessages int) string {
+	if maxMessages <= 0 {
+		maxMessages = coreMemoriesMaxMessages
+	}
+	lines := make([]string, 0, len(rows))
+	for _, row := range rows {
+		switch row.Role {
+		case "user", "assistant":
+			content := strings.TrimSpace(row.Content)
+			if content == "" {
+				continue
+			}
+			lines = append(lines, fmt.Sprintf("%s: %s", row.Role, content))
+		}
+	}
+	if len(lines) == 0 {
+		return ""
+	}
+	if len(lines) > maxMessages {
+		lines = lines[len(lines)-maxMessages:]
+	}
+	return strings.Join(lines, "\n")
+}
+
+func extractManagedCoreMemories(existing string) string {
+	start := strings.Index(existing, coreMemoriesStartMarker)
+	end := strings.Index(existing, coreMemoriesEndMarker)
+	if start < 0 || end < 0 || end <= start {
+		return strings.TrimSpace(existing)
+	}
+	content := existing[start+len(coreMemoriesStartMarker) : end]
+	return strings.TrimSpace(content)
+}
+
+func upsertManagedCoreMemories(existing, core string) string {
+	core = strings.TrimSpace(core)
+	managed := coreMemoriesStartMarker + "\n" + core + "\n" + coreMemoriesEndMarker
+	start := strings.Index(existing, coreMemoriesStartMarker)
+	end := strings.Index(existing, coreMemoriesEndMarker)
+	if start >= 0 && end > start {
+		end += len(coreMemoriesEndMarker)
+		updated := strings.TrimRight(existing[:start], "\n")
+		suffix := strings.TrimLeft(existing[end:], "\n")
+		if updated == "" && suffix == "" {
+			return managed + "\n"
+		}
+		if suffix == "" {
+			return updated + "\n\n" + managed + "\n"
+		}
+		if updated == "" {
+			return managed + "\n\n" + suffix
+		}
+		return updated + "\n\n" + managed + "\n\n" + suffix
+	}
+	prefix := strings.TrimSpace(existing)
+	if prefix == "" {
+		return managed + "\n"
+	}
+	return prefix + "\n\n" + managed + "\n"
+}
+
+func coreMemoriesLastTurnSettingKey(sessionID string) string {
+	return "core_memories_last_turn:" + strings.TrimSpace(sessionID)
 }
 
 func (e *Engine) maybeCompact(ctx context.Context, sess db.Session, model string, promptEvalCount int, thinkParam interface{}) (bool, error) {
@@ -628,4 +822,17 @@ func truncateForTrace(v string, max int) string {
 		return v[:max]
 	}
 	return v[:max-3] + "..."
+}
+
+func clampToMaxChars(s string, maxChars int) string {
+	text := strings.TrimSpace(s)
+	if maxChars <= 0 || text == "" {
+		return text
+	}
+	r := []rune(text)
+	if len(r) <= maxChars {
+		return text
+	}
+	clamped := strings.TrimSpace(string(r[:maxChars]))
+	return clamped
 }
