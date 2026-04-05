@@ -38,6 +38,7 @@ func TestParseCommand(t *testing.T) {
 		{in: "/show tools", want: "show"},
 		{in: "/ show thinking on", want: "show"},
 		{in: "/show thinking off", want: "show"},
+		{in: "/cron list", want: "cron"},
 		{in: "/stop", want: "stop"},
 		{in: "/restart", want: "restart"},
 		{in: "plain text", want: ""},

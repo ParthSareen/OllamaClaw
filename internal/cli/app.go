@@ -26,7 +26,7 @@ import (
 type App struct{}
 
 var (
-	BuildVersion = "0.1.1"
+	BuildVersion = "0.1.2"
 	BuildCommit  = "unknown"
 	BuildDate    = "unknown"
 )
@@ -234,7 +234,7 @@ func (a *App) runLaunch(args []string) error {
 func runtimeBuildLabel() string {
 	version := strings.TrimSpace(BuildVersion)
 	if version == "" {
-		version = "0.1.1"
+		version = "0.1.2"
 	}
 	parts := []string{version}
 	commit := strings.TrimSpace(BuildCommit)
@@ -558,12 +558,15 @@ func (a *App) bootstrap() (*runtime, func(), error) {
 	pm := plugin.NewManager(store, cfg)
 	cronMgr := cronjobs.NewManager(store)
 	eng := agent.New(cfg, store, client, pm, cronMgr)
-	cronMgr.SetRunner(func(ctx context.Context, transport, sessionKey, prompt string) (string, error) {
+	cronMgr.SetRunner(func(ctx context.Context, transport, sessionKey, prompt string) (cronjobs.RunResult, error) {
 		res, err := eng.HandleText(ctx, transport, sessionKey, prompt)
 		if err != nil {
-			return "", err
+			return cronjobs.RunResult{}, err
 		}
-		return res.AssistantContent, nil
+		return cronjobs.RunResult{
+			Output:       res.AssistantContent,
+			BashCommands: extractBashCommands(res.ToolTrace),
+		}, nil
 	})
 	cleanup := func() {
 		cronMgr.Stop()
@@ -573,4 +576,27 @@ func (a *App) bootstrap() (*runtime, func(), error) {
 		_ = store.Close()
 	}
 	return &runtime{cfg: cfg, store: store, engine: eng, pluginManager: pm, cron: cronMgr}, cleanup, nil
+}
+
+func extractBashCommands(trace []agent.ToolTraceEntry) []string {
+	out := make([]string, 0, len(trace))
+	for _, entry := range trace {
+		if !strings.EqualFold(strings.TrimSpace(entry.Name), "bash") {
+			continue
+		}
+		if strings.TrimSpace(entry.ArgsJSON) == "" {
+			continue
+		}
+		var args map[string]interface{}
+		if err := json.Unmarshal([]byte(entry.ArgsJSON), &args); err != nil {
+			continue
+		}
+		command, _ := args["command"].(string)
+		command = strings.TrimSpace(command)
+		if command == "" {
+			continue
+		}
+		out = append(out, command)
+	}
+	return cronjobs.BashCommandsFromTrace(out)
 }

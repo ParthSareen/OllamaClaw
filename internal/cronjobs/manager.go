@@ -2,7 +2,10 @@ package cronjobs
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"os/exec"
 	"sort"
 	"strings"
 	"sync"
@@ -13,8 +16,19 @@ import (
 	"github.com/robfig/cron/v3"
 )
 
-type RunnerFunc func(ctx context.Context, transport, sessionKey, prompt string) (string, error)
+type RunResult struct {
+	Output       string
+	BashCommands []string
+}
+
+type RunnerFunc func(ctx context.Context, transport, sessionKey, prompt string) (RunResult, error)
 type OutputSinkFunc func(ctx context.Context, transport, sessionKey, content string) error
+
+type safeCronBashApprover struct{}
+
+func (safeCronBashApprover) ApproveBashCommand(context.Context, tools.BashApprovalRequest) error {
+	return nil
+}
 
 type Manager struct {
 	store *db.Store
@@ -27,6 +41,21 @@ type Manager struct {
 
 	runner RunnerFunc
 	sink   OutputSinkFunc
+}
+
+const (
+	prefetchCommandTimeout   = 20 * time.Second
+	prefetchOutputMaxBytes   = 4000
+	maxLearnedPrefetchPerRun = 4
+	maxPrefetchCommands      = 8
+)
+
+type prefetchCommandResult struct {
+	Command    string
+	ExitCode   int
+	Stdout     string
+	Stderr     string
+	DurationMs int64
 }
 
 func NewManager(store *db.Store) *Manager {
@@ -103,7 +132,22 @@ func (m *Manager) AddJob(ctx context.Context, spec tools.CronJobSpec) (tools.Cro
 	}
 
 	now := time.Now().UTC()
-	job := db.CronJob{ID: id, Schedule: schedule, Prompt: prompt, Transport: transport, SessionKey: sessionKey, Active: true, CreatedAt: now, UpdatedAt: now}
+	autoPrefetch := true
+	if spec.AutoPrefetch != nil {
+		autoPrefetch = *spec.AutoPrefetch
+	}
+	job := db.CronJob{
+		ID:           id,
+		Schedule:     schedule,
+		Prompt:       prompt,
+		Transport:    transport,
+		SessionKey:   sessionKey,
+		Active:       true,
+		Safe:         spec.Safe,
+		AutoPrefetch: autoPrefetch,
+		CreatedAt:    now,
+		UpdatedAt:    now,
+	}
 	if err := m.store.UpsertCronJob(ctx, job); err != nil {
 		return tools.CronJobInfo{}, err
 	}
@@ -144,6 +188,47 @@ func (m *Manager) RemoveJob(ctx context.Context, id string) error {
 	return m.store.DeleteCronJob(ctx, id)
 }
 
+func (m *Manager) SetJobSafe(ctx context.Context, id string, safe bool) (tools.CronJobInfo, error) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return tools.CronJobInfo{}, fmt.Errorf("id is required")
+	}
+	job, ok, err := m.store.GetCronJob(ctx, id)
+	if err != nil {
+		return tools.CronJobInfo{}, err
+	}
+	if !ok {
+		return tools.CronJobInfo{}, fmt.Errorf("cron job %s not found", id)
+	}
+	job.Safe = safe
+	if err := m.store.UpsertCronJob(ctx, job); err != nil {
+		return tools.CronJobInfo{}, err
+	}
+	updated, ok, err := m.store.GetCronJob(ctx, id)
+	if err != nil {
+		return tools.CronJobInfo{}, err
+	}
+	if !ok {
+		return tools.CronJobInfo{}, fmt.Errorf("cron job %s not found after update", id)
+	}
+	return toToolInfo(updated), nil
+}
+
+func (m *Manager) ListJobPrefetchCommands(ctx context.Context, id string) ([]string, error) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return nil, fmt.Errorf("id is required")
+	}
+	_, ok, err := m.store.GetCronJob(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, fmt.Errorf("cron job %s not found", id)
+	}
+	return m.store.ListCronPrefetchCommands(ctx, id)
+}
+
 func (m *Manager) scheduleLocked(ctx context.Context, job db.CronJob) error {
 	schedule, err := m.parser.Parse(job.Schedule)
 	if err != nil {
@@ -170,8 +255,8 @@ func (m *Manager) scheduleLocked(ctx context.Context, job db.CronJob) error {
 }
 
 func (m *Manager) runJob(jobID string) {
-	ctx := context.Background()
-	job, ok, err := m.store.GetCronJob(ctx, jobID)
+	baseCtx := context.Background()
+	job, ok, err := m.store.GetCronJob(baseCtx, jobID)
 	if err != nil || !ok || !job.Active {
 		return
 	}
@@ -181,12 +266,26 @@ func (m *Manager) runJob(jobID string) {
 	sink := m.sink
 	m.mu.Unlock()
 	if runner == nil {
-		_ = m.store.UpdateCronRun(ctx, job.ID, nil, job.NextRunAt, "no runner configured")
+		_ = m.store.UpdateCronRun(baseCtx, job.ID, nil, job.NextRunAt, "no runner configured")
 		return
 	}
 
 	now := time.Now().UTC()
-	resp, runErr := runner(ctx, job.Transport, job.SessionKey, job.Prompt)
+	runCtx := baseCtx
+	if job.Safe {
+		runCtx = tools.WithBashApprover(runCtx, safeCronBashApprover{})
+	}
+	prefetchCommands, prefetchErr := m.store.ListCronPrefetchCommands(baseCtx, job.ID)
+	if prefetchErr != nil {
+		prefetchCommands = nil
+	}
+	effectivePrompt := job.Prompt
+	if job.AutoPrefetch && len(prefetchCommands) > 0 {
+		results := executePrefetchCommands(runCtx, prefetchCommands)
+		effectivePrompt = augmentCronPromptWithPrefetch(job.Prompt, results)
+	}
+
+	res, runErr := runner(runCtx, job.Transport, job.SessionKey, effectivePrompt)
 	spec, parseErr := m.parser.Parse(job.Schedule)
 	var next *time.Time
 	if parseErr == nil {
@@ -194,24 +293,29 @@ func (m *Manager) runJob(jobID string) {
 		next = &n
 	}
 	if runErr != nil {
-		_ = m.store.UpdateCronRun(ctx, job.ID, &now, next, runErr.Error())
+		_ = m.store.UpdateCronRun(baseCtx, job.ID, &now, next, runErr.Error())
 		return
 	}
-	_ = m.store.UpdateCronRun(ctx, job.ID, &now, next, "")
-	if sink != nil && strings.TrimSpace(resp) != "" {
-		_ = sink(ctx, job.Transport, job.SessionKey, resp)
+	if job.AutoPrefetch {
+		m.learnPrefetchCommands(baseCtx, job.ID, res.BashCommands)
+	}
+	_ = m.store.UpdateCronRun(baseCtx, job.ID, &now, next, "")
+	if sink != nil && strings.TrimSpace(res.Output) != "" {
+		_ = sink(baseCtx, job.Transport, job.SessionKey, res.Output)
 	}
 }
 
 func toToolInfo(j db.CronJob) tools.CronJobInfo {
 	info := tools.CronJobInfo{
-		ID:         j.ID,
-		Schedule:   j.Schedule,
-		Prompt:     j.Prompt,
-		Transport:  j.Transport,
-		SessionKey: j.SessionKey,
-		Active:     j.Active,
-		LastError:  j.LastError,
+		ID:           j.ID,
+		Schedule:     j.Schedule,
+		Prompt:       j.Prompt,
+		Transport:    j.Transport,
+		SessionKey:   j.SessionKey,
+		Active:       j.Active,
+		Safe:         j.Safe,
+		AutoPrefetch: j.AutoPrefetch,
+		LastError:    j.LastError,
 	}
 	if j.LastRunAt != nil {
 		info.LastRunAt = j.LastRunAt.UTC().Format(time.RFC3339)
@@ -220,4 +324,179 @@ func toToolInfo(j db.CronJob) tools.CronJobInfo {
 		info.NextRunAt = j.NextRunAt.UTC().Format(time.RFC3339)
 	}
 	return info
+}
+
+func executePrefetchCommands(ctx context.Context, commands []string) []prefetchCommandResult {
+	out := make([]prefetchCommandResult, 0, len(commands))
+	for _, command := range commands {
+		command = normalizeCronCommand(command)
+		if command == "" {
+			continue
+		}
+		cmdCtx, cancel := context.WithTimeout(ctx, prefetchCommandTimeout)
+		startedAt := time.Now()
+		c := exec.CommandContext(cmdCtx, "/bin/bash", "-lc", command)
+		stdout, err := c.Output()
+		stderr := ""
+		exitCode := 0
+		if err != nil {
+			if ee := (&exec.ExitError{}); errors.As(err, &ee) {
+				exitCode = ee.ExitCode()
+				stderr = string(ee.Stderr)
+			} else {
+				exitCode = -1
+				stderr = err.Error()
+			}
+		}
+		cancel()
+		if cmdCtx.Err() == context.DeadlineExceeded {
+			exitCode = -1
+			stderr = strings.TrimSpace(stderr + "\ncommand timed out")
+		}
+		out = append(out, prefetchCommandResult{
+			Command:    command,
+			ExitCode:   exitCode,
+			Stdout:     truncatePrefetch(string(stdout)),
+			Stderr:     truncatePrefetch(stderr),
+			DurationMs: time.Since(startedAt).Milliseconds(),
+		})
+	}
+	return out
+}
+
+func augmentCronPromptWithPrefetch(prompt string, results []prefetchCommandResult) string {
+	if len(results) == 0 {
+		return prompt
+	}
+	var b strings.Builder
+	b.WriteString(prompt)
+	b.WriteString("\n\nPrefetched command outputs for this cron run (already executed by host):")
+	for i, result := range results {
+		b.WriteString(fmt.Sprintf("\n\n[%d] command: %s\nexit_code: %d\nduration_ms: %d\nstdout:\n%s\nstderr:\n%s",
+			i+1,
+			result.Command,
+			result.ExitCode,
+			result.DurationMs,
+			result.Stdout,
+			result.Stderr,
+		))
+	}
+	b.WriteString("\n\nUse prefetched outputs when possible. Only call additional tools if needed for missing or fresher data.")
+	return b.String()
+}
+
+func (m *Manager) learnPrefetchCommands(ctx context.Context, jobID string, commands []string) {
+	if len(commands) == 0 {
+		return
+	}
+	existing, err := m.store.ListCronPrefetchCommands(ctx, jobID)
+	if err != nil {
+		return
+	}
+	known := make(map[string]struct{}, len(existing))
+	for _, command := range existing {
+		known[normalizeCronCommand(command)] = struct{}{}
+	}
+	additions := make([]string, 0, maxLearnedPrefetchPerRun)
+	for _, raw := range commands {
+		if len(known)+len(additions) >= maxPrefetchCommands {
+			break
+		}
+		command := normalizeCronCommand(raw)
+		if !isLearnablePrefetchCommand(command) {
+			continue
+		}
+		if _, ok := known[command]; ok {
+			continue
+		}
+		known[command] = struct{}{}
+		additions = append(additions, command)
+		if len(additions) >= maxLearnedPrefetchPerRun {
+			break
+		}
+	}
+	if len(additions) == 0 {
+		return
+	}
+	_ = m.store.UpsertCronPrefetchCommands(ctx, jobID, additions)
+}
+
+func normalizeCronCommand(command string) string {
+	return strings.Join(strings.Fields(strings.TrimSpace(command)), " ")
+}
+
+func isLearnablePrefetchCommand(command string) bool {
+	if command == "" {
+		return false
+	}
+	lower := strings.ToLower(command)
+	if strings.ContainsAny(lower, ";&|><`$") {
+		return false
+	}
+	if strings.Contains(lower, "ollamaclaw") || strings.Contains(lower, "launch.lock") {
+		return false
+	}
+	fields := strings.Fields(lower)
+	if len(fields) == 0 {
+		return false
+	}
+	head := fields[0]
+	switch head {
+	case "gh", "ls", "pwd", "cat", "head", "tail", "stat", "wc", "find", "grep", "ps", "ollama":
+		return true
+	case "git":
+		if len(fields) < 2 {
+			return false
+		}
+		switch fields[1] {
+		case "status", "diff", "show", "log", "rev-parse", "branch", "remote":
+			return true
+		default:
+			return false
+		}
+	default:
+		return false
+	}
+}
+
+func truncatePrefetch(v string) string {
+	v = strings.TrimSpace(v)
+	if len(v) <= prefetchOutputMaxBytes {
+		return v
+	}
+	return v[:prefetchOutputMaxBytes] + "\n...[truncated]"
+}
+
+func BashCommandsFromTrace(raw []string) []string {
+	out := make([]string, 0, len(raw))
+	seen := map[string]struct{}{}
+	for _, item := range raw {
+		command := normalizeCronCommand(item)
+		if command == "" {
+			continue
+		}
+		if _, ok := seen[command]; ok {
+			continue
+		}
+		seen[command] = struct{}{}
+		out = append(out, command)
+	}
+	return out
+}
+
+func BashCommandsFromToolTraceJSON(trace []json.RawMessage) []string {
+	out := make([]string, 0, len(trace))
+	for _, item := range trace {
+		var payload map[string]interface{}
+		if err := json.Unmarshal(item, &payload); err != nil {
+			continue
+		}
+		command, _ := payload["command"].(string)
+		command = normalizeCronCommand(command)
+		if command == "" {
+			continue
+		}
+		out = append(out, command)
+	}
+	return BashCommandsFromTrace(out)
 }

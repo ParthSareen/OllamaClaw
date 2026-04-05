@@ -179,7 +179,7 @@ func TestGuardTelegramBashCommandCurlAlwaysNeedsApproval(t *testing.T) {
 	}
 }
 
-func TestGuardTelegramBashCommandCurlDisablesAlwaysAllow(t *testing.T) {
+func TestGuardTelegramBashCommandCurlEnablesAlwaysAllow(t *testing.T) {
 	approver := &stubBashApprover{}
 	ctx := WithSessionInfo(context.Background(), "telegram", "8750063231")
 	ctx = WithBashApprover(ctx, approver)
@@ -189,8 +189,27 @@ func TestGuardTelegramBashCommandCurlDisablesAlwaysAllow(t *testing.T) {
 	if !approver.called {
 		t.Fatalf("expected approver to be called")
 	}
-	if approver.lastReq.AllowAlways {
-		t.Fatalf("expected curl approvals to disable always-allow")
+	if !approver.lastReq.AllowAlways {
+		t.Fatalf("expected curl approvals to allow always-allow")
+	}
+}
+
+func TestGuardTelegramBashCommandControlOperatorsEnableAlwaysAllow(t *testing.T) {
+	approver := &stubBashApprover{}
+	ctx := WithSessionInfo(context.Background(), "telegram", "8750063231")
+	ctx = WithBashApprover(ctx, approver)
+	cmd := "tail -100 ~/.codex/history.jsonl 2>/dev/null | head -30"
+	if err := guardTelegramBashCommand(ctx, cmd); err != nil {
+		t.Fatalf("expected approver path for control-operator command, got %v", err)
+	}
+	if !approver.called {
+		t.Fatalf("expected approver to be called")
+	}
+	if !approver.lastReq.AllowAlways {
+		t.Fatalf("expected control-operator approvals to allow always-allow")
+	}
+	if !strings.Contains(strings.ToLower(approver.lastReq.Reason), "shell control operators") {
+		t.Fatalf("expected control-operator reason, got %q", approver.lastReq.Reason)
 	}
 }
 

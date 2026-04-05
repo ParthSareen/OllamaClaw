@@ -1,6 +1,7 @@
 # OllamaClaw
 
 OllamaClaw is a Telegram-first Go coding agent which uses Ollama. Hacking on this to use as a playground for different ideas and experiements. Currently using it to run crons, reminders, and small tasks.
+Current app version: `0.1.2`.
 
 It supports:
 - Shared agent core for `repl` and `telegram` modes
@@ -83,6 +84,11 @@ ollamaclaw plugin update [plugin-id]
 - `/help` shows usage
 - `/model [name]` shows/sets per-chat model
 - `/tools` lists built-in + enabled plugin tools
+- `/cron list [active|all]` lists cron jobs
+- `/cron safe <id>` marks a cron as safe (Telegram bash approvals auto-approve for that cron)
+- `/cron unsafe <id>` removes safe mode from a cron
+- `/cron prefetch list <id>` shows learned prefetched commands for a cron job
+- Cron jobs auto-learn stable bash commands from prior runs and prefetch them on future runs (`auto_prefetch` on by default)
 - `/show tools [on|off]` toggles live tool event messages
 - `/show thinking [on|off]` toggles thinking visibility mode
 - `/verbose [on|off]` enables/disables tool + thinking traces for this chat session
@@ -186,6 +192,8 @@ Tables:
 - `sessions`
 - `messages`
 - `compactions`
+- `cron_jobs`
+- `cron_prefetch_commands`
 - `plugins`
 - `plugin_tools`
 
@@ -218,7 +226,7 @@ Example:
 {
   "id": "acme.echo",
   "name": "Echo",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "apiVersion": "1.0",
   "entrypoint": {"command": "python3", "args": ["plugin.py"]},
   "protocol": {"jsonrpc": "2.0", "transport": "stdio", "framing": "ndjson"},

@@ -29,23 +29,27 @@ type Tool struct {
 }
 
 type CronJobSpec struct {
-	ID         string
-	Schedule   string
-	Prompt     string
-	Transport  string
-	SessionKey string
+	ID           string
+	Schedule     string
+	Prompt       string
+	Transport    string
+	SessionKey   string
+	Safe         bool
+	AutoPrefetch *bool
 }
 
 type CronJobInfo struct {
-	ID         string `json:"id"`
-	Schedule   string `json:"schedule"`
-	Prompt     string `json:"prompt"`
-	Transport  string `json:"transport"`
-	SessionKey string `json:"session_key"`
-	Active     bool   `json:"active"`
-	LastRunAt  string `json:"last_run_at,omitempty"`
-	NextRunAt  string `json:"next_run_at,omitempty"`
-	LastError  string `json:"last_error,omitempty"`
+	ID           string `json:"id"`
+	Schedule     string `json:"schedule"`
+	Prompt       string `json:"prompt"`
+	Transport    string `json:"transport"`
+	SessionKey   string `json:"session_key"`
+	Active       bool   `json:"active"`
+	Safe         bool   `json:"safe"`
+	AutoPrefetch bool   `json:"auto_prefetch"`
+	LastRunAt    string `json:"last_run_at,omitempty"`
+	NextRunAt    string `json:"next_run_at,omitempty"`
+	LastError    string `json:"last_error,omitempty"`
 }
 
 type CronController interface {
@@ -405,6 +409,8 @@ func cronTools(ctrl CronController) []Tool {
     "id": {"type": "string"},
     "schedule": {"type": "string", "description": "Cron schedule, e.g. '0 * * * *'"},
     "prompt": {"type": "string", "description": "Prompt to run when the job triggers"},
+    "safe": {"type": "boolean", "description": "When true, Telegram bash approvals are auto-approved for this cron job"},
+    "auto_prefetch": {"type": "boolean", "description": "When true, model-chosen stable bash commands can be prefetched automatically on future runs"},
     "transport": {"type": "string", "description": "Target transport, defaults to current session transport"},
     "session_key": {"type": "string", "description": "Target session key, defaults to current session key"}
   },
@@ -429,6 +435,12 @@ func cronTools(ctrl CronController) []Tool {
 				if v, ok := args["session_key"].(string); ok {
 					spec.SessionKey = v
 				}
+				if v, ok := args["safe"].(bool); ok {
+					spec.Safe = v
+				}
+				if v, ok := args["auto_prefetch"].(bool); ok {
+					spec.AutoPrefetch = &v
+				}
 				if info, ok := SessionInfoFromContext(ctx); ok {
 					if strings.TrimSpace(spec.Transport) == "" {
 						spec.Transport = info.Transport
@@ -442,13 +454,15 @@ func cronTools(ctrl CronController) []Tool {
 					return nil, err
 				}
 				return map[string]interface{}{
-					"id":          job.ID,
-					"schedule":    job.Schedule,
-					"prompt":      job.Prompt,
-					"transport":   job.Transport,
-					"session_key": job.SessionKey,
-					"active":      job.Active,
-					"next_run_at": job.NextRunAt,
+					"id":            job.ID,
+					"schedule":      job.Schedule,
+					"prompt":        job.Prompt,
+					"transport":     job.Transport,
+					"session_key":   job.SessionKey,
+					"active":        job.Active,
+					"safe":          job.Safe,
+					"auto_prefetch": job.AutoPrefetch,
+					"next_run_at":   job.NextRunAt,
 				}, nil
 			},
 			Source: "builtin",
@@ -474,15 +488,17 @@ func cronTools(ctrl CronController) []Tool {
 				items := make([]map[string]interface{}, 0, len(jobs))
 				for _, j := range jobs {
 					items = append(items, map[string]interface{}{
-						"id":          j.ID,
-						"schedule":    j.Schedule,
-						"prompt":      j.Prompt,
-						"transport":   j.Transport,
-						"session_key": j.SessionKey,
-						"active":      j.Active,
-						"last_run_at": j.LastRunAt,
-						"next_run_at": j.NextRunAt,
-						"last_error":  j.LastError,
+						"id":            j.ID,
+						"schedule":      j.Schedule,
+						"prompt":        j.Prompt,
+						"transport":     j.Transport,
+						"session_key":   j.SessionKey,
+						"active":        j.Active,
+						"safe":          j.Safe,
+						"auto_prefetch": j.AutoPrefetch,
+						"last_run_at":   j.LastRunAt,
+						"next_run_at":   j.NextRunAt,
+						"last_error":    j.LastError,
 					})
 				}
 				return map[string]interface{}{"jobs": items}, nil
@@ -647,18 +663,7 @@ func containsShellControlOperators(normalized string) bool {
 	return strings.ContainsAny(normalized, ";&|><`$")
 }
 
-func canAlwaysAllowTelegramCommand(normalized string) bool {
-	if normalized == "" {
-		return false
-	}
-	if containsShellControlOperators(normalized) {
-		return false
-	}
-	for _, rx := range telegramApprovalPatterns {
-		if rx.MatchString(normalized) {
-			return false
-		}
-	}
+func canAlwaysAllowTelegramCommand(_ string) bool {
 	return true
 }
 

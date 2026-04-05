@@ -66,15 +66,17 @@ type PluginTool struct {
 }
 
 type CronJob struct {
-	ID         string
-	Schedule   string
-	Prompt     string
-	Transport  string
-	SessionKey string
-	Active     bool
-	LastRunAt  *time.Time
-	NextRunAt  *time.Time
-	LastError  string
-	CreatedAt  time.Time
-	UpdatedAt  time.Time
+	ID           string
+	Schedule     string
+	Prompt       string
+	Transport    string
+	SessionKey   string
+	Active       bool
+	Safe         bool
+	AutoPrefetch bool
+	LastRunAt    *time.Time
+	NextRunAt    *time.Time
+	LastError    string
+	CreatedAt    time.Time
+	UpdatedAt    time.Time
 }

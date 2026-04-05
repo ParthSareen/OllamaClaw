@@ -239,7 +239,7 @@ func TestRuntimeBuildLabel(t *testing.T) {
 	BuildVersion = ""
 	BuildCommit = "unknown"
 	BuildDate = ""
-	if got := runtimeBuildLabel(); got != "0.1.1" {
-		t.Fatalf("expected fallback build label 0.1.1, got %q", got)
+	if got := runtimeBuildLabel(); got != "0.1.2" {
+		t.Fatalf("expected fallback build label 0.1.2, got %q", got)
 	}
 }

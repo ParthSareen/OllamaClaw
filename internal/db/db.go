@@ -148,6 +148,23 @@ CREATE TABLE IF NOT EXISTS cron_jobs (
 
 CREATE INDEX IF NOT EXISTS idx_cron_jobs_active ON cron_jobs(active, next_run_at);
 `,
+		`
+ALTER TABLE cron_jobs ADD COLUMN safe INTEGER NOT NULL DEFAULT 0;
+`,
+		`
+ALTER TABLE cron_jobs ADD COLUMN auto_prefetch INTEGER NOT NULL DEFAULT 1;
+
+CREATE TABLE IF NOT EXISTS cron_prefetch_commands (
+  job_id TEXT NOT NULL,
+  command TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY(job_id, command),
+  FOREIGN KEY(job_id) REFERENCES cron_jobs(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_cron_prefetch_job ON cron_prefetch_commands(job_id);
+`,
 	}
 
 	for i, sqlText := range migrations {
@@ -617,19 +634,21 @@ func (s *Store) UpsertCronJob(ctx context.Context, job CronJob) error {
 	lastRun := nullableTimeString(job.LastRunAt)
 	nextRun := nullableTimeString(job.NextRunAt)
 	_, err := s.db.ExecContext(ctx, `
-INSERT INTO cron_jobs(id, schedule, prompt, transport, session_key, active, last_run_at, next_run_at, last_error, created_at, updated_at)
-VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+INSERT INTO cron_jobs(id, schedule, prompt, transport, session_key, active, safe, auto_prefetch, last_run_at, next_run_at, last_error, created_at, updated_at)
+VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(id) DO UPDATE SET
   schedule=excluded.schedule,
   prompt=excluded.prompt,
   transport=excluded.transport,
   session_key=excluded.session_key,
   active=excluded.active,
+  safe=excluded.safe,
+  auto_prefetch=excluded.auto_prefetch,
   last_run_at=excluded.last_run_at,
   next_run_at=excluded.next_run_at,
   last_error=excluded.last_error,
   updated_at=excluded.updated_at
-`, job.ID, job.Schedule, job.Prompt, job.Transport, job.SessionKey, boolToInt(job.Active), lastRun, nextRun, job.LastError, now, now)
+`, job.ID, job.Schedule, job.Prompt, job.Transport, job.SessionKey, boolToInt(job.Active), boolToInt(job.Safe), boolToInt(job.AutoPrefetch), lastRun, nextRun, job.LastError, now, now)
 	if err != nil {
 		return fmt.Errorf("upsert cron job: %w", err)
 	}
@@ -638,7 +657,7 @@ ON CONFLICT(id) DO UPDATE SET
 
 func (s *Store) GetCronJob(ctx context.Context, id string) (CronJob, bool, error) {
 	row := s.db.QueryRowContext(ctx, `
-SELECT id, schedule, prompt, transport, session_key, active, last_run_at, next_run_at, last_error, created_at, updated_at
+SELECT id, schedule, prompt, transport, session_key, active, safe, auto_prefetch, last_run_at, next_run_at, last_error, created_at, updated_at
 FROM cron_jobs
 WHERE id = ?
 `, id)
@@ -651,7 +670,7 @@ WHERE id = ?
 
 func (s *Store) ListCronJobs(ctx context.Context, activeOnly bool) ([]CronJob, error) {
 	query := `
-SELECT id, schedule, prompt, transport, session_key, active, last_run_at, next_run_at, last_error, created_at, updated_at
+SELECT id, schedule, prompt, transport, session_key, active, safe, auto_prefetch, last_run_at, next_run_at, last_error, created_at, updated_at
 FROM cron_jobs
 `
 	if activeOnly {
@@ -667,14 +686,16 @@ FROM cron_jobs
 	for rows.Next() {
 		var (
 			job                    CronJob
-			active                 int
+			active, safe, prefetch int
 			lastRunRaw, nextRaw    sql.NullString
 			createdRaw, updatedRaw string
 		)
-		if err := rows.Scan(&job.ID, &job.Schedule, &job.Prompt, &job.Transport, &job.SessionKey, &active, &lastRunRaw, &nextRaw, &job.LastError, &createdRaw, &updatedRaw); err != nil {
+		if err := rows.Scan(&job.ID, &job.Schedule, &job.Prompt, &job.Transport, &job.SessionKey, &active, &safe, &prefetch, &lastRunRaw, &nextRaw, &job.LastError, &createdRaw, &updatedRaw); err != nil {
 			return nil, fmt.Errorf("scan cron job: %w", err)
 		}
 		job.Active = active == 1
+		job.Safe = safe == 1
+		job.AutoPrefetch = prefetch == 1
 		job.LastRunAt = parseNullTime(lastRunRaw)
 		job.NextRunAt = parseNullTime(nextRaw)
 		job.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdRaw)
@@ -714,11 +735,11 @@ WHERE id = ?
 func scanCronJob(row *sql.Row) (CronJob, bool, error) {
 	var (
 		job                    CronJob
-		active                 int
+		active, safe, prefetch int
 		lastRunRaw, nextRaw    sql.NullString
 		createdRaw, updatedRaw string
 	)
-	err := row.Scan(&job.ID, &job.Schedule, &job.Prompt, &job.Transport, &job.SessionKey, &active, &lastRunRaw, &nextRaw, &job.LastError, &createdRaw, &updatedRaw)
+	err := row.Scan(&job.ID, &job.Schedule, &job.Prompt, &job.Transport, &job.SessionKey, &active, &safe, &prefetch, &lastRunRaw, &nextRaw, &job.LastError, &createdRaw, &updatedRaw)
 	if errors.Is(err, sql.ErrNoRows) {
 		return CronJob{}, false, nil
 	}
@@ -726,11 +747,66 @@ func scanCronJob(row *sql.Row) (CronJob, bool, error) {
 		return CronJob{}, false, fmt.Errorf("scan cron job: %w", err)
 	}
 	job.Active = active == 1
+	job.Safe = safe == 1
+	job.AutoPrefetch = prefetch == 1
 	job.LastRunAt = parseNullTime(lastRunRaw)
 	job.NextRunAt = parseNullTime(nextRaw)
 	job.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdRaw)
 	job.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updatedRaw)
 	return job, true, nil
+}
+
+func (s *Store) ListCronPrefetchCommands(ctx context.Context, jobID string) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT command FROM cron_prefetch_commands WHERE job_id = ? ORDER BY command ASC`, jobID)
+	if err != nil {
+		return nil, fmt.Errorf("list cron prefetch commands: %w", err)
+	}
+	defer rows.Close()
+	out := make([]string, 0, 8)
+	for rows.Next() {
+		var cmd string
+		if err := rows.Scan(&cmd); err != nil {
+			return nil, fmt.Errorf("scan cron prefetch command: %w", err)
+		}
+		out = append(out, cmd)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate cron prefetch commands: %w", err)
+	}
+	return out, nil
+}
+
+func (s *Store) UpsertCronPrefetchCommands(ctx context.Context, jobID string, commands []string) error {
+	if strings.TrimSpace(jobID) == "" {
+		return fmt.Errorf("job id is required")
+	}
+	if len(commands) == 0 {
+		return nil
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	for _, command := range commands {
+		command = strings.TrimSpace(command)
+		if command == "" {
+			continue
+		}
+		if _, err := tx.ExecContext(ctx, `
+INSERT INTO cron_prefetch_commands(job_id, command, created_at, updated_at)
+VALUES(?, ?, ?, ?)
+ON CONFLICT(job_id, command) DO UPDATE SET
+  updated_at=excluded.updated_at
+`, jobID, command, now, now); err != nil {
+			tx.Rollback()
+			return fmt.Errorf("upsert cron prefetch command: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	return nil
 }
 
 func parseNullTime(v sql.NullString) *time.Time {
