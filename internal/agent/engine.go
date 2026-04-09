@@ -94,9 +94,9 @@ type HandleOptions struct {
 type ToolEventPhase string
 
 const (
-	ToolEventStart  ToolEventPhase = "start"
-	ToolEventFinish ToolEventPhase = "finish"
-	prefetchToolID  string         = "prefetch_ctx"
+	ToolEventStart       ToolEventPhase = "start"
+	ToolEventFinish      ToolEventPhase = "finish"
+	prefetchToolIDPrefix                = "prefetch_ctx:"
 )
 
 type ToolEvent struct {
@@ -150,9 +150,10 @@ func (e *Engine) HandleTextWithOptions(ctx context.Context, transport, sessionKe
 	if err != nil {
 		return HandleResult{}, err
 	}
-	if err := e.store.ArchiveMessagesByToolCallID(ctx, sess.ID, prefetchToolID); err != nil {
+	if err := e.store.ArchiveMessagesByToolCallIDPrefix(ctx, sess.ID, prefetchToolIDPrefix); err != nil {
 		return HandleResult{}, err
 	}
+	activePrefetchToolCallID := ""
 	shouldCleanupPrefetch := false
 	defer func() {
 		if !shouldCleanupPrefetch {
@@ -160,12 +161,17 @@ func (e *Engine) HandleTextWithOptions(ctx context.Context, transport, sessionKe
 		}
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
-		_ = e.store.ArchiveMessagesByToolCallID(cleanupCtx, sess.ID, prefetchToolID)
+		_ = e.store.ArchiveMessagesByToolCallIDPrefix(cleanupCtx, sess.ID, prefetchToolIDPrefix)
 	}()
 	if prefetched, ok := tools.PrefetchedBashResultsFromContext(ctx); ok && len(prefetched) > 0 {
-		if err := e.injectPrefetchedBashContext(ctx, sess.ID, prefetched); err != nil {
+		prefetchToolCallID, runIDErr := prefetchedRunToolCallID(prefetched)
+		if runIDErr != nil {
+			return HandleResult{}, runIDErr
+		}
+		if err := e.injectPrefetchedBashContext(ctx, sess.ID, prefetchToolCallID, prefetched); err != nil {
 			return HandleResult{}, err
 		}
+		activePrefetchToolCallID = prefetchToolCallID
 		shouldCleanupPrefetch = true
 	}
 	if err := e.store.InsertMessage(ctx, &db.Message{SessionID: sess.ID, Role: "user", Content: input}); err != nil {
@@ -197,7 +203,7 @@ func (e *Engine) HandleTextWithOptions(ctx context.Context, transport, sessionKe
 			return HandleResult{}, err
 		}
 		toolDefs := toOllamaTools(combined)
-		msgList, err := e.activePromptMessages(ctx, sess.ID)
+		msgList, err := e.activePromptMessages(ctx, sess.ID, activePrefetchToolCallID)
 		if err != nil {
 			return HandleResult{}, err
 		}
@@ -355,7 +361,7 @@ func (e *Engine) emitToolEvent(cb func(ToolEvent), ev ToolEvent) {
 	cb(ev)
 }
 
-func (e *Engine) injectPrefetchedBashContext(ctx context.Context, sessionID string, prefetched []tools.PrefetchedBashResult) error {
+func (e *Engine) injectPrefetchedBashContext(ctx context.Context, sessionID, toolCallID string, prefetched []tools.PrefetchedBashResult) error {
 	for i, p := range prefetched {
 		call := []ollama.ToolCall{
 			{
@@ -370,13 +376,14 @@ func (e *Engine) injectPrefetchedBashContext(ctx context.Context, sessionID stri
 			SessionID:     sessionID,
 			Role:          "assistant",
 			Content:       fmt.Sprintf("Host prefetch step %d/%d (run_started_at=%s)", i+1, len(prefetched), p.RunStarted),
-			ToolCallID:    prefetchToolID,
+			ToolCallID:    toolCallID,
 			ToolCallsJSON: string(callJSON),
 		}); err != nil {
 			return err
 		}
 		payload := map[string]interface{}{
 			"prefetched":     true,
+			"run_id":         p.RunID,
 			"run_started_at": p.RunStarted,
 			"fetched_at":     p.FetchedAt,
 			"exit_code":      p.ExitCode,
@@ -389,7 +396,7 @@ func (e *Engine) injectPrefetchedBashContext(ctx context.Context, sessionID stri
 			SessionID:    sessionID,
 			Role:         "tool",
 			ToolName:     "bash",
-			ToolCallID:   prefetchToolID,
+			ToolCallID:   toolCallID,
 			ToolArgsJSON: mustJSON(map[string]interface{}{"command": p.Command}),
 			Content:      string(b),
 		}); err != nil {
@@ -526,7 +533,7 @@ func (e *Engine) combinedTools(ctx context.Context) ([]tools.Tool, error) {
 	return all, nil
 }
 
-func (e *Engine) activePromptMessages(ctx context.Context, sessionID string) ([]ollama.ChatMessage, error) {
+func (e *Engine) activePromptMessages(ctx context.Context, sessionID, activePrefetchToolCallID string) ([]ollama.ChatMessage, error) {
 	messages := []ollama.ChatMessage{{Role: "system", Content: e.runtimeSystemPrompt()}}
 	if core := strings.TrimSpace(e.runtimeCoreMemories()); core != "" {
 		messages = append(messages, ollama.ChatMessage{Role: "system", Content: "Core memories:\n" + core})
@@ -543,6 +550,9 @@ func (e *Engine) activePromptMessages(ctx context.Context, sessionID string) ([]
 		return nil, err
 	}
 	for _, row := range rows {
+		if strings.HasPrefix(strings.TrimSpace(row.ToolCallID), prefetchToolIDPrefix) && strings.TrimSpace(row.ToolCallID) != strings.TrimSpace(activePrefetchToolCallID) {
+			continue
+		}
 		msg := ollama.ChatMessage{Role: row.Role, Content: row.Content, Thinking: row.Thinking, ToolName: row.ToolName}
 		if strings.TrimSpace(row.ToolCallsJSON) != "" {
 			var tc []ollama.ToolCall
@@ -553,6 +563,22 @@ func (e *Engine) activePromptMessages(ctx context.Context, sessionID string) ([]
 		messages = append(messages, msg)
 	}
 	return messages, nil
+}
+
+func prefetchedRunToolCallID(prefetched []tools.PrefetchedBashResult) (string, error) {
+	if len(prefetched) == 0 {
+		return "", nil
+	}
+	runID := strings.TrimSpace(prefetched[0].RunID)
+	if runID == "" {
+		return "", errors.New("prefetched context missing run_id")
+	}
+	for _, p := range prefetched[1:] {
+		if strings.TrimSpace(p.RunID) != runID {
+			return "", errors.New("prefetched context has inconsistent run_id values")
+		}
+	}
+	return prefetchToolIDPrefix + runID, nil
 }
 
 func (e *Engine) runtimeSystemPrompt() string {

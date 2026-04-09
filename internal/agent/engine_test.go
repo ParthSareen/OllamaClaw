@@ -657,6 +657,7 @@ func TestHandleTextInjectsPrefetchedBashAsToolContext(t *testing.T) {
 	ctx = tools.WithPrefetchedBashResults(ctx, []tools.PrefetchedBashResult{
 		{
 			Command:    "pwd",
+			RunID:      "run-abc123",
 			RunStarted: "2026-04-08T17:04:59-07:00",
 			FetchedAt:  "2026-04-08T17:05:00-07:00",
 			ExitCode:   0,
@@ -704,6 +705,9 @@ func TestHandleTextInjectsPrefetchedBashAsToolContext(t *testing.T) {
 			if !strings.Contains(m.Content, "\"run_started_at\":\"2026-04-08T17:04:59-07:00\"") {
 				t.Fatalf("expected run_started_at in prefetched tool result, got %q", m.Content)
 			}
+			if !strings.Contains(m.Content, "\"run_id\":\"run-abc123\"") {
+				t.Fatalf("expected run_id in prefetched tool result, got %q", m.Content)
+			}
 		}
 		if userIdx == -1 && m.Role == "user" && strings.TrimSpace(m.Content) == "check status" {
 			userIdx = i
@@ -730,9 +734,35 @@ func TestHandleTextInjectsPrefetchedBashAsToolContext(t *testing.T) {
 		t.Fatalf("ListMessages error: %v", err)
 	}
 	for _, m := range active {
-		if m.ToolCallID == prefetchToolID {
+		if strings.HasPrefix(m.ToolCallID, prefetchToolIDPrefix) {
 			t.Fatalf("expected synthetic prefetch context to be archived after run, found active message: %+v", m)
 		}
+	}
+}
+
+func TestHandleTextPrefetchedContextRequiresRunID(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	ctx := context.Background()
+	ctx = tools.WithPrefetchedBashResults(ctx, []tools.PrefetchedBashResult{
+		{
+			Command:    "pwd",
+			RunStarted: "2026-04-08T17:04:59-07:00",
+			FetchedAt:  "2026-04-08T17:05:00-07:00",
+			ExitCode:   0,
+		},
+	})
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatalf("ollama should not be called when prefetch run_id is invalid")
+	}))
+	defer srv.Close()
+
+	engine, store := newTestEngine(t, srv.URL)
+	defer store.Close()
+	if _, err := engine.HandleText(ctx, "telegram", "8750063231", "check status"); err == nil {
+		t.Fatalf("expected error when prefetch run_id is missing")
+	} else if !strings.Contains(err.Error(), "run_id") {
+		t.Fatalf("expected run_id error, got %v", err)
 	}
 }
 

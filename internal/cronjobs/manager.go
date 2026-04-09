@@ -2,6 +2,8 @@ package cronjobs
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -53,6 +55,7 @@ const (
 
 type prefetchCommandResult struct {
 	Command    string
+	RunID      string
 	RunStarted string
 	FetchedAt  string
 	ExitCode   int
@@ -285,7 +288,8 @@ func (m *Manager) runJob(jobID string) {
 	}
 	prefetched := []prefetchCommandResult{}
 	if job.AutoPrefetch && len(prefetchCommands) > 0 {
-		prefetched = executePrefetchCommands(runCtx, now, prefetchCommands)
+		runID := newPrefetchRunID()
+		prefetched = executePrefetchCommands(runCtx, now, runID, prefetchCommands)
 	}
 	if len(prefetched) > 0 {
 		runCtx = tools.WithPrefetchedBashResults(runCtx, toToolPrefetchedBashResults(prefetched))
@@ -333,7 +337,7 @@ func toToolInfo(j db.CronJob) tools.CronJobInfo {
 	return info
 }
 
-func executePrefetchCommands(ctx context.Context, runStarted time.Time, commands []string) []prefetchCommandResult {
+func executePrefetchCommands(ctx context.Context, runStarted time.Time, runID string, commands []string) []prefetchCommandResult {
 	out := make([]prefetchCommandResult, 0, len(commands))
 	runStarted = runStarted.In(util.PacificLocation())
 	runStartedText := util.FormatPacificRFC3339(runStarted)
@@ -364,6 +368,7 @@ func executePrefetchCommands(ctx context.Context, runStarted time.Time, commands
 		}
 		out = append(out, prefetchCommandResult{
 			Command:    command,
+			RunID:      runID,
 			RunStarted: runStartedText,
 			FetchedAt:  util.FormatPacificRFC3339(startedAt),
 			ExitCode:   exitCode,
@@ -499,6 +504,7 @@ func toToolPrefetchedBashResults(results []prefetchCommandResult) []tools.Prefet
 	for _, result := range results {
 		out = append(out, tools.PrefetchedBashResult{
 			Command:    result.Command,
+			RunID:      result.RunID,
 			RunStarted: result.RunStarted,
 			FetchedAt:  result.FetchedAt,
 			ExitCode:   result.ExitCode,
@@ -508,4 +514,12 @@ func toToolPrefetchedBashResults(results []prefetchCommandResult) []tools.Prefet
 		})
 	}
 	return out
+}
+
+func newPrefetchRunID() string {
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return fmt.Sprintf("run-%d", time.Now().UTC().UnixNano())
+	}
+	return fmt.Sprintf("run-%d-%s", time.Now().UTC().UnixNano(), hex.EncodeToString(b[:]))
 }

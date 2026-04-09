@@ -90,7 +90,7 @@ ollamaclaw plugin update [plugin-id]
 - `/cron unsafe <id>` removes safe mode from a cron
 - `/cron prefetch list <id>` shows learned prefetched commands for a cron job
 - Cron jobs auto-learn stable bash commands from prior runs and prefetch them on future runs (`auto_prefetch` on by default)
-- Prefetched commands are executed immediately before each cron agent turn and injected as synthetic `bash` tool-call context with `run_started_at` + per-command `fetched_at` timestamps
+- Prefetched commands are executed immediately before each cron agent turn and injected as synthetic `bash` tool-call context with `run_id`, `run_started_at`, and per-command `fetched_at` timestamps; only the current run's `run_id` context is visible to the model
 - Telegram bash policy defaults to allow for non-destructive commands; potentially destructive commands require approval; critical lifecycle commands remain blocked
 - `/show tools [on|off]` toggles live tool event messages
 - `/show thinking [on|off]` toggles thinking visibility mode

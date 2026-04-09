@@ -213,6 +213,27 @@ func TestRunJobPrefetchInjectsRunnerContextAndLearnsCommands(t *testing.T) {
 	if strings.TrimSpace(seenPrefetched[0].RunStarted) == "" {
 		t.Fatalf("expected prefetch run_started_at timestamp, got %+v", seenPrefetched[0])
 	}
+	firstRunID := strings.TrimSpace(seenPrefetched[0].RunID)
+	if firstRunID == "" {
+		t.Fatalf("expected prefetch run_id to be set, got %+v", seenPrefetched[0])
+	}
+	mgr.runJob("job-prefetch")
+	if len(seenPrefetched) < 1 {
+		t.Fatalf("expected prefetched commands on second run, got %d (%v)", len(seenPrefetched), seenPrefetched)
+	}
+	secondRunID := ""
+	for _, p := range seenPrefetched {
+		if strings.TrimSpace(p.Command) == "pwd" {
+			secondRunID = strings.TrimSpace(p.RunID)
+			break
+		}
+	}
+	if secondRunID == "" {
+		t.Fatalf("expected prefetch run_id on second run, got %+v", seenPrefetched[0])
+	}
+	if secondRunID == firstRunID {
+		t.Fatalf("expected new run_id each run, got identical value %q", secondRunID)
+	}
 	learned, err := store.ListCronPrefetchCommands(context.Background(), "job-prefetch")
 	if err != nil {
 		t.Fatalf("list learned prefetch commands: %v", err)
