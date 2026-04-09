@@ -1,7 +1,7 @@
 # OllamaClaw
 
 OllamaClaw is a Telegram-first Go coding agent which uses Ollama. Hacking on this to use as a playground for different ideas and experiements. Currently using it to run crons, reminders, and small tasks.
-Current app version: `0.1.3`.
+Current app version: `0.1.4`.
 
 It supports:
 - Shared agent core for `repl` and `telegram` modes
@@ -253,7 +253,7 @@ Example:
 {
   "id": "acme.echo",
   "name": "Echo",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "apiVersion": "1.0",
   "entrypoint": {"command": "python3", "args": ["plugin.py"]},
   "protocol": {"jsonrpc": "2.0", "transport": "stdio", "framing": "ndjson"},
