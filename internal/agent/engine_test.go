@@ -657,6 +657,7 @@ func TestHandleTextInjectsPrefetchedBashAsToolContext(t *testing.T) {
 	ctx = tools.WithPrefetchedBashResults(ctx, []tools.PrefetchedBashResult{
 		{
 			Command:    "pwd",
+			RunStarted: "2026-04-08T17:04:59-07:00",
 			FetchedAt:  "2026-04-08T17:05:00-07:00",
 			ExitCode:   0,
 			Stdout:     "/tmp",
@@ -691,21 +692,34 @@ func TestHandleTextInjectsPrefetchedBashAsToolContext(t *testing.T) {
 	if len(firstReq) < 4 {
 		t.Fatalf("expected at least 4 messages (system + assistant/tool prefetch + user), got %d", len(firstReq))
 	}
-	foundAssistantCall := false
-	foundToolResult := false
-	for _, m := range firstReq {
-		if m.Role == "assistant" && len(m.ToolCalls) > 0 && m.ToolCalls[0].Function.Name == "bash" {
-			foundAssistantCall = true
+	assistantIdx := -1
+	toolIdx := -1
+	userIdx := -1
+	for i, m := range firstReq {
+		if assistantIdx == -1 && m.Role == "assistant" && len(m.ToolCalls) > 0 && m.ToolCalls[0].Function.Name == "bash" {
+			assistantIdx = i
 		}
-		if m.Role == "tool" && m.ToolName == "bash" && strings.Contains(m.Content, "\"prefetched\":true") {
-			foundToolResult = true
+		if toolIdx == -1 && m.Role == "tool" && m.ToolName == "bash" && strings.Contains(m.Content, "\"prefetched\":true") {
+			toolIdx = i
+			if !strings.Contains(m.Content, "\"run_started_at\":\"2026-04-08T17:04:59-07:00\"") {
+				t.Fatalf("expected run_started_at in prefetched tool result, got %q", m.Content)
+			}
+		}
+		if userIdx == -1 && m.Role == "user" && strings.TrimSpace(m.Content) == "check status" {
+			userIdx = i
 		}
 	}
-	if !foundAssistantCall {
+	if assistantIdx == -1 {
 		t.Fatalf("expected synthetic assistant bash tool call in prompt, got %#v", firstReq)
 	}
-	if !foundToolResult {
+	if toolIdx == -1 {
 		t.Fatalf("expected synthetic prefetched tool result in prompt, got %#v", firstReq)
+	}
+	if userIdx == -1 {
+		t.Fatalf("expected user prompt message in request, got %#v", firstReq)
+	}
+	if !(assistantIdx < toolIdx && toolIdx < userIdx) {
+		t.Fatalf("expected order assistant(tool call) -> tool(result) -> user(prompt); got assistant=%d tool=%d user=%d messages=%#v", assistantIdx, toolIdx, userIdx, firstReq)
 	}
 }
 

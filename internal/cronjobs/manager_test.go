@@ -155,7 +155,7 @@ func TestSetJobSafeMissingJob(t *testing.T) {
 	}
 }
 
-func TestRunJobPrefetchAugmentsPromptAndLearnsCommands(t *testing.T) {
+func TestRunJobPrefetchInjectsRunnerContextAndLearnsCommands(t *testing.T) {
 	store, err := db.Open(filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {
 		t.Fatalf("open db: %v", err)
@@ -209,6 +209,9 @@ func TestRunJobPrefetchAugmentsPromptAndLearnsCommands(t *testing.T) {
 	}
 	if strings.TrimSpace(seenPrefetched[0].FetchedAt) == "" {
 		t.Fatalf("expected prefetched command timestamp, got %+v", seenPrefetched[0])
+	}
+	if strings.TrimSpace(seenPrefetched[0].RunStarted) == "" {
+		t.Fatalf("expected prefetch run_started_at timestamp, got %+v", seenPrefetched[0])
 	}
 	learned, err := store.ListCronPrefetchCommands(context.Background(), "job-prefetch")
 	if err != nil {

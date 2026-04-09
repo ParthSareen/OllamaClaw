@@ -355,18 +355,19 @@ func (e *Engine) injectPrefetchedBashContext(ctx context.Context, sessionID stri
 		if err := e.store.InsertMessage(ctx, &db.Message{
 			SessionID:     sessionID,
 			Role:          "assistant",
-			Content:       fmt.Sprintf("Host prefetch step %d/%d", i+1, len(prefetched)),
+			Content:       fmt.Sprintf("Host prefetch step %d/%d (run_started_at=%s)", i+1, len(prefetched), p.RunStarted),
 			ToolCallsJSON: string(callJSON),
 		}); err != nil {
 			return err
 		}
 		payload := map[string]interface{}{
-			"prefetched":  true,
-			"fetched_at":  p.FetchedAt,
-			"exit_code":   p.ExitCode,
-			"stdout":      p.Stdout,
-			"stderr":      p.Stderr,
-			"duration_ms": p.DurationMs,
+			"prefetched":     true,
+			"run_started_at": p.RunStarted,
+			"fetched_at":     p.FetchedAt,
+			"exit_code":      p.ExitCode,
+			"stdout":         p.Stdout,
+			"stderr":         p.Stderr,
+			"duration_ms":    p.DurationMs,
 		}
 		b, _ := json.Marshal(payload)
 		if err := e.store.InsertMessage(ctx, &db.Message{

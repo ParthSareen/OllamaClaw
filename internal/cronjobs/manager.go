@@ -53,6 +53,7 @@ const (
 
 type prefetchCommandResult struct {
 	Command    string
+	RunStarted string
 	FetchedAt  string
 	ExitCode   int
 	Stdout     string
@@ -284,7 +285,7 @@ func (m *Manager) runJob(jobID string) {
 	}
 	prefetched := []prefetchCommandResult{}
 	if job.AutoPrefetch && len(prefetchCommands) > 0 {
-		prefetched = executePrefetchCommands(runCtx, prefetchCommands)
+		prefetched = executePrefetchCommands(runCtx, now, prefetchCommands)
 	}
 	if len(prefetched) > 0 {
 		runCtx = tools.WithPrefetchedBashResults(runCtx, toToolPrefetchedBashResults(prefetched))
@@ -332,8 +333,10 @@ func toToolInfo(j db.CronJob) tools.CronJobInfo {
 	return info
 }
 
-func executePrefetchCommands(ctx context.Context, commands []string) []prefetchCommandResult {
+func executePrefetchCommands(ctx context.Context, runStarted time.Time, commands []string) []prefetchCommandResult {
 	out := make([]prefetchCommandResult, 0, len(commands))
+	runStarted = runStarted.In(util.PacificLocation())
+	runStartedText := util.FormatPacificRFC3339(runStarted)
 	for _, command := range commands {
 		command = normalizeCronCommand(command)
 		if command == "" {
@@ -361,6 +364,7 @@ func executePrefetchCommands(ctx context.Context, commands []string) []prefetchC
 		}
 		out = append(out, prefetchCommandResult{
 			Command:    command,
+			RunStarted: runStartedText,
 			FetchedAt:  util.FormatPacificRFC3339(startedAt),
 			ExitCode:   exitCode,
 			Stdout:     truncatePrefetch(string(stdout)),
@@ -369,32 +373,6 @@ func executePrefetchCommands(ctx context.Context, commands []string) []prefetchC
 		})
 	}
 	return out
-}
-
-func augmentCronPromptWithPrefetch(prompt string, results []prefetchCommandResult, runAt time.Time) string {
-	var b strings.Builder
-	b.WriteString(prompt)
-	b.WriteString("\n\nCron run metadata (host-provided):")
-	b.WriteString(fmt.Sprintf("\nrun_started_at: %s", util.FormatPacificRFC3339(runAt)))
-	b.WriteString(fmt.Sprintf("\ntimezone: %s", util.PacificTimezoneName))
-	b.WriteString("\nfreshness_requirement: Never rely on prior-run status for time-sensitive answers. Use data fetched in this run only.")
-	if len(results) > 0 {
-		b.WriteString("\n\nPrefetched command outputs for this cron run (already executed by host at run_started_at):")
-		for i, result := range results {
-			b.WriteString(fmt.Sprintf("\n\n[%d] command: %s\nfetched_at: %s\nexit_code: %d\nduration_ms: %d\nstdout:\n%s\nstderr:\n%s",
-				i+1,
-				result.Command,
-				result.FetchedAt,
-				result.ExitCode,
-				result.DurationMs,
-				result.Stdout,
-				result.Stderr,
-			))
-		}
-	}
-	b.WriteString("\n\nIf required status/data is missing, failed, or may be stale, run fresh tool calls now before final answer.")
-	b.WriteString("\nNever report time-sensitive status from chat history when it conflicts with this run.")
-	return b.String()
 }
 
 func (m *Manager) learnPrefetchCommands(ctx context.Context, jobID string, commands []string) {
@@ -521,6 +499,7 @@ func toToolPrefetchedBashResults(results []prefetchCommandResult) []tools.Prefet
 	for _, result := range results {
 		out = append(out, tools.PrefetchedBashResult{
 			Command:    result.Command,
+			RunStarted: result.RunStarted,
 			FetchedAt:  result.FetchedAt,
 			ExitCode:   result.ExitCode,
 			Stdout:     result.Stdout,

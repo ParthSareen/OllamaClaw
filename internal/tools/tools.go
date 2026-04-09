@@ -86,6 +86,7 @@ type SessionInfo struct {
 
 type PrefetchedBashResult struct {
 	Command    string `json:"command"`
+	RunStarted string `json:"run_started_at"`
 	FetchedAt  string `json:"fetched_at"`
 	ExitCode   int    `json:"exit_code"`
 	Stdout     string `json:"stdout"`
