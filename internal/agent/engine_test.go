@@ -14,6 +14,7 @@ import (
 	"github.com/ParthSareen/OllamaClaw/internal/db"
 	"github.com/ParthSareen/OllamaClaw/internal/ollama"
 	"github.com/ParthSareen/OllamaClaw/internal/plugin"
+	"github.com/ParthSareen/OllamaClaw/internal/tools"
 )
 
 func TestHandleTextWithReadFileToolTrace(t *testing.T) {
@@ -525,8 +526,11 @@ func TestHandleTextUsesSystemPromptFromHomeFile(t *testing.T) {
 	if res.AssistantContent != "ok" {
 		t.Fatalf("unexpected assistant content: %q", res.AssistantContent)
 	}
-	if firstSystem != custom {
-		t.Fatalf("expected system prompt %q, got %q", custom, firstSystem)
+	if !strings.Contains(firstSystem, custom) {
+		t.Fatalf("expected system prompt to include custom prompt %q, got %q", custom, firstSystem)
+	}
+	if !strings.Contains(strings.ToLower(firstSystem), "america/los_angeles") {
+		t.Fatalf("expected system prompt to include timezone policy, got %q", firstSystem)
 	}
 }
 
@@ -582,6 +586,126 @@ func TestHandleTextInjectsCoreMemoriesFromFile(t *testing.T) {
 	}
 	if !strings.Contains(messages[1].Content, "prefers terse answers") {
 		t.Fatalf("expected injected memory content, got %q", messages[1].Content)
+	}
+}
+
+func TestHandleTextIncludesManagedPromptOverlay(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	ctx := context.Background()
+
+	promptPath, err := config.SystemPromptPath()
+	if err != nil {
+		t.Fatalf("SystemPromptPath error: %v", err)
+	}
+	overlayPath, err := config.SystemPromptOverlayPath()
+	if err != nil {
+		t.Fatalf("SystemPromptOverlayPath error: %v", err)
+	}
+	custom := "You are a custom prompt for testing."
+	overlay := "- Prefer short updates.\n- Keep momentum high."
+	if err := os.MkdirAll(filepath.Dir(promptPath), 0o755); err != nil {
+		t.Fatalf("mkdir prompt dir: %v", err)
+	}
+	if err := os.WriteFile(promptPath, []byte(custom), 0o600); err != nil {
+		t.Fatalf("write prompt file: %v", err)
+	}
+	if err := os.WriteFile(overlayPath, []byte(overlay), 0o600); err != nil {
+		t.Fatalf("write overlay file: %v", err)
+	}
+
+	var firstSystem string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req ollama.ChatRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		if len(req.Messages) > 0 {
+			firstSystem = req.Messages[0].Content
+		}
+		resp := ollama.ChatResponse{
+			Message:         ollama.ChatMessage{Role: "assistant", Content: "ok"},
+			PromptEvalCount: 4,
+			EvalCount:       1,
+			Done:            true,
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer srv.Close()
+
+	engine, store := newTestEngine(t, srv.URL)
+	defer store.Close()
+
+	if _, err := engine.HandleText(ctx, "repl", "default", "hello"); err != nil {
+		t.Fatalf("HandleText error: %v", err)
+	}
+	if !strings.Contains(firstSystem, custom) {
+		t.Fatalf("expected custom prompt in system message, got %q", firstSystem)
+	}
+	if !strings.Contains(firstSystem, "Managed Prompt Overlay:") || !strings.Contains(firstSystem, "Prefer short updates") {
+		t.Fatalf("expected overlay in system message, got %q", firstSystem)
+	}
+	if !strings.Contains(strings.ToLower(firstSystem), "america/los_angeles") {
+		t.Fatalf("expected timezone policy in system message, got %q", firstSystem)
+	}
+}
+
+func TestHandleTextInjectsPrefetchedBashAsToolContext(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	ctx := context.Background()
+	ctx = tools.WithPrefetchedBashResults(ctx, []tools.PrefetchedBashResult{
+		{
+			Command:    "pwd",
+			FetchedAt:  "2026-04-08T17:05:00-07:00",
+			ExitCode:   0,
+			Stdout:     "/tmp",
+			Stderr:     "",
+			DurationMs: 5,
+		},
+	})
+
+	var firstReq []ollama.ChatMessage
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req ollama.ChatRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		firstReq = req.Messages
+		resp := ollama.ChatResponse{
+			Message:         ollama.ChatMessage{Role: "assistant", Content: "ok"},
+			PromptEvalCount: 10,
+			EvalCount:       2,
+			Done:            true,
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer srv.Close()
+
+	engine, store := newTestEngine(t, srv.URL)
+	defer store.Close()
+	if _, err := engine.HandleText(ctx, "telegram", "8750063231", "check status"); err != nil {
+		t.Fatalf("HandleText error: %v", err)
+	}
+	if len(firstReq) < 4 {
+		t.Fatalf("expected at least 4 messages (system + assistant/tool prefetch + user), got %d", len(firstReq))
+	}
+	foundAssistantCall := false
+	foundToolResult := false
+	for _, m := range firstReq {
+		if m.Role == "assistant" && len(m.ToolCalls) > 0 && m.ToolCalls[0].Function.Name == "bash" {
+			foundAssistantCall = true
+		}
+		if m.Role == "tool" && m.ToolName == "bash" && strings.Contains(m.Content, "\"prefetched\":true") {
+			foundToolResult = true
+		}
+	}
+	if !foundAssistantCall {
+		t.Fatalf("expected synthetic assistant bash tool call in prompt, got %#v", firstReq)
+	}
+	if !foundToolResult {
+		t.Fatalf("expected synthetic prefetched tool result in prompt, got %#v", firstReq)
 	}
 }
 
@@ -664,6 +788,18 @@ func TestHandleTextInjectsClampedCoreMemories(t *testing.T) {
 	injected := strings.TrimPrefix(messages[1].Content, "Core memories:\n")
 	if len([]rune(injected)) > coreMemoriesMaxChars {
 		t.Fatalf("expected injected core memories <= %d chars, got %d", coreMemoriesMaxChars, len([]rune(injected)))
+	}
+}
+
+func TestWithTimezonePolicyPromptAppendsOnce(t *testing.T) {
+	base := "You are custom."
+	once := withTimezonePolicyPrompt(base)
+	if !strings.Contains(strings.ToLower(once), "america/los_angeles") {
+		t.Fatalf("expected timezone policy to be appended, got %q", once)
+	}
+	twice := withTimezonePolicyPrompt(once)
+	if twice != once {
+		t.Fatalf("expected second application to be idempotent, got %q", twice)
 	}
 }
 

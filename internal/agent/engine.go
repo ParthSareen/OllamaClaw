@@ -44,6 +44,7 @@ Response format:
 Execution behavior:
 - Prefer solving over narrating.
 - Use tools whenever they reduce guesswork, improve speed, or increase correctness.
+- For prompt tuning, use managed system_prompt tools instead of directly editing prompt files.
 - Never fabricate tool results, file contents, command outcomes, or links.
 - If tool output is long, summarize key findings first, then include critical details.
 - If blocked, state the blocker plainly and give the best next action immediately.
@@ -60,7 +61,11 @@ CRON behavior:
 - For CI/PR checks: run gh pr view <PR_NUM> for current status.
 - For time-sensitive tasks: always query the source; do not reuse stale info.
 - Cron prompts may be brief; infer and execute the needed tool calls.
-- Report only relevant results.`
+- Report only relevant results.
+
+Timezone policy:
+- Treat all scheduling and time-based operations in America/Los_Angeles (PST/PDT).
+- Convert timezone-based outputs into America/Los_Angeles before presenting times.`
 
 type Engine struct {
 	cfg            config.Config
@@ -143,6 +148,11 @@ func (e *Engine) HandleTextWithOptions(ctx context.Context, transport, sessionKe
 	sess, err := e.store.GetOrCreateActiveSession(ctx, transport, sessionKey, e.cfg.DefaultModel)
 	if err != nil {
 		return HandleResult{}, err
+	}
+	if prefetched, ok := tools.PrefetchedBashResultsFromContext(ctx); ok && len(prefetched) > 0 {
+		if err := e.injectPrefetchedBashContext(ctx, sess.ID, prefetched); err != nil {
+			return HandleResult{}, err
+		}
 	}
 	if err := e.store.InsertMessage(ctx, &db.Message{SessionID: sess.ID, Role: "user", Content: input}); err != nil {
 		return HandleResult{}, err
@@ -331,6 +341,47 @@ func (e *Engine) emitToolEvent(cb func(ToolEvent), ev ToolEvent) {
 	cb(ev)
 }
 
+func (e *Engine) injectPrefetchedBashContext(ctx context.Context, sessionID string, prefetched []tools.PrefetchedBashResult) error {
+	for i, p := range prefetched {
+		call := []ollama.ToolCall{
+			{
+				Function: ollama.ToolCallFunction{
+					Name:      "bash",
+					Arguments: map[string]interface{}{"command": p.Command},
+				},
+			},
+		}
+		callJSON, _ := json.Marshal(call)
+		if err := e.store.InsertMessage(ctx, &db.Message{
+			SessionID:     sessionID,
+			Role:          "assistant",
+			Content:       fmt.Sprintf("Host prefetch step %d/%d", i+1, len(prefetched)),
+			ToolCallsJSON: string(callJSON),
+		}); err != nil {
+			return err
+		}
+		payload := map[string]interface{}{
+			"prefetched":  true,
+			"fetched_at":  p.FetchedAt,
+			"exit_code":   p.ExitCode,
+			"stdout":      p.Stdout,
+			"stderr":      p.Stderr,
+			"duration_ms": p.DurationMs,
+		}
+		b, _ := json.Marshal(payload)
+		if err := e.store.InsertMessage(ctx, &db.Message{
+			SessionID:    sessionID,
+			Role:         "tool",
+			ToolName:     "bash",
+			ToolArgsJSON: mustJSON(map[string]interface{}{"command": p.Command}),
+			Content:      string(b),
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (e *Engine) ListTools(ctx context.Context) ([]tools.Tool, error) {
 	return e.combinedTools(ctx)
 }
@@ -488,22 +539,57 @@ func (e *Engine) activePromptMessages(ctx context.Context, sessionID string) ([]
 }
 
 func (e *Engine) runtimeSystemPrompt() string {
+	overlay := e.runtimeSystemPromptOverlay()
 	path, err := config.SystemPromptPath()
 	if err != nil {
-		return defaultSystemPrompt
+		return composeSystemPrompt(defaultSystemPrompt, overlay)
 	}
 	if b, err := os.ReadFile(path); err == nil {
 		text := strings.TrimSpace(string(b))
 		if text != "" {
-			return string(b)
+			return composeSystemPrompt(string(b), overlay)
 		}
-		return defaultSystemPrompt
+		return composeSystemPrompt(defaultSystemPrompt, overlay)
 	} else if !errors.Is(err, os.ErrNotExist) {
-		return defaultSystemPrompt
+		return composeSystemPrompt(defaultSystemPrompt, overlay)
 	}
 	_ = os.MkdirAll(filepath.Dir(path), 0o755)
 	_ = os.WriteFile(path, []byte(defaultSystemPrompt), 0o600)
-	return defaultSystemPrompt
+	return composeSystemPrompt(defaultSystemPrompt, overlay)
+}
+
+func withTimezonePolicyPrompt(base string) string {
+	text := strings.TrimSpace(base)
+	if text == "" {
+		text = defaultSystemPrompt
+	}
+	lower := strings.ToLower(text)
+	if strings.Contains(lower, "america/los_angeles") || strings.Contains(lower, "pst/pdt") {
+		return text
+	}
+	addendum := "\n\nTimezone policy:\n- Treat all scheduling and time-based operations in America/Los_Angeles (PST/PDT).\n- Convert timezone-based outputs into America/Los_Angeles before presenting times."
+	return text + addendum
+}
+
+func composeSystemPrompt(base, overlay string) string {
+	text := withTimezonePolicyPrompt(base)
+	overlay = strings.TrimSpace(overlay)
+	if overlay == "" {
+		return text
+	}
+	return text + "\n\nManaged Prompt Overlay:\n" + overlay
+}
+
+func (e *Engine) runtimeSystemPromptOverlay() string {
+	path, err := config.SystemPromptOverlayPath()
+	if err != nil {
+		return ""
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(b))
 }
 
 func (e *Engine) runtimeCoreMemories() string {

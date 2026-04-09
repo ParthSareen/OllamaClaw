@@ -13,7 +13,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ParthSareen/OllamaClaw/internal/config"
 	"github.com/ParthSareen/OllamaClaw/internal/ollama"
+	"github.com/ParthSareen/OllamaClaw/internal/util"
 )
 
 type Executor func(ctx context.Context, args map[string]interface{}) (map[string]interface{}, error)
@@ -66,15 +68,29 @@ type BuiltinsConfig struct {
 }
 
 const (
-	defaultBashTimeoutSec = 120
-	maxBashTimeoutSec     = 120
+	defaultBashTimeoutSec      = 120
+	maxBashTimeoutSec          = 120
+	maxPromptOverlayChars      = 4000
+	defaultPromptHistoryLimit  = 10
+	maxPromptHistoryLimit      = 50
+	promptOverlayPreviewMaxRun = 240
 )
 
 type sessionContextKey struct{}
+type prefetchContextKey struct{}
 
 type SessionInfo struct {
 	Transport  string
 	SessionKey string
+}
+
+type PrefetchedBashResult struct {
+	Command    string `json:"command"`
+	FetchedAt  string `json:"fetched_at"`
+	ExitCode   int    `json:"exit_code"`
+	Stdout     string `json:"stdout"`
+	Stderr     string `json:"stderr"`
+	DurationMs int64  `json:"duration_ms"`
 }
 
 type BashApprovalRequest struct {
@@ -88,6 +104,14 @@ type BashApprover interface {
 	ApproveBashCommand(ctx context.Context, req BashApprovalRequest) error
 }
 
+type promptOverlayHistoryEntry struct {
+	Revision  string `json:"revision"`
+	CreatedAt string `json:"created_at"`
+	Operation string `json:"operation"`
+	Note      string `json:"note,omitempty"`
+	Overlay   string `json:"overlay"`
+}
+
 type telegramBashPolicy int
 
 const (
@@ -96,30 +120,76 @@ const (
 	telegramBashPolicyDeny
 )
 
+type telegramDestructivePattern struct {
+	RX     *regexp.Regexp
+	Reason string
+}
+
 var (
-	telegramAllowPatterns = []*regexp.Regexp{
-		// Read-only / inspection patterns.
-		regexp.MustCompile(`^pwd$`),
-		regexp.MustCompile(`^ls(?:\s+[-\w./@:=+]+)*$`),
-		regexp.MustCompile(`^(?:cat|head|tail|stat|wc)\s+[-\w./@:=+]+(?:\s+[-\w./@:=+]+)*$`),
-		regexp.MustCompile(`^grep(?:\s+[-\w./@:=+]+)+$`),
-		regexp.MustCompile(`^find(?:\s+[-\w./@:=+]+)+$`),
-		regexp.MustCompile(`^ps(?:\s+[-\w./@:=+]+)*$`),
-		regexp.MustCompile(`^git\s+(?:status|diff)(?:\s+[-\w./@:=+]+)*$`),
-		regexp.MustCompile(`^ollama(?:\s+[-\w./@:=+]+)*$`),
-	}
-	telegramApprovalPatterns = []*regexp.Regexp{
-		// Network/data tooling: always require explicit confirmation.
-		regexp.MustCompile(`^curl(?:\s|$)`),
-		regexp.MustCompile(`^wget(?:\s|$)`),
-		regexp.MustCompile(`^http(?:\s|$)`), // httpie
-		regexp.MustCompile(`^scp(?:\s|$)`),
-		regexp.MustCompile(`^ssh(?:\s|$)`),
-	}
 	telegramDenyPatterns = []*regexp.Regexp{
 		regexp.MustCompile(`\bsudo\b`),
 		regexp.MustCompile(`\bdoas\b`),
 		regexp.MustCompile(`\brm\s+-rf\s+/(?:\s|$)`),
+	}
+	telegramExplicitApprovalPatterns = []telegramDestructivePattern{
+		{
+			RX:     regexp.MustCompile(`^curl(?:\s|$)`),
+			Reason: "network/data command requires explicit approval",
+		},
+		{
+			RX:     regexp.MustCompile(`^wget(?:\s|$)`),
+			Reason: "network/data command requires explicit approval",
+		},
+		{
+			RX:     regexp.MustCompile(`^http(?:\s|$)`), // httpie
+			Reason: "network/data command requires explicit approval",
+		},
+		{
+			RX:     regexp.MustCompile(`^scp(?:\s|$)`),
+			Reason: "network/data command requires explicit approval",
+		},
+		{
+			RX:     regexp.MustCompile(`^ssh(?:\s|$)`),
+			Reason: "network/data command requires explicit approval",
+		},
+	}
+	telegramPotentiallyDestructivePatterns = []telegramDestructivePattern{
+		{
+			RX:     regexp.MustCompile(`\b(?:rm|rmdir|unlink|shred|wipefs|mkfs(?:\.[-\w]+)?|fdisk|parted|dd)\b`),
+			Reason: "contains potentially destructive file/system commands",
+		},
+		{
+			RX:     regexp.MustCompile(`\b(?:mv|cp|install|rsync|truncate|touch|mkdir|chmod|chown|chgrp|chflags|xattr)\b`),
+			Reason: "contains filesystem mutation commands",
+		},
+		{
+			RX:     regexp.MustCompile(`\b(?:sed|perl)\b[^\n]*\s-i(?:\s|$)`),
+			Reason: "contains in-place file edits",
+		},
+		{
+			RX:     regexp.MustCompile(`\bgit\s+(?:add|commit|merge|rebase|cherry-pick|am|apply|reset|clean|checkout|switch|restore|stash|tag|branch|push|pull)\b`),
+			Reason: "contains mutating git subcommands",
+		},
+		{
+			RX:     regexp.MustCompile(`\b(?:kill|pkill|killall|launchctl|systemctl|service|shutdown|reboot|halt|poweroff)\b`),
+			Reason: "contains process/service control commands",
+		},
+		{
+			RX:     regexp.MustCompile(`\b(?:apt|apt-get|yum|dnf|pacman|brew|pip|pip3|npm|pnpm|yarn|cargo|go)\b\s+(?:install|uninstall|remove|upgrade|update|dist-upgrade|full-upgrade|autoremove|clean|tap|untap|get)\b`),
+			Reason: "contains package manager mutation commands",
+		},
+		{
+			RX:     regexp.MustCompile(`\b(?:curl|wget)\b[^\n]*\s(?:-x|--request)\s*(?:post|put|patch|delete)\b`),
+			Reason: "contains network write operations",
+		},
+		{
+			RX:     regexp.MustCompile(`\bhttp\s+(?:post|put|patch|delete)\b`),
+			Reason: "contains network write operations",
+		},
+		{
+			RX:     regexp.MustCompile(`\b(?:bash|sh|zsh)\s+-c\b`),
+			Reason: "contains nested shell execution",
+		},
 	}
 )
 
@@ -134,6 +204,29 @@ func SessionInfoFromContext(ctx context.Context) (SessionInfo, bool) {
 	}
 	info, ok := v.(SessionInfo)
 	return info, ok
+}
+
+func WithPrefetchedBashResults(ctx context.Context, results []PrefetchedBashResult) context.Context {
+	if len(results) == 0 {
+		return ctx
+	}
+	copied := make([]PrefetchedBashResult, len(results))
+	copy(copied, results)
+	return context.WithValue(ctx, prefetchContextKey{}, copied)
+}
+
+func PrefetchedBashResultsFromContext(ctx context.Context) ([]PrefetchedBashResult, bool) {
+	v := ctx.Value(prefetchContextKey{})
+	if v == nil {
+		return nil, false
+	}
+	results, ok := v.([]PrefetchedBashResult)
+	if !ok || len(results) == 0 {
+		return nil, false
+	}
+	copied := make([]PrefetchedBashResult, len(results))
+	copy(copied, results)
+	return copied, true
 }
 
 type bashApproverContextKey struct{}
@@ -261,6 +354,234 @@ func BuiltinTools(cfg BuiltinsConfig, client *ollama.Client) []Tool {
 					return nil, err
 				}
 				return map[string]any{"path": p, "bytes_written": len(content)}, nil
+			},
+			Source: "builtin",
+		},
+		{
+			Name:        "system_prompt_get",
+			Description: "Read managed system prompt paths/content and optional revision history",
+			Schema: mustSchema(`{
+  "type": "object",
+  "properties": {
+    "include_base": {"type": "boolean", "description": "Include system_prompt.txt content in response", "default": false},
+    "history_limit": {"type": "integer", "minimum": 0, "maximum": 50, "description": "Include last N overlay history revisions (0 disables history)", "default": 0}
+  }
+}`),
+			Execute: func(ctx context.Context, args map[string]interface{}) (map[string]interface{}, error) {
+				_ = ctx
+				includeBase := false
+				if v, ok := args["include_base"].(bool); ok {
+					includeBase = v
+				}
+				historyLimit := 0
+				if v, ok := asInt(args["history_limit"]); ok {
+					if v < 0 {
+						v = 0
+					}
+					if v > maxPromptHistoryLimit {
+						v = maxPromptHistoryLimit
+					}
+					historyLimit = v
+				}
+				basePath, err := config.SystemPromptPath()
+				if err != nil {
+					return nil, err
+				}
+				overlayPath, err := config.SystemPromptOverlayPath()
+				if err != nil {
+					return nil, err
+				}
+				historyPath, err := config.SystemPromptOverlayHistoryPath()
+				if err != nil {
+					return nil, err
+				}
+				overlay, err := readPromptOverlay()
+				if err != nil {
+					return nil, err
+				}
+				out := map[string]interface{}{
+					"base_path":            basePath,
+					"overlay_path":         overlayPath,
+					"history_path":         historyPath,
+					"overlay":              overlay,
+					"overlay_chars":        len([]rune(overlay)),
+					"max_overlay_chars":    maxPromptOverlayChars,
+					"timezone":             util.PacificTimezoneName,
+					"managed_overlay_mode": true,
+				}
+				if includeBase {
+					b, err := os.ReadFile(basePath)
+					if err == nil {
+						out["base_prompt"] = string(b)
+					} else if errors.Is(err, os.ErrNotExist) {
+						out["base_prompt"] = ""
+						out["base_prompt_missing"] = true
+					} else {
+						return nil, err
+					}
+				}
+				if historyLimit > 0 {
+					history, err := readPromptOverlayHistory()
+					if err != nil {
+						return nil, err
+					}
+					out["history"] = historySummaries(history, historyLimit)
+				}
+				return out, nil
+			},
+			Source: "builtin",
+		},
+		{
+			Name:        "system_prompt_update",
+			Description: "Safely update only the managed system prompt overlay (set, append, clear) with revision history",
+			Schema: mustSchema(`{
+  "type": "object",
+  "properties": {
+    "operation": {"type": "string", "enum": ["set", "append", "clear"], "default": "set"},
+    "content": {"type": "string", "description": "Overlay content for set/append operations"},
+    "note": {"type": "string", "description": "Optional short note for revision history"}
+  }
+}`),
+			Execute: func(ctx context.Context, args map[string]interface{}) (map[string]interface{}, error) {
+				_ = ctx
+				op := "set"
+				if v, ok := args["operation"].(string); ok && strings.TrimSpace(v) != "" {
+					op = strings.ToLower(strings.TrimSpace(v))
+				}
+				content := ""
+				if v, ok := args["content"].(string); ok {
+					content = v
+				}
+				note := ""
+				if v, ok := args["note"].(string); ok {
+					note = strings.TrimSpace(v)
+				}
+				current, err := readPromptOverlay()
+				if err != nil {
+					return nil, err
+				}
+				var next string
+				switch op {
+				case "set":
+					if strings.TrimSpace(content) == "" {
+						return nil, errors.New("content is required for set")
+					}
+					next = strings.TrimSpace(content)
+				case "append":
+					if strings.TrimSpace(content) == "" {
+						return nil, errors.New("content is required for append")
+					}
+					if strings.TrimSpace(current) == "" {
+						next = strings.TrimSpace(content)
+					} else {
+						next = strings.TrimSpace(current) + "\n\n" + strings.TrimSpace(content)
+					}
+				case "clear":
+					next = ""
+				default:
+					return nil, fmt.Errorf("unsupported operation %q", op)
+				}
+				next, truncated := clampPromptOverlay(next)
+				overlayPath, err := writePromptOverlay(next)
+				if err != nil {
+					return nil, err
+				}
+				entry, err := appendPromptOverlayHistory(op, note, next)
+				if err != nil {
+					return nil, err
+				}
+				return map[string]interface{}{
+					"overlay_path":      overlayPath,
+					"operation":         op,
+					"revision":          entry.Revision,
+					"truncated":         truncated,
+					"overlay_chars":     len([]rune(next)),
+					"max_overlay_chars": maxPromptOverlayChars,
+					"overlay_preview":   previewPromptOverlay(next, promptOverlayPreviewMaxRun),
+				}, nil
+			},
+			Source: "builtin",
+		},
+		{
+			Name:        "system_prompt_history",
+			Description: "List managed system prompt overlay revisions",
+			Schema: mustSchema(`{
+  "type": "object",
+  "properties": {
+    "limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 10}
+  }
+}`),
+			Execute: func(ctx context.Context, args map[string]interface{}) (map[string]interface{}, error) {
+				_ = ctx
+				limit := defaultPromptHistoryLimit
+				if v, ok := asInt(args["limit"]); ok && v > 0 {
+					if v > maxPromptHistoryLimit {
+						v = maxPromptHistoryLimit
+					}
+					limit = v
+				}
+				history, err := readPromptOverlayHistory()
+				if err != nil {
+					return nil, err
+				}
+				return map[string]interface{}{
+					"history": historySummaries(history, limit),
+				}, nil
+			},
+			Source: "builtin",
+		},
+		{
+			Name:        "system_prompt_rollback",
+			Description: "Rollback managed system prompt overlay to a previous revision",
+			Schema: mustSchema(`{
+  "type": "object",
+  "properties": {
+    "revision": {"type": "string", "description": "Target revision from system_prompt_history"},
+    "note": {"type": "string", "description": "Optional rollback reason"}
+  },
+  "required": ["revision"]
+}`),
+			Execute: func(ctx context.Context, args map[string]interface{}) (map[string]interface{}, error) {
+				_ = ctx
+				revision, ok := args["revision"].(string)
+				if !ok || strings.TrimSpace(revision) == "" {
+					return nil, errors.New("revision is required")
+				}
+				note := ""
+				if v, ok := args["note"].(string); ok {
+					note = strings.TrimSpace(v)
+				}
+				history, err := readPromptOverlayHistory()
+				if err != nil {
+					return nil, err
+				}
+				target, found := findPromptOverlayRevision(history, strings.TrimSpace(revision))
+				if !found {
+					return nil, fmt.Errorf("revision %q not found", revision)
+				}
+				overlay, truncated := clampPromptOverlay(target.Overlay)
+				overlayPath, err := writePromptOverlay(overlay)
+				if err != nil {
+					return nil, err
+				}
+				op := "rollback"
+				if note == "" {
+					note = "rollback to " + target.Revision
+				}
+				entry, err := appendPromptOverlayHistory(op, note, overlay)
+				if err != nil {
+					return nil, err
+				}
+				return map[string]interface{}{
+					"overlay_path":       overlayPath,
+					"rolled_back_to":     target.Revision,
+					"new_revision":       entry.Revision,
+					"truncated":          truncated,
+					"overlay_chars":      len([]rune(overlay)),
+					"overlay_preview":    previewPromptOverlay(overlay, promptOverlayPreviewMaxRun),
+					"max_overlay_chars":  maxPromptOverlayChars,
+					"history_entry_note": note,
+				}, nil
 			},
 			Source: "builtin",
 		},
@@ -402,12 +723,12 @@ func cronTools(ctrl CronController) []Tool {
 	return []Tool{
 		{
 			Name:        "cron_add",
-			Description: "Create or update a cron job that periodically sends a prompt to OllamaClaw",
+			Description: "Create or update a cron job that periodically sends a prompt to OllamaClaw (schedule interpreted in America/Los_Angeles, PST/PDT)",
 			Schema: mustSchema(`{
   "type": "object",
   "properties": {
     "id": {"type": "string"},
-    "schedule": {"type": "string", "description": "Cron schedule, e.g. '0 * * * *'"},
+    "schedule": {"type": "string", "description": "Cron schedule in America/Los_Angeles (PST/PDT), e.g. '0 * * * *'"},
     "prompt": {"type": "string", "description": "Prompt to run when the job triggers"},
     "safe": {"type": "boolean", "description": "When true, Telegram bash approvals are auto-approved for this cron job"},
     "auto_prefetch": {"type": "boolean", "description": "When true, model-chosen stable bash commands can be prefetched automatically on future runs"},
@@ -463,13 +784,14 @@ func cronTools(ctrl CronController) []Tool {
 					"safe":          job.Safe,
 					"auto_prefetch": job.AutoPrefetch,
 					"next_run_at":   job.NextRunAt,
+					"timezone":      util.PacificTimezoneName,
 				}, nil
 			},
 			Source: "builtin",
 		},
 		{
 			Name:        "cron_list",
-			Description: "List configured cron jobs",
+			Description: "List configured cron jobs (timestamps returned in America/Los_Angeles, PST/PDT)",
 			Schema: mustSchema(`{
   "type": "object",
   "properties": {
@@ -499,6 +821,7 @@ func cronTools(ctrl CronController) []Tool {
 						"last_run_at":   j.LastRunAt,
 						"next_run_at":   j.NextRunAt,
 						"last_error":    j.LastError,
+						"timezone":      util.PacificTimezoneName,
 					})
 				}
 				return map[string]interface{}{"jobs": items}, nil
@@ -587,6 +910,163 @@ func truncate(s string, max int) string {
 	return s[:max-len(tail)] + tail
 }
 
+func readPromptOverlay() (string, error) {
+	path, err := config.SystemPromptOverlayPath()
+	if err != nil {
+		return "", err
+	}
+	b, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(b)), nil
+}
+
+func writePromptOverlay(content string) (string, error) {
+	path, err := config.SystemPromptOverlayPath()
+	if err != nil {
+		return "", err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return "", err
+	}
+	if err := os.WriteFile(path, []byte(strings.TrimSpace(content)), 0o600); err != nil {
+		return "", err
+	}
+	return path, nil
+}
+
+func appendPromptOverlayHistory(operation, note, overlay string) (promptOverlayHistoryEntry, error) {
+	path, err := config.SystemPromptOverlayHistoryPath()
+	if err != nil {
+		return promptOverlayHistoryEntry{}, err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return promptOverlayHistoryEntry{}, err
+	}
+	entry := promptOverlayHistoryEntry{
+		Revision:  fmt.Sprintf("%d", time.Now().UTC().UnixNano()),
+		CreatedAt: time.Now().UTC().Format(time.RFC3339Nano),
+		Operation: strings.TrimSpace(operation),
+		Note:      strings.TrimSpace(note),
+		Overlay:   strings.TrimSpace(overlay),
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		return promptOverlayHistoryEntry{}, err
+	}
+	defer f.Close()
+	b, err := json.Marshal(entry)
+	if err != nil {
+		return promptOverlayHistoryEntry{}, err
+	}
+	if _, err := f.Write(append(b, '\n')); err != nil {
+		return promptOverlayHistoryEntry{}, err
+	}
+	return entry, nil
+}
+
+func readPromptOverlayHistory() ([]promptOverlayHistoryEntry, error) {
+	path, err := config.SystemPromptOverlayHistoryPath()
+	if err != nil {
+		return nil, err
+	}
+	f, err := os.Open(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return []promptOverlayHistoryEntry{}, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	entries := make([]promptOverlayHistoryEntry, 0, 64)
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		var entry promptOverlayHistoryEntry
+		if err := json.Unmarshal([]byte(line), &entry); err != nil {
+			continue
+		}
+		if strings.TrimSpace(entry.Revision) == "" {
+			continue
+		}
+		entries = append(entries, entry)
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+	return entries, nil
+}
+
+func historySummaries(entries []promptOverlayHistoryEntry, limit int) []map[string]interface{} {
+	if limit <= 0 {
+		return []map[string]interface{}{}
+	}
+	if limit > len(entries) {
+		limit = len(entries)
+	}
+	out := make([]map[string]interface{}, 0, limit)
+	for i := len(entries) - 1; i >= 0 && len(out) < limit; i-- {
+		e := entries[i]
+		out = append(out, map[string]interface{}{
+			"revision":      e.Revision,
+			"created_at":    e.CreatedAt,
+			"operation":     e.Operation,
+			"note":          e.Note,
+			"overlay_chars": len([]rune(e.Overlay)),
+			"preview":       previewPromptOverlay(e.Overlay, promptOverlayPreviewMaxRun),
+		})
+	}
+	return out
+}
+
+func findPromptOverlayRevision(entries []promptOverlayHistoryEntry, revision string) (promptOverlayHistoryEntry, bool) {
+	revision = strings.TrimSpace(revision)
+	if revision == "" {
+		return promptOverlayHistoryEntry{}, false
+	}
+	for i := len(entries) - 1; i >= 0; i-- {
+		if entries[i].Revision == revision {
+			return entries[i], true
+		}
+	}
+	return promptOverlayHistoryEntry{}, false
+}
+
+func clampPromptOverlay(content string) (string, bool) {
+	text := strings.TrimSpace(content)
+	if text == "" {
+		return "", false
+	}
+	runes := []rune(text)
+	if len(runes) <= maxPromptOverlayChars {
+		return text, false
+	}
+	return strings.TrimSpace(string(runes[:maxPromptOverlayChars])), true
+}
+
+func previewPromptOverlay(content string, max int) string {
+	text := strings.TrimSpace(content)
+	if max <= 0 {
+		return text
+	}
+	runes := []rune(text)
+	if len(runes) <= max {
+		return text
+	}
+	if max <= 3 {
+		return string(runes[:max])
+	}
+	return string(runes[:max-3]) + "..."
+}
+
 func expandPath(p string) string {
 	if strings.HasPrefix(p, "~/") {
 		home, err := os.UserHomeDir()
@@ -630,9 +1110,6 @@ func classifyTelegramBashCommand(normalized string) (telegramBashPolicy, string)
 	if normalized == "" {
 		return telegramBashPolicyRequireApproval, "empty command"
 	}
-	if containsShellControlOperators(normalized) {
-		return telegramBashPolicyRequireApproval, "contains shell control operators"
-	}
 	if reason := disallowedTelegramLifecycleReason(normalized); reason != "" {
 		return telegramBashPolicyDeny, reason
 	}
@@ -641,30 +1118,79 @@ func classifyTelegramBashCommand(normalized string) (telegramBashPolicy, string)
 			return telegramBashPolicyDeny, "matches a denied command pattern"
 		}
 	}
-	for _, rx := range telegramApprovalPatterns {
-		if rx.MatchString(normalized) {
-			// Explicit user requirement: curl always asks for approval.
-			return telegramBashPolicyRequireApproval, "network/data command requires explicit approval"
-		}
+	if reason := explicitApprovalTelegramReason(normalized); reason != "" {
+		return telegramBashPolicyRequireApproval, reason
 	}
-	for _, rx := range telegramAllowPatterns {
-		if rx.MatchString(normalized) {
-			return telegramBashPolicyAllow, ""
-		}
+	if reason := potentiallyDestructiveTelegramReason(normalized); reason != "" {
+		return telegramBashPolicyRequireApproval, reason
 	}
-	return telegramBashPolicyRequireApproval, "command is outside the Telegram auto-allowlist"
+	if containsPotentialWriteRedirection(normalized) {
+		return telegramBashPolicyRequireApproval, "contains file-writing output redirection"
+	}
+	return telegramBashPolicyAllow, ""
 }
 
 func normalizeTelegramBashCommand(cmd string) string {
 	return strings.ToLower(strings.Join(strings.Fields(strings.TrimSpace(cmd)), " "))
 }
 
-func containsShellControlOperators(normalized string) bool {
-	return strings.ContainsAny(normalized, ";&|><`$")
-}
-
 func canAlwaysAllowTelegramCommand(_ string) bool {
 	return true
+}
+
+func potentiallyDestructiveTelegramReason(normalized string) string {
+	for _, p := range telegramPotentiallyDestructivePatterns {
+		if p.RX.MatchString(normalized) {
+			return p.Reason
+		}
+	}
+	return ""
+}
+
+func explicitApprovalTelegramReason(normalized string) string {
+	for _, p := range telegramExplicitApprovalPatterns {
+		if p.RX.MatchString(normalized) {
+			return p.Reason
+		}
+	}
+	return ""
+}
+
+func containsPotentialWriteRedirection(normalized string) bool {
+	if normalized == "" {
+		return false
+	}
+	fields := strings.Fields(normalized)
+	for i, field := range fields {
+		_, target, ok := parseWriteRedirectToken(field)
+		if !ok {
+			continue
+		}
+		if target == "" && i+1 < len(fields) {
+			target = fields[i+1]
+		}
+		target = strings.TrimSpace(target)
+		if target == "" {
+			return true
+		}
+		if target == "/dev/null" {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+func parseWriteRedirectToken(token string) (op, target string, ok bool) {
+	for _, prefix := range []string{"1>>", "2>>", ">>", "1>", "2>", ">"} {
+		if token == prefix {
+			return prefix, "", true
+		}
+		if strings.HasPrefix(token, prefix) {
+			return prefix, strings.TrimSpace(token[len(prefix):]), true
+		}
+	}
+	return "", "", false
 }
 
 func disallowedTelegramLifecycleReason(normalized string) string {

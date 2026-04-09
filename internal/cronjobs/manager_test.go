@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/ParthSareen/OllamaClaw/internal/db"
 	"github.com/ParthSareen/OllamaClaw/internal/tools"
@@ -180,8 +181,12 @@ func TestRunJobPrefetchAugmentsPromptAndLearnsCommands(t *testing.T) {
 
 	mgr := NewManager(store)
 	seenPrompt := ""
+	seenPrefetched := []tools.PrefetchedBashResult{}
 	mgr.SetRunner(func(ctx context.Context, transport, sessionKey, prompt string) (RunResult, error) {
 		seenPrompt = prompt
+		if prefetched, ok := tools.PrefetchedBashResultsFromContext(ctx); ok {
+			seenPrefetched = prefetched
+		}
 		return RunResult{
 			Output: "done",
 			BashCommands: []string{
@@ -193,11 +198,17 @@ func TestRunJobPrefetchAugmentsPromptAndLearnsCommands(t *testing.T) {
 	})
 	mgr.runJob("job-prefetch")
 
-	if !strings.Contains(seenPrompt, "Prefetched command outputs for this cron run") {
-		t.Fatalf("expected prefetch section in prompt, got %q", seenPrompt)
+	if strings.TrimSpace(seenPrompt) != "check PR status" {
+		t.Fatalf("expected original prompt to be passed to runner, got %q", seenPrompt)
 	}
-	if !strings.Contains(seenPrompt, "command: pwd") {
-		t.Fatalf("expected seeded prefetch command output in prompt, got %q", seenPrompt)
+	if len(seenPrefetched) != 1 {
+		t.Fatalf("expected 1 prefetched command in runner context, got %d (%v)", len(seenPrefetched), seenPrefetched)
+	}
+	if strings.TrimSpace(seenPrefetched[0].Command) != "pwd" {
+		t.Fatalf("expected prefetched command pwd, got %q", seenPrefetched[0].Command)
+	}
+	if strings.TrimSpace(seenPrefetched[0].FetchedAt) == "" {
+		t.Fatalf("expected prefetched command timestamp, got %+v", seenPrefetched[0])
 	}
 	learned, err := store.ListCronPrefetchCommands(context.Background(), "job-prefetch")
 	if err != nil {
@@ -246,5 +257,28 @@ func TestListJobPrefetchCommands(t *testing.T) {
 	}
 	if len(commands) != 2 {
 		t.Fatalf("expected 2 commands, got %d (%v)", len(commands), commands)
+	}
+}
+
+func TestToToolInfoFormatsTimesInPacific(t *testing.T) {
+	last := time.Date(2026, time.January, 15, 20, 0, 0, 0, time.UTC)
+	next := time.Date(2026, time.January, 15, 21, 30, 0, 0, time.UTC)
+	info := toToolInfo(db.CronJob{
+		ID:           "job-tz",
+		Schedule:     "0 * * * *",
+		Prompt:       "check status",
+		Transport:    "telegram",
+		SessionKey:   "8750063231",
+		Active:       true,
+		Safe:         false,
+		AutoPrefetch: true,
+		LastRunAt:    &last,
+		NextRunAt:    &next,
+	})
+	if info.LastRunAt != "2026-01-15T12:00:00-08:00" {
+		t.Fatalf("expected LastRunAt in PST, got %q", info.LastRunAt)
+	}
+	if info.NextRunAt != "2026-01-15T13:30:00-08:00" {
+		t.Fatalf("expected NextRunAt in PST, got %q", info.NextRunAt)
 	}
 }

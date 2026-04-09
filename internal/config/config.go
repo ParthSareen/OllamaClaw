@@ -16,6 +16,8 @@ const (
 	defaultLogFile       = "ollamaclaw.log"
 	defaultLockFile      = "plugins.lock.json"
 	defaultPromptFile    = "system_prompt.txt"
+	defaultPromptOverlay = "system_prompt.overlay.md"
+	defaultPromptHistory = "system_prompt.overlay.history.jsonl"
 	defaultCoreMemFile   = "core_memories.md"
 )
 
@@ -96,6 +98,22 @@ func SystemPromptPath() (string, error) {
 		return "", err
 	}
 	return filepath.Join(dir, defaultPromptFile), nil
+}
+
+func SystemPromptOverlayPath() (string, error) {
+	dir, err := ConfigDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, defaultPromptOverlay), nil
+}
+
+func SystemPromptOverlayHistoryPath() (string, error) {
+	dir, err := ConfigDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, defaultPromptHistory), nil
 }
 
 func CoreMemoriesPath() (string, error) {

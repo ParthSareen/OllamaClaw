@@ -156,7 +156,11 @@ func TestClassifyTelegramBashCommand(t *testing.T) {
 		{cmd: "git status", want: telegramBashPolicyAllow},
 		{cmd: "ollama list", want: telegramBashPolicyAllow},
 		{cmd: "curl https://example.com", want: telegramBashPolicyRequireApproval, reasonIn: "network/data"},
-		{cmd: "touch /tmp/x", want: telegramBashPolicyRequireApproval, reasonIn: "outside"},
+		{cmd: "touch /tmp/x", want: telegramBashPolicyRequireApproval, reasonIn: "filesystem mutation"},
+		{cmd: "curl -X POST https://example.com", want: telegramBashPolicyRequireApproval, reasonIn: "network/data"},
+		{cmd: "git commit -m 'x'", want: telegramBashPolicyRequireApproval, reasonIn: "mutating git"},
+		{cmd: "echo hi > /tmp/out.txt", want: telegramBashPolicyRequireApproval, reasonIn: "output redirection"},
+		{cmd: "tail -100 ~/.codex/history.jsonl 2>/dev/null | head -30", want: telegramBashPolicyAllow},
 		{cmd: "sudo ls", want: telegramBashPolicyDeny, reasonIn: "denied"},
 		{cmd: "rm -f ~/.ollamaclaw/launch.lock", want: telegramBashPolicyDeny, reasonIn: "lock files"},
 	}
@@ -179,37 +183,26 @@ func TestGuardTelegramBashCommandCurlAlwaysNeedsApproval(t *testing.T) {
 	}
 }
 
-func TestGuardTelegramBashCommandCurlEnablesAlwaysAllow(t *testing.T) {
+func TestGuardTelegramBashCommandDestructiveCommandEnablesAlwaysAllow(t *testing.T) {
 	approver := &stubBashApprover{}
 	ctx := WithSessionInfo(context.Background(), "telegram", "8750063231")
 	ctx = WithBashApprover(ctx, approver)
-	if err := guardTelegramBashCommand(ctx, "curl https://example.com"); err != nil {
-		t.Fatalf("expected approver path for curl, got %v", err)
+	if err := guardTelegramBashCommand(ctx, "touch /tmp/test-file"); err != nil {
+		t.Fatalf("expected approver path for destructive command, got %v", err)
 	}
 	if !approver.called {
 		t.Fatalf("expected approver to be called")
 	}
 	if !approver.lastReq.AllowAlways {
-		t.Fatalf("expected curl approvals to allow always-allow")
+		t.Fatalf("expected destructive command approvals to allow always-allow")
 	}
 }
 
-func TestGuardTelegramBashCommandControlOperatorsEnableAlwaysAllow(t *testing.T) {
-	approver := &stubBashApprover{}
+func TestGuardTelegramBashCommandNonDestructiveControlOperatorsAllowed(t *testing.T) {
 	ctx := WithSessionInfo(context.Background(), "telegram", "8750063231")
-	ctx = WithBashApprover(ctx, approver)
 	cmd := "tail -100 ~/.codex/history.jsonl 2>/dev/null | head -30"
 	if err := guardTelegramBashCommand(ctx, cmd); err != nil {
-		t.Fatalf("expected approver path for control-operator command, got %v", err)
-	}
-	if !approver.called {
-		t.Fatalf("expected approver to be called")
-	}
-	if !approver.lastReq.AllowAlways {
-		t.Fatalf("expected control-operator approvals to allow always-allow")
-	}
-	if !strings.Contains(strings.ToLower(approver.lastReq.Reason), "shell control operators") {
-		t.Fatalf("expected control-operator reason, got %q", approver.lastReq.Reason)
+		t.Fatalf("expected non-destructive control-operator command to be allowed, got %v", err)
 	}
 }
 
@@ -256,5 +249,144 @@ func TestBashToolTimeoutMessageIncludesDuration(t *testing.T) {
 	stderr, _ := res["stderr"].(string)
 	if !strings.Contains(stderr, "command timed out after 1s") {
 		t.Fatalf("expected timeout duration in stderr, got %q", stderr)
+	}
+}
+
+func TestSystemPromptUpdateGetAndHistory(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	toolMap := ToolMap(BuiltinTools(BuiltinsConfig{
+		ToolOutputMaxBytes: 4096,
+		BashTimeoutSec:     10,
+		LogPath:            filepath.Join(home, "ollamaclaw.log"),
+	}, ollama.NewClient("http://localhost:11434")))
+	updateTool := toolMap["system_prompt_update"]
+	getTool := toolMap["system_prompt_get"]
+	historyTool := toolMap["system_prompt_history"]
+
+	first, err := updateTool.Execute(context.Background(), map[string]interface{}{
+		"operation": "set",
+		"content":   "Be concise and direct.",
+		"note":      "initial",
+	})
+	if err != nil {
+		t.Fatalf("system_prompt_update(set) error: %v", err)
+	}
+	rev1, _ := first["revision"].(string)
+	if strings.TrimSpace(rev1) == "" {
+		t.Fatalf("expected revision from set operation")
+	}
+
+	if _, err := updateTool.Execute(context.Background(), map[string]interface{}{
+		"operation": "append",
+		"content":   "Prefer bullet points for summaries.",
+		"note":      "append style",
+	}); err != nil {
+		t.Fatalf("system_prompt_update(append) error: %v", err)
+	}
+
+	got, err := getTool.Execute(context.Background(), map[string]interface{}{
+		"history_limit": float64(5),
+	})
+	if err != nil {
+		t.Fatalf("system_prompt_get error: %v", err)
+	}
+	overlay, _ := got["overlay"].(string)
+	if !strings.Contains(overlay, "Be concise and direct.") || !strings.Contains(overlay, "Prefer bullet points for summaries.") {
+		t.Fatalf("expected appended overlay content, got %q", overlay)
+	}
+	history, ok := got["history"].([]map[string]interface{})
+	if !ok {
+		t.Fatalf("expected history in system_prompt_get response, got %#v", got["history"])
+	}
+	if len(history) < 2 {
+		t.Fatalf("expected at least 2 history entries, got %d", len(history))
+	}
+
+	hres, err := historyTool.Execute(context.Background(), map[string]interface{}{"limit": float64(1)})
+	if err != nil {
+		t.Fatalf("system_prompt_history error: %v", err)
+	}
+	entries, ok := hres["history"].([]map[string]interface{})
+	if !ok || len(entries) != 1 {
+		t.Fatalf("expected exactly 1 history entry, got %#v", hres["history"])
+	}
+}
+
+func TestSystemPromptRollback(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	toolMap := ToolMap(BuiltinTools(BuiltinsConfig{
+		ToolOutputMaxBytes: 4096,
+		BashTimeoutSec:     10,
+		LogPath:            filepath.Join(home, "ollamaclaw.log"),
+	}, ollama.NewClient("http://localhost:11434")))
+	updateTool := toolMap["system_prompt_update"]
+	rollbackTool := toolMap["system_prompt_rollback"]
+	getTool := toolMap["system_prompt_get"]
+
+	first, err := updateTool.Execute(context.Background(), map[string]interface{}{
+		"operation": "set",
+		"content":   "Version one",
+	})
+	if err != nil {
+		t.Fatalf("set v1 error: %v", err)
+	}
+	rev1, _ := first["revision"].(string)
+	if strings.TrimSpace(rev1) == "" {
+		t.Fatalf("expected revision for v1")
+	}
+	if _, err := updateTool.Execute(context.Background(), map[string]interface{}{
+		"operation": "set",
+		"content":   "Version two",
+	}); err != nil {
+		t.Fatalf("set v2 error: %v", err)
+	}
+	if _, err := rollbackTool.Execute(context.Background(), map[string]interface{}{
+		"revision": rev1,
+		"note":     "back to v1",
+	}); err != nil {
+		t.Fatalf("rollback error: %v", err)
+	}
+	got, err := getTool.Execute(context.Background(), map[string]interface{}{})
+	if err != nil {
+		t.Fatalf("get after rollback error: %v", err)
+	}
+	overlay, _ := got["overlay"].(string)
+	if strings.TrimSpace(overlay) != "Version one" {
+		t.Fatalf("expected overlay to be rolled back to v1, got %q", overlay)
+	}
+}
+
+func TestSystemPromptOverlayClamp(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	toolMap := ToolMap(BuiltinTools(BuiltinsConfig{
+		ToolOutputMaxBytes: 4096,
+		BashTimeoutSec:     10,
+		LogPath:            filepath.Join(home, "ollamaclaw.log"),
+	}, ollama.NewClient("http://localhost:11434")))
+	updateTool := toolMap["system_prompt_update"]
+	getTool := toolMap["system_prompt_get"]
+
+	long := strings.Repeat("x", maxPromptOverlayChars+200)
+	res, err := updateTool.Execute(context.Background(), map[string]interface{}{
+		"operation": "set",
+		"content":   long,
+	})
+	if err != nil {
+		t.Fatalf("set long overlay error: %v", err)
+	}
+	truncated, _ := res["truncated"].(bool)
+	if !truncated {
+		t.Fatalf("expected truncated=true for oversized overlay")
+	}
+	got, err := getTool.Execute(context.Background(), map[string]interface{}{})
+	if err != nil {
+		t.Fatalf("get overlay error: %v", err)
+	}
+	chars, _ := got["overlay_chars"].(int)
+	if chars != maxPromptOverlayChars {
+		t.Fatalf("expected overlay_chars=%d, got %d", maxPromptOverlayChars, chars)
 	}
 }

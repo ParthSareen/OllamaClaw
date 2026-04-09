@@ -5,7 +5,7 @@ Current app version: `0.1.3`.
 
 It supports:
 - Shared agent core for `repl` and `telegram` modes
-- Built-in tools: `bash`, `read_file`, `write_file`, `web_search`, `web_fetch`
+- Built-in tools: `bash`, `read_file`, `write_file`, `web_search`, `web_fetch`, `system_prompt_get`, `system_prompt_update`, `system_prompt_history`, `system_prompt_rollback`
 - Local SQLite persistence with per-chat sessions
 - Context compaction (summary + recent turns)
 - Shareable subprocess plugins (JSON-RPC over stdio)
@@ -85,10 +85,13 @@ ollamaclaw plugin update [plugin-id]
 - `/model [name]` shows/sets per-chat model
 - `/tools` lists built-in + enabled plugin tools
 - `/cron list [active|all]` lists cron jobs
+- Cron schedules and displayed cron timestamps are interpreted in `America/Los_Angeles` (PST/PDT)
 - `/cron safe <id>` marks a cron as safe (Telegram bash approvals auto-approve for that cron)
 - `/cron unsafe <id>` removes safe mode from a cron
 - `/cron prefetch list <id>` shows learned prefetched commands for a cron job
 - Cron jobs auto-learn stable bash commands from prior runs and prefetch them on future runs (`auto_prefetch` on by default)
+- Prefetched commands are executed immediately before each cron agent turn; prompts include `run_started_at` and per-command `fetched_at` timestamps
+- Telegram bash policy defaults to allow for non-destructive commands; potentially destructive commands require approval; critical lifecycle commands remain blocked
 - `/show tools [on|off]` toggles live tool event messages
 - `/show thinking [on|off]` toggles thinking visibility mode
 - `/verbose [on|off]` enables/disables tool + thinking traces for this chat session
@@ -150,6 +153,18 @@ Output:
 {"title":"...","content":"...","links":["..."]}
 ```
 
+### `system_prompt_get`
+Reads managed system prompt details (base/overlay paths, overlay content, optional revision history).
+
+### `system_prompt_update`
+Safely updates only the managed overlay (`set`, `append`, `clear`) with revision history logging.
+
+### `system_prompt_history`
+Lists recent managed overlay revisions.
+
+### `system_prompt_rollback`
+Rolls managed overlay back to a prior revision from `system_prompt_history`.
+
 `web_search` and `web_fetch` use Ollama hosted APIs and require:
 
 ```bash
@@ -161,6 +176,8 @@ export OLLAMA_API_KEY=...
 File: `~/.ollamaclaw/config.json`
 
 Runtime system prompt file: `~/.ollamaclaw/system_prompt.txt` (read dynamically each turn; falls back to built-in prompt if missing/empty)
+Managed system prompt overlay file: `~/.ollamaclaw/system_prompt.overlay.md` (agent-updatable layer)
+Managed overlay history file: `~/.ollamaclaw/system_prompt.overlay.history.jsonl` (append-only revision log)
 Core memories file: `~/.ollamaclaw/core_memories.md` (updated in background every 10 user turns and injected as a system context block)
 
 Defaults:

@@ -21,6 +21,7 @@ import (
 	"github.com/ParthSareen/OllamaClaw/internal/cronjobs"
 	"github.com/ParthSareen/OllamaClaw/internal/db"
 	"github.com/ParthSareen/OllamaClaw/internal/tools"
+	"github.com/ParthSareen/OllamaClaw/internal/util"
 	"github.com/go-telegram/bot"
 	"github.com/go-telegram/bot/models"
 )
@@ -678,7 +679,7 @@ func (r *Runner) handleCommand(ctx context.Context, b *bot.Bot, chatID int64, ra
 				return
 			}
 			lines := make([]string, 0, len(jobs)+1)
-			lines = append(lines, fmt.Sprintf("cron jobs (%s):", scopeLabel))
+			lines = append(lines, fmt.Sprintf("cron jobs (%s, timezone=%s):", scopeLabel, util.PacificTimezoneName))
 			for _, job := range jobs {
 				nextRun := "-"
 				if strings.TrimSpace(job.NextRunAt) != "" {
@@ -756,7 +757,7 @@ func (r *Runner) handleCommand(ctx context.Context, b *bot.Bot, chatID int64, ra
 		if version == "" {
 			version = "dev"
 		}
-		text := fmt.Sprintf("status:\nversion: %s\nmodel: %s\nverbose: %t\nshow_tools: %t\nthink: %s\nprompt_tokens: %d\ncompletion_tokens: %d\ncompactions: %d\nenabled_plugins: %d\ndb: %s\nlog: %s", version, redactTelegramToken(r.Cfg.Telegram.BotToken, sess.ModelOverride), verbose, showTools, thinkValue, sess.TotalPromptToken, sess.TotalEvalToken, sess.CompactionCount, len(enabledPlugins), r.Cfg.DBPath, strings.TrimSpace(r.Cfg.LogPath))
+		text := fmt.Sprintf("status:\nversion: %s\nmodel: %s\nverbose: %t\nshow_tools: %t\nthink: %s\ntimezone: %s\nprompt_tokens: %d\ncompletion_tokens: %d\ncompactions: %d\nenabled_plugins: %d\ndb: %s\nlog: %s", version, redactTelegramToken(r.Cfg.Telegram.BotToken, sess.ModelOverride), verbose, showTools, thinkValue, util.PacificTimezoneName, sess.TotalPromptToken, sess.TotalEvalToken, sess.CompactionCount, len(enabledPlugins), r.Cfg.DBPath, strings.TrimSpace(r.Cfg.LogPath))
 		send(text)
 	case "stop":
 		r.logf("command stop: chat=%d", chatID)

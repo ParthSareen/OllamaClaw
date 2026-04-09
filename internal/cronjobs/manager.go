@@ -13,6 +13,7 @@ import (
 
 	"github.com/ParthSareen/OllamaClaw/internal/db"
 	"github.com/ParthSareen/OllamaClaw/internal/tools"
+	"github.com/ParthSareen/OllamaClaw/internal/util"
 	"github.com/robfig/cron/v3"
 )
 
@@ -52,6 +53,7 @@ const (
 
 type prefetchCommandResult struct {
 	Command    string
+	FetchedAt  string
 	ExitCode   int
 	Stdout     string
 	Stderr     string
@@ -60,7 +62,7 @@ type prefetchCommandResult struct {
 
 func NewManager(store *db.Store) *Manager {
 	parser := cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow | cron.Descriptor)
-	c := cron.New(cron.WithParser(parser))
+	c := cron.New(cron.WithParser(parser), cron.WithLocation(util.PacificLocation()))
 	return &Manager{
 		store:   store,
 		entries: map[string]cron.EntryID{},
@@ -234,7 +236,8 @@ func (m *Manager) scheduleLocked(ctx context.Context, job db.CronJob) error {
 	if err != nil {
 		return err
 	}
-	next := schedule.Next(time.Now().UTC())
+	nowPacific := time.Now().In(util.PacificLocation())
+	next := schedule.Next(nowPacific)
 	job.NextRunAt = &next
 	if err := m.store.UpsertCronJob(ctx, job); err != nil {
 		return err
@@ -270,7 +273,7 @@ func (m *Manager) runJob(jobID string) {
 		return
 	}
 
-	now := time.Now().UTC()
+	now := time.Now().In(util.PacificLocation())
 	runCtx := baseCtx
 	if job.Safe {
 		runCtx = tools.WithBashApprover(runCtx, safeCronBashApprover{})
@@ -279,11 +282,14 @@ func (m *Manager) runJob(jobID string) {
 	if prefetchErr != nil {
 		prefetchCommands = nil
 	}
-	effectivePrompt := job.Prompt
+	prefetched := []prefetchCommandResult{}
 	if job.AutoPrefetch && len(prefetchCommands) > 0 {
-		results := executePrefetchCommands(runCtx, prefetchCommands)
-		effectivePrompt = augmentCronPromptWithPrefetch(job.Prompt, results)
+		prefetched = executePrefetchCommands(runCtx, prefetchCommands)
 	}
+	if len(prefetched) > 0 {
+		runCtx = tools.WithPrefetchedBashResults(runCtx, toToolPrefetchedBashResults(prefetched))
+	}
+	effectivePrompt := job.Prompt
 
 	res, runErr := runner(runCtx, job.Transport, job.SessionKey, effectivePrompt)
 	spec, parseErr := m.parser.Parse(job.Schedule)
@@ -318,10 +324,10 @@ func toToolInfo(j db.CronJob) tools.CronJobInfo {
 		LastError:    j.LastError,
 	}
 	if j.LastRunAt != nil {
-		info.LastRunAt = j.LastRunAt.UTC().Format(time.RFC3339)
+		info.LastRunAt = util.FormatPacificRFC3339(*j.LastRunAt)
 	}
 	if j.NextRunAt != nil {
-		info.NextRunAt = j.NextRunAt.UTC().Format(time.RFC3339)
+		info.NextRunAt = util.FormatPacificRFC3339(*j.NextRunAt)
 	}
 	return info
 }
@@ -334,7 +340,7 @@ func executePrefetchCommands(ctx context.Context, commands []string) []prefetchC
 			continue
 		}
 		cmdCtx, cancel := context.WithTimeout(ctx, prefetchCommandTimeout)
-		startedAt := time.Now()
+		startedAt := time.Now().In(util.PacificLocation())
 		c := exec.CommandContext(cmdCtx, "/bin/bash", "-lc", command)
 		stdout, err := c.Output()
 		stderr := ""
@@ -355,6 +361,7 @@ func executePrefetchCommands(ctx context.Context, commands []string) []prefetchC
 		}
 		out = append(out, prefetchCommandResult{
 			Command:    command,
+			FetchedAt:  util.FormatPacificRFC3339(startedAt),
 			ExitCode:   exitCode,
 			Stdout:     truncatePrefetch(string(stdout)),
 			Stderr:     truncatePrefetch(stderr),
@@ -364,24 +371,29 @@ func executePrefetchCommands(ctx context.Context, commands []string) []prefetchC
 	return out
 }
 
-func augmentCronPromptWithPrefetch(prompt string, results []prefetchCommandResult) string {
-	if len(results) == 0 {
-		return prompt
-	}
+func augmentCronPromptWithPrefetch(prompt string, results []prefetchCommandResult, runAt time.Time) string {
 	var b strings.Builder
 	b.WriteString(prompt)
-	b.WriteString("\n\nPrefetched command outputs for this cron run (already executed by host):")
-	for i, result := range results {
-		b.WriteString(fmt.Sprintf("\n\n[%d] command: %s\nexit_code: %d\nduration_ms: %d\nstdout:\n%s\nstderr:\n%s",
-			i+1,
-			result.Command,
-			result.ExitCode,
-			result.DurationMs,
-			result.Stdout,
-			result.Stderr,
-		))
+	b.WriteString("\n\nCron run metadata (host-provided):")
+	b.WriteString(fmt.Sprintf("\nrun_started_at: %s", util.FormatPacificRFC3339(runAt)))
+	b.WriteString(fmt.Sprintf("\ntimezone: %s", util.PacificTimezoneName))
+	b.WriteString("\nfreshness_requirement: Never rely on prior-run status for time-sensitive answers. Use data fetched in this run only.")
+	if len(results) > 0 {
+		b.WriteString("\n\nPrefetched command outputs for this cron run (already executed by host at run_started_at):")
+		for i, result := range results {
+			b.WriteString(fmt.Sprintf("\n\n[%d] command: %s\nfetched_at: %s\nexit_code: %d\nduration_ms: %d\nstdout:\n%s\nstderr:\n%s",
+				i+1,
+				result.Command,
+				result.FetchedAt,
+				result.ExitCode,
+				result.DurationMs,
+				result.Stdout,
+				result.Stderr,
+			))
+		}
 	}
-	b.WriteString("\n\nUse prefetched outputs when possible. Only call additional tools if needed for missing or fresher data.")
+	b.WriteString("\n\nIf required status/data is missing, failed, or may be stale, run fresh tool calls now before final answer.")
+	b.WriteString("\nNever report time-sensitive status from chat history when it conflicts with this run.")
 	return b.String()
 }
 
@@ -499,4 +511,22 @@ func BashCommandsFromToolTraceJSON(trace []json.RawMessage) []string {
 		out = append(out, command)
 	}
 	return BashCommandsFromTrace(out)
+}
+
+func toToolPrefetchedBashResults(results []prefetchCommandResult) []tools.PrefetchedBashResult {
+	if len(results) == 0 {
+		return nil
+	}
+	out := make([]tools.PrefetchedBashResult, 0, len(results))
+	for _, result := range results {
+		out = append(out, tools.PrefetchedBashResult{
+			Command:    result.Command,
+			FetchedAt:  result.FetchedAt,
+			ExitCode:   result.ExitCode,
+			Stdout:     result.Stdout,
+			Stderr:     result.Stderr,
+			DurationMs: result.DurationMs,
+		})
+	}
+	return out
 }

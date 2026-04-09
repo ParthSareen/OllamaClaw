@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -52,5 +53,24 @@ func TestSaveExpandsDBPath(t *testing.T) {
 	expectedLog := filepath.Join(home, "custom", "ollamaclaw.log")
 	if loaded.LogPath != expectedLog {
 		t.Fatalf("expected %s, got %s", expectedLog, loaded.LogPath)
+	}
+}
+
+func TestSystemPromptOverlayPaths(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	overlayPath, err := SystemPromptOverlayPath()
+	if err != nil {
+		t.Fatalf("SystemPromptOverlayPath() error: %v", err)
+	}
+	historyPath, err := SystemPromptOverlayHistoryPath()
+	if err != nil {
+		t.Fatalf("SystemPromptOverlayHistoryPath() error: %v", err)
+	}
+	if !strings.HasSuffix(overlayPath, filepath.Join(".ollamaclaw", "system_prompt.overlay.md")) {
+		t.Fatalf("unexpected overlay path: %s", overlayPath)
+	}
+	if !strings.HasSuffix(historyPath, filepath.Join(".ollamaclaw", "system_prompt.overlay.history.jsonl")) {
+		t.Fatalf("unexpected history path: %s", historyPath)
 	}
 }
