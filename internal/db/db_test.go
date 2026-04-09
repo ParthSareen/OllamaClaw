@@ -93,6 +93,42 @@ func TestMessageArchiveAndCompactionSummary(t *testing.T) {
 	}
 }
 
+func TestArchiveMessagesByToolCallID(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	store, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open() error: %v", err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	sess, err := store.CreateSession(ctx, "telegram", "123", "model")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m1 := &Message{SessionID: sess.ID, Role: "assistant", Content: "prefetch 1", ToolCallID: "prefetch_ctx"}
+	m2 := &Message{SessionID: sess.ID, Role: "tool", Content: `{"prefetched":true}`, ToolName: "bash", ToolCallID: "prefetch_ctx"}
+	m3 := &Message{SessionID: sess.ID, Role: "assistant", Content: "normal"}
+	if err := store.InsertMessage(ctx, m1); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.InsertMessage(ctx, m2); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.InsertMessage(ctx, m3); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ArchiveMessagesByToolCallID(ctx, sess.ID, "prefetch_ctx"); err != nil {
+		t.Fatal(err)
+	}
+	active, err := store.ListMessages(ctx, sess.ID, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(active) != 1 || active[0].ID != m3.ID {
+		t.Fatalf("expected only non-prefetch message to remain active, got %+v", active)
+	}
+}
+
 func TestCronJobSafePersistence(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.db")
 	store, err := Open(path)

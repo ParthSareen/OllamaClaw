@@ -721,6 +721,19 @@ func TestHandleTextInjectsPrefetchedBashAsToolContext(t *testing.T) {
 	if !(assistantIdx < toolIdx && toolIdx < userIdx) {
 		t.Fatalf("expected order assistant(tool call) -> tool(result) -> user(prompt); got assistant=%d tool=%d user=%d messages=%#v", assistantIdx, toolIdx, userIdx, firstReq)
 	}
+	sess, err := engine.GetOrCreateSession(context.Background(), "telegram", "8750063231")
+	if err != nil {
+		t.Fatalf("GetOrCreateSession error: %v", err)
+	}
+	active, err := store.ListMessages(context.Background(), sess.ID, false)
+	if err != nil {
+		t.Fatalf("ListMessages error: %v", err)
+	}
+	for _, m := range active {
+		if m.ToolCallID == prefetchToolID {
+			t.Fatalf("expected synthetic prefetch context to be archived after run, found active message: %+v", m)
+		}
+	}
 }
 
 func TestUpsertManagedCoreMemoriesPreservesUserContent(t *testing.T) {

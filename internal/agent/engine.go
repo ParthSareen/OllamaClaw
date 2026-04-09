@@ -96,6 +96,7 @@ type ToolEventPhase string
 const (
 	ToolEventStart  ToolEventPhase = "start"
 	ToolEventFinish ToolEventPhase = "finish"
+	prefetchToolID  string         = "prefetch_ctx"
 )
 
 type ToolEvent struct {
@@ -149,10 +150,23 @@ func (e *Engine) HandleTextWithOptions(ctx context.Context, transport, sessionKe
 	if err != nil {
 		return HandleResult{}, err
 	}
+	if err := e.store.ArchiveMessagesByToolCallID(ctx, sess.ID, prefetchToolID); err != nil {
+		return HandleResult{}, err
+	}
+	shouldCleanupPrefetch := false
+	defer func() {
+		if !shouldCleanupPrefetch {
+			return
+		}
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = e.store.ArchiveMessagesByToolCallID(cleanupCtx, sess.ID, prefetchToolID)
+	}()
 	if prefetched, ok := tools.PrefetchedBashResultsFromContext(ctx); ok && len(prefetched) > 0 {
 		if err := e.injectPrefetchedBashContext(ctx, sess.ID, prefetched); err != nil {
 			return HandleResult{}, err
 		}
+		shouldCleanupPrefetch = true
 	}
 	if err := e.store.InsertMessage(ctx, &db.Message{SessionID: sess.ID, Role: "user", Content: input}); err != nil {
 		return HandleResult{}, err
@@ -356,6 +370,7 @@ func (e *Engine) injectPrefetchedBashContext(ctx context.Context, sessionID stri
 			SessionID:     sessionID,
 			Role:          "assistant",
 			Content:       fmt.Sprintf("Host prefetch step %d/%d (run_started_at=%s)", i+1, len(prefetched), p.RunStarted),
+			ToolCallID:    prefetchToolID,
 			ToolCallsJSON: string(callJSON),
 		}); err != nil {
 			return err
@@ -374,6 +389,7 @@ func (e *Engine) injectPrefetchedBashContext(ctx context.Context, sessionID stri
 			SessionID:    sessionID,
 			Role:         "tool",
 			ToolName:     "bash",
+			ToolCallID:   prefetchToolID,
 			ToolArgsJSON: mustJSON(map[string]interface{}{"command": p.Command}),
 			Content:      string(b),
 		}); err != nil {

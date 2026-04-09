@@ -438,6 +438,17 @@ func (s *Store) ArchiveMessagesByIDs(ctx context.Context, sessionID string, ids 
 	return nil
 }
 
+func (s *Store) ArchiveMessagesByToolCallID(ctx context.Context, sessionID, toolCallID string) error {
+	if strings.TrimSpace(sessionID) == "" || strings.TrimSpace(toolCallID) == "" {
+		return nil
+	}
+	_, err := s.db.ExecContext(ctx, `UPDATE messages SET archived = 1 WHERE session_id = ? AND archived = 0 AND tool_call_id = ?`, sessionID, toolCallID)
+	if err != nil {
+		return fmt.Errorf("archive messages by tool call id: %w", err)
+	}
+	return nil
+}
+
 func (s *Store) InsertCompaction(ctx context.Context, c Compaction) error {
 	_, err := s.db.ExecContext(ctx, `
 INSERT INTO compactions(session_id, summary, first_kept_message_id, archived_before_seq, created_at)
