@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/ParthSareen/OllamaClaw/internal/config"
 	"github.com/ParthSareen/OllamaClaw/internal/db"
@@ -969,6 +970,31 @@ func TestWithTimezonePolicyPromptAppendsOnce(t *testing.T) {
 	twice := withTimezonePolicyPrompt(once)
 	if twice != once {
 		t.Fatalf("expected second application to be idempotent, got %q", twice)
+	}
+}
+
+func TestWithCurrentTimePromptAddsPacificAndUTC(t *testing.T) {
+	base := "You are custom."
+	now := time.Date(2026, time.April, 15, 18, 45, 30, 0, time.UTC)
+	got := withCurrentTimePrompt(base, now)
+	if !strings.Contains(got, "Current runtime time:") {
+		t.Fatalf("expected current runtime time section, got %q", got)
+	}
+	if !strings.Contains(got, "Current time (America/Los_Angeles): 2026-04-15T11:45:30-07:00") {
+		t.Fatalf("expected pacific timestamp in prompt, got %q", got)
+	}
+	if !strings.Contains(got, "Current time (UTC): 2026-04-15T18:45:30Z") {
+		t.Fatalf("expected UTC timestamp in prompt, got %q", got)
+	}
+}
+
+func TestWithCurrentTimePromptAppendsOnce(t *testing.T) {
+	base := "You are custom."
+	now := time.Date(2026, time.April, 15, 18, 45, 30, 0, time.UTC)
+	once := withCurrentTimePrompt(base, now)
+	twice := withCurrentTimePrompt(once, now.Add(2*time.Hour))
+	if twice != once {
+		t.Fatalf("expected second current-time application to be idempotent, got %q", twice)
 	}
 }
 

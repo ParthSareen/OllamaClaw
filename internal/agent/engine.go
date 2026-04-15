@@ -17,6 +17,7 @@ import (
 	"github.com/ParthSareen/OllamaClaw/internal/ollama"
 	"github.com/ParthSareen/OllamaClaw/internal/plugin"
 	"github.com/ParthSareen/OllamaClaw/internal/tools"
+	"github.com/ParthSareen/OllamaClaw/internal/util"
 )
 
 const (
@@ -619,23 +620,24 @@ func attachImagesToLatestUserMessage(messages []ollama.ChatMessage, images []str
 }
 
 func (e *Engine) runtimeSystemPrompt() string {
+	now := time.Now()
 	overlay := e.runtimeSystemPromptOverlay()
 	path, err := config.SystemPromptPath()
 	if err != nil {
-		return composeSystemPrompt(defaultSystemPrompt, overlay)
+		return composeSystemPrompt(defaultSystemPrompt, overlay, now)
 	}
 	if b, err := os.ReadFile(path); err == nil {
 		text := strings.TrimSpace(string(b))
 		if text != "" {
-			return composeSystemPrompt(string(b), overlay)
+			return composeSystemPrompt(string(b), overlay, now)
 		}
-		return composeSystemPrompt(defaultSystemPrompt, overlay)
+		return composeSystemPrompt(defaultSystemPrompt, overlay, now)
 	} else if !errors.Is(err, os.ErrNotExist) {
-		return composeSystemPrompt(defaultSystemPrompt, overlay)
+		return composeSystemPrompt(defaultSystemPrompt, overlay, now)
 	}
 	_ = os.MkdirAll(filepath.Dir(path), 0o755)
 	_ = os.WriteFile(path, []byte(defaultSystemPrompt), 0o600)
-	return composeSystemPrompt(defaultSystemPrompt, overlay)
+	return composeSystemPrompt(defaultSystemPrompt, overlay, now)
 }
 
 func withTimezonePolicyPrompt(base string) string {
@@ -651,8 +653,24 @@ func withTimezonePolicyPrompt(base string) string {
 	return text + addendum
 }
 
-func composeSystemPrompt(base, overlay string) string {
+func withCurrentTimePrompt(base string, now time.Time) string {
+	text := strings.TrimSpace(base)
+	if text == "" {
+		text = defaultSystemPrompt
+	}
+	lower := strings.ToLower(text)
+	if strings.Contains(lower, "current runtime time:") || strings.Contains(lower, "current time (america/los_angeles):") {
+		return text
+	}
+	pacific := now.In(util.PacificLocation()).Format(time.RFC3339)
+	utc := now.UTC().Format(time.RFC3339)
+	addendum := "\n\nCurrent runtime time:\n- Current time (America/Los_Angeles): " + pacific + "\n- Current time (UTC): " + utc + "\n- Interpret relative dates (today/tomorrow/yesterday/this week) against America/Los_Angeles."
+	return text + addendum
+}
+
+func composeSystemPrompt(base, overlay string, now time.Time) string {
 	text := withTimezonePolicyPrompt(base)
+	text = withCurrentTimePrompt(text, now)
 	overlay = strings.TrimSpace(overlay)
 	if overlay == "" {
 		return text
