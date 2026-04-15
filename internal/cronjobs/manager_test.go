@@ -9,6 +9,8 @@ import (
 
 	"github.com/ParthSareen/OllamaClaw/internal/db"
 	"github.com/ParthSareen/OllamaClaw/internal/tools"
+	"github.com/ParthSareen/OllamaClaw/internal/util"
+	"github.com/robfig/cron/v3"
 )
 
 func TestAddListRemoveJob(t *testing.T) {
@@ -304,5 +306,91 @@ func TestToToolInfoFormatsTimesInPacific(t *testing.T) {
 	}
 	if info.NextRunAt != "2026-01-15T13:30:00-08:00" {
 		t.Fatalf("expected NextRunAt in PST, got %q", info.NextRunAt)
+	}
+}
+
+func TestScheduleSpecPacificPrefixesTimezone(t *testing.T) {
+	spec, err := scheduleSpecPacific("0 9 * * *")
+	if err != nil {
+		t.Fatalf("scheduleSpecPacific() error: %v", err)
+	}
+	wantPrefix := "CRON_TZ=America/Los_Angeles "
+	if !strings.HasPrefix(spec, wantPrefix) {
+		t.Fatalf("expected %q prefix, got %q", wantPrefix, spec)
+	}
+	if strings.TrimSpace(strings.TrimPrefix(spec, wantPrefix)) != "0 9 * * *" {
+		t.Fatalf("unexpected normalized spec %q", spec)
+	}
+}
+
+func TestScheduleSpecPacificRejectsTimezoneOverride(t *testing.T) {
+	for _, spec := range []string{
+		"TZ=UTC 0 9 * * *",
+		"CRON_TZ=UTC 0 9 * * *",
+		"crOn_tz=UTC 0 9 * * *",
+	} {
+		if _, err := scheduleSpecPacific(spec); err == nil {
+			t.Fatalf("expected timezone override rejection for spec %q", spec)
+		}
+	}
+}
+
+func TestParseSchedulePacificUsesPacificIndependentlyOfTimeLocal(t *testing.T) {
+	origLocal := time.Local
+	t.Cleanup(func() { time.Local = origLocal })
+	time.Local = time.FixedZone("UTC+09", 9*60*60)
+
+	parser := cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow | cron.Descriptor)
+	sched, err := parseSchedulePacific(parser, "0 9 * * *")
+	if err != nil {
+		t.Fatalf("parseSchedulePacific() error: %v", err)
+	}
+	nowUTC := time.Date(2026, time.April, 14, 14, 30, 0, 0, time.UTC)
+	next := sched.Next(nowUTC)
+	nextPacific := next.In(util.PacificLocation())
+	if nextPacific.Hour() != 9 || nextPacific.Minute() != 0 {
+		t.Fatalf("expected next run at 09:00 Pacific, got %s", nextPacific.Format(time.RFC3339))
+	}
+}
+
+func TestAddJobRejectsTimezonePrefixedSpec(t *testing.T) {
+	store, err := db.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer store.Close()
+	mgr := NewManager(store)
+	_, err = mgr.AddJob(context.Background(), tools.CronJobSpec{
+		ID:         "job-tz-reject",
+		Schedule:   "CRON_TZ=UTC 0 9 * * *",
+		Prompt:     "ping",
+		Transport:  "repl",
+		SessionKey: "default",
+	})
+	if err == nil {
+		t.Fatalf("expected timezone-prefixed spec rejection")
+	}
+	if !strings.Contains(strings.ToLower(err.Error()), "timezone") {
+		t.Fatalf("expected timezone-related error, got %v", err)
+	}
+}
+
+func TestParseSchedulePacificRespectsDSTOffsets(t *testing.T) {
+	parser := cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow | cron.Descriptor)
+	sched, err := parseSchedulePacific(parser, "0 9 * * *")
+	if err != nil {
+		t.Fatalf("parseSchedulePacific() error: %v", err)
+	}
+
+	winterNow := time.Date(2026, time.January, 15, 10, 0, 0, 0, time.UTC)
+	winterNext := sched.Next(winterNow).In(util.PacificLocation())
+	if _, offset := winterNext.Zone(); offset != -8*60*60 {
+		t.Fatalf("expected winter PST offset -0800, got %s (%d)", winterNext.Format(time.RFC3339), offset)
+	}
+
+	summerNow := time.Date(2026, time.July, 15, 10, 0, 0, 0, time.UTC)
+	summerNext := sched.Next(summerNow).In(util.PacificLocation())
+	if _, offset := summerNext.Zone(); offset != -7*60*60 {
+		t.Fatalf("expected summer PDT offset -0700, got %s (%d)", summerNext.Format(time.RFC3339), offset)
 	}
 }

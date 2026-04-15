@@ -2,8 +2,11 @@ package telegram
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -12,6 +15,28 @@ import (
 	"github.com/go-telegram/bot"
 	"github.com/go-telegram/bot/models"
 )
+
+type fakeTelegramFileClient struct {
+	files map[string]*models.File
+	base  string
+	err   error
+}
+
+func (f fakeTelegramFileClient) GetFile(ctx context.Context, params *bot.GetFileParams) (*models.File, error) {
+	_ = ctx
+	if f.err != nil {
+		return nil, f.err
+	}
+	if file, ok := f.files[params.FileID]; ok {
+		cp := *file
+		return &cp, nil
+	}
+	return nil, fmt.Errorf("unknown file id %s", params.FileID)
+}
+
+func (f fakeTelegramFileClient) FileDownloadLink(file *models.File) string {
+	return strings.TrimRight(f.base, "/") + "/" + strings.TrimLeft(file.FilePath, "/")
+}
 
 func TestSplitText(t *testing.T) {
 	text := "line1\nline2\nline3\nline4"
@@ -48,6 +73,110 @@ func TestParseCommand(t *testing.T) {
 		if got := parseCommand(tc.in); got != tc.want {
 			t.Fatalf("parseCommand(%q) = %q, want %q", tc.in, got, tc.want)
 		}
+	}
+}
+
+func TestExtractMessageInputPrefersTextThenCaptionAndImageFallback(t *testing.T) {
+	msg := &models.Message{Text: "hello"}
+	text, images := extractMessageInput(msg)
+	if text != "hello" || len(images) != 0 {
+		t.Fatalf("expected plain text input, got text=%q images=%v", text, images)
+	}
+
+	msg = &models.Message{Caption: "check this", Photo: []models.PhotoSize{{FileID: "small", FileSize: 10, Width: 10, Height: 10}, {FileID: "large", FileSize: 99, Width: 200, Height: 200}}}
+	text, images = extractMessageInput(msg)
+	if text != "check this" {
+		t.Fatalf("expected caption text, got %q", text)
+	}
+	if len(images) != 1 || images[0] != "large" {
+		t.Fatalf("expected largest photo file id, got %v", images)
+	}
+
+	msg = &models.Message{Photo: []models.PhotoSize{{FileID: "only", FileSize: 5, Width: 20, Height: 20}}}
+	text, images = extractMessageInput(msg)
+	if text != "Please analyze this image." {
+		t.Fatalf("expected default text for image-only message, got %q", text)
+	}
+	if len(images) != 1 || images[0] != "only" {
+		t.Fatalf("expected image-only file id, got %v", images)
+	}
+}
+
+func TestExtractMessageInputIncludesImageDocument(t *testing.T) {
+	msg := &models.Message{
+		Caption: "doc image",
+		Document: &models.Document{
+			FileID:   "doc-image",
+			MimeType: "image/png",
+		},
+	}
+	text, images := extractMessageInput(msg)
+	if text != "doc image" {
+		t.Fatalf("expected caption text, got %q", text)
+	}
+	if len(images) != 1 || images[0] != "doc-image" {
+		t.Fatalf("expected image document file id, got %v", images)
+	}
+
+	msg.Document.MimeType = "application/pdf"
+	_, images = extractMessageInput(msg)
+	if len(images) != 0 {
+		t.Fatalf("expected non-image document to be ignored, got %v", images)
+	}
+}
+
+func TestFetchTelegramImagesSuccess(t *testing.T) {
+	body := []byte("fake-image-bytes")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/file.jpg" {
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = w.Write(body)
+	}))
+	defer srv.Close()
+
+	api := fakeTelegramFileClient{
+		base: srv.URL,
+		files: map[string]*models.File{
+			"file-1": {FileID: "file-1", FilePath: "file.jpg"},
+		},
+	}
+	images, err := fetchTelegramImages(context.Background(), api, []string{"file-1"})
+	if err != nil {
+		t.Fatalf("fetchTelegramImages() error: %v", err)
+	}
+	if len(images) != 1 {
+		t.Fatalf("expected one image payload, got %d", len(images))
+	}
+	decoded, err := base64.StdEncoding.DecodeString(images[0])
+	if err != nil {
+		t.Fatalf("decode base64: %v", err)
+	}
+	if string(decoded) != string(body) {
+		t.Fatalf("decoded payload mismatch: got %q want %q", string(decoded), string(body))
+	}
+}
+
+func TestFetchTelegramImagesTooLarge(t *testing.T) {
+	large := strings.Repeat("a", telegramImageMaxBytes+1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(large))
+	}))
+	defer srv.Close()
+
+	api := fakeTelegramFileClient{
+		base: srv.URL,
+		files: map[string]*models.File{
+			"big": {FileID: "big", FilePath: "big.jpg"},
+		},
+	}
+	_, err := fetchTelegramImages(context.Background(), api, []string{"big"})
+	if err == nil {
+		t.Fatalf("expected too-large image error")
+	}
+	if !strings.Contains(strings.ToLower(err.Error()), "too large") {
+		t.Fatalf("expected too-large error, got %v", err)
 	}
 }
 
@@ -200,6 +329,59 @@ func TestRunnerTurnLifecycle(t *testing.T) {
 	r.endTurn("8750063231", id)
 	if _, ok := r.stopTurn("8750063231"); ok {
 		t.Fatalf("expected no in-flight turn after endTurn")
+	}
+}
+
+func TestRunnerQueuedTurnDebounceLatestWins(t *testing.T) {
+	r := &Runner{}
+	executed := make(chan string, 4)
+	r.turnExecutor = func(ctx context.Context, turnCtx context.Context, b *bot.Bot, chatID, userID int64, sessionKey, text string, imageFileIDs []string) {
+		executed <- text
+	}
+
+	turnID, ok := r.beginTurn("8750063231", 8750063231, func() {})
+	if !ok {
+		t.Fatalf("expected initial in-flight turn")
+	}
+
+	first := r.enqueuePendingTurn("8750063231", pendingTurn{
+		chatID:     8750063231,
+		userID:     8750063231,
+		sessionKey: "8750063231",
+		text:       "first",
+	})
+	r.schedulePendingTurnDrain("8750063231", first.generation)
+
+	time.Sleep(200 * time.Millisecond)
+
+	second := r.enqueuePendingTurn("8750063231", pendingTurn{
+		chatID:     8750063231,
+		userID:     8750063231,
+		sessionKey: "8750063231",
+		text:       "second",
+	})
+	r.schedulePendingTurnDrain("8750063231", second.generation)
+	r.endTurn("8750063231", turnID)
+
+	select {
+	case got := <-executed:
+		t.Fatalf("queued turn ran too early before debounce elapsed: %q", got)
+	case <-time.After(700 * time.Millisecond):
+	}
+
+	select {
+	case got := <-executed:
+		if got != "second" {
+			t.Fatalf("expected latest queued message to run, got %q", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for queued turn to run")
+	}
+
+	select {
+	case got := <-executed:
+		t.Fatalf("expected only one queued execution, got extra %q", got)
+	case <-time.After(300 * time.Millisecond):
 	}
 }
 

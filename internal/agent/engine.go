@@ -89,6 +89,7 @@ type HandleResult struct {
 
 type HandleOptions struct {
 	OnToolEvent func(ToolEvent)
+	InputImages []string
 }
 
 type ToolEventPhase string
@@ -182,6 +183,7 @@ func (e *Engine) HandleTextWithOptions(ctx context.Context, transport, sessionKe
 	if strings.TrimSpace(model) == "" {
 		model = e.cfg.DefaultModel
 	}
+	inputImages := sanitizeInputImages(opts.InputImages)
 
 	thinkSetting, _ := e.SessionThinkValue(ctx, transport, sessionKey)
 	thinkParam := thinkSettingToAPIValue(thinkSetting)
@@ -207,6 +209,7 @@ func (e *Engine) HandleTextWithOptions(ctx context.Context, transport, sessionKe
 		if err != nil {
 			return HandleResult{}, err
 		}
+		msgList = attachImagesToLatestUserMessage(msgList, inputImages)
 		resp, err := e.client.Chat(ctx, ollama.ChatRequest{Model: model, Messages: msgList, Tools: toolDefs, Stream: false, Think: thinkParam})
 		if err != nil {
 			if cerr := ctx.Err(); cerr != nil {
@@ -579,6 +582,40 @@ func prefetchedRunToolCallID(prefetched []tools.PrefetchedBashResult) (string, e
 		}
 	}
 	return prefetchToolIDPrefix + runID, nil
+}
+
+func sanitizeInputImages(images []string) []string {
+	if len(images) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(images))
+	for _, img := range images {
+		trimmed := strings.TrimSpace(img)
+		if trimmed == "" {
+			continue
+		}
+		out = append(out, trimmed)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func attachImagesToLatestUserMessage(messages []ollama.ChatMessage, images []string) []ollama.ChatMessage {
+	if len(images) == 0 || len(messages) == 0 {
+		return messages
+	}
+	for i := len(messages) - 1; i >= 0; i-- {
+		if messages[i].Role != "user" {
+			continue
+		}
+		copied := make([]string, len(images))
+		copy(copied, images)
+		messages[i].Images = copied
+		return messages
+	}
+	return messages
 }
 
 func (e *Engine) runtimeSystemPrompt() string {

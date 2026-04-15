@@ -5,6 +5,7 @@ import "encoding/json"
 type ChatMessage struct {
 	Role       string     `json:"role"`
 	Content    string     `json:"content,omitempty"`
+	Images     []string   `json:"images,omitempty"`
 	Thinking   string     `json:"thinking,omitempty"`
 	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
 	ToolName   string     `json:"tool_name,omitempty"`

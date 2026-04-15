@@ -125,6 +125,118 @@ func TestHandleTextWithReadFileToolTrace(t *testing.T) {
 	}
 }
 
+func TestHandleTextAttachesInputImagesToLatestUserMessage(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	ctx := context.Background()
+
+	var seenUserWithImage bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req ollama.ChatRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		for _, m := range req.Messages {
+			if m.Role == "user" && strings.TrimSpace(m.Content) == "what is in this image?" && len(m.Images) == 1 && m.Images[0] == "ZmFrZS1pbWFnZS1iYXNlNjQ=" {
+				seenUserWithImage = true
+				break
+			}
+		}
+		resp := ollama.ChatResponse{
+			Message:         ollama.ChatMessage{Role: "assistant", Content: "looks good"},
+			PromptEvalCount: 12,
+			EvalCount:       3,
+			Done:            true,
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer srv.Close()
+
+	engine, store := newTestEngine(t, srv.URL)
+	defer store.Close()
+
+	_, err := engine.HandleTextWithOptions(ctx, "telegram", "8750063231", "what is in this image?", HandleOptions{
+		InputImages: []string{"ZmFrZS1pbWFnZS1iYXNlNjQ="},
+	})
+	if err != nil {
+		t.Fatalf("HandleTextWithOptions error: %v", err)
+	}
+	if !seenUserWithImage {
+		t.Fatalf("expected user message with image payload in chat request")
+	}
+}
+
+func TestHandleTextAttachesInputImagesAcrossToolLoop(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	ctx := context.Background()
+
+	callCount := 0
+	userImageSeenEachCall := []bool{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		var req ollama.ChatRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		seen := false
+		for _, m := range req.Messages {
+			if m.Role == "user" && strings.TrimSpace(m.Content) == "check this image and run tools" && len(m.Images) == 1 && m.Images[0] == "aW1hZ2Ux" {
+				seen = true
+				break
+			}
+		}
+		userImageSeenEachCall = append(userImageSeenEachCall, seen)
+
+		resp := ollama.ChatResponse{}
+		if callCount == 1 {
+			resp = ollama.ChatResponse{
+				Message: ollama.ChatMessage{
+					Role: "assistant",
+					ToolCalls: []ollama.ToolCall{
+						{
+							Function: ollama.ToolCallFunction{
+								Name:      "missing_tool",
+								Arguments: map[string]interface{}{},
+							},
+						},
+					},
+				},
+				PromptEvalCount: 15,
+				EvalCount:       4,
+				Done:            true,
+			}
+		} else {
+			resp = ollama.ChatResponse{
+				Message:         ollama.ChatMessage{Role: "assistant", Content: "done"},
+				PromptEvalCount: 20,
+				EvalCount:       5,
+				Done:            true,
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer srv.Close()
+
+	engine, store := newTestEngine(t, srv.URL)
+	defer store.Close()
+
+	_, err := engine.HandleTextWithOptions(ctx, "telegram", "8750063231", "check this image and run tools", HandleOptions{
+		InputImages: []string{"aW1hZ2Ux"},
+	})
+	if err != nil {
+		t.Fatalf("HandleTextWithOptions error: %v", err)
+	}
+	if callCount < 2 {
+		t.Fatalf("expected at least 2 chat calls, got %d", callCount)
+	}
+	for i, seen := range userImageSeenEachCall {
+		if !seen {
+			t.Fatalf("expected input image to be present on request #%d", i+1)
+		}
+	}
+}
+
 func TestHandleTextUnknownToolTraceError(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	ctx := context.Background()

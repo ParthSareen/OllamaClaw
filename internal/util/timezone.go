@@ -3,6 +3,7 @@ package util
 import (
 	"sync"
 	"time"
+	_ "time/tzdata"
 )
 
 const PacificTimezoneName = "America/Los_Angeles"

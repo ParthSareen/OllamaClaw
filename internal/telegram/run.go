@@ -3,9 +3,12 @@ package telegram
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -42,11 +45,15 @@ type Runner struct {
 	runCancel    context.CancelFunc
 	turnMu       sync.Mutex
 	inFlight     map[string]inFlightTurn
+	pendingMu    sync.Mutex
+	pendingTurns map[string]pendingTurn
+	nextPending  atomic.Uint64
 	nextApproval atomic.Uint64
 	approvalMu   sync.Mutex
 	approvals    map[string]*pendingApproval
 	unauthMu     sync.Mutex
 	unauthAt     map[string]time.Time
+	turnExecutor func(ctx context.Context, turnCtx context.Context, b *bot.Bot, chatID, userID int64, sessionKey, text string, imageFileIDs []string)
 }
 
 const (
@@ -54,6 +61,11 @@ const (
 	settingTelegramBashAlwaysAllowKey = "telegram_bash_always_allow"
 	maxLogPreview                     = 280
 	maxToolPreview                    = 700
+	maxTelegramInputImages            = 4
+	telegramImageMaxBytes             = 8 * 1024 * 1024
+	telegramImageFetchTimeout         = 20 * time.Second
+	pendingTurnDebounce               = time.Second
+	pendingTurnRetry                  = 100 * time.Millisecond
 	updateWorkers                     = 8
 	approvalTTL                       = 10 * time.Minute
 	maxApprovalCommandPreview         = 300
@@ -67,6 +79,17 @@ type inFlightTurn struct {
 	id     uint64
 	chatID int64
 	cancel context.CancelFunc
+}
+
+type pendingTurn struct {
+	generation   uint64
+	chatID       int64
+	userID       int64
+	sessionKey   string
+	text         string
+	imageFileIDs []string
+	readyAt      time.Time
+	bot          *bot.Bot
 }
 
 type pendingApproval struct {
@@ -98,6 +121,11 @@ type telegramBashApprover struct {
 	chatID     int64
 	userID     int64
 	sessionKey string
+}
+
+type telegramFileClient interface {
+	GetFile(ctx context.Context, params *bot.GetFileParams) (*models.File, error)
+	FileDownloadLink(file *models.File) string
 }
 
 func (a *telegramBashApprover) ApproveBashCommand(ctx context.Context, req tools.BashApprovalRequest) error {
@@ -270,9 +298,9 @@ func (r *Runner) handleUpdate(ctx context.Context, b *bot.Bot, update *models.Up
 	if update.Message.From != nil {
 		userID = update.Message.From.ID
 	}
-	text := strings.TrimSpace(update.Message.Text)
+	text, imageFileIDs := extractMessageInput(update.Message)
 	if text == "" {
-		r.logf("message ignored: empty text chat=%d user=%d", chatID, userID)
+		r.logf("message ignored: empty text/media chat=%d user=%d", chatID, userID)
 		return
 	}
 	cmd := parseCommand(text)
@@ -280,7 +308,7 @@ func (r *Runner) handleUpdate(ctx context.Context, b *bot.Bot, update *models.Up
 		return
 	}
 	r.logf("authorization accepted: chat=%d user=%d command=%q", chatID, userID, cmd)
-	r.logf("message received: chat=%d user=%d chars=%d preview=%q", chatID, userID, len(text), r.previewForLog(text))
+	r.logf("message received: chat=%d user=%d chars=%d images=%d preview=%q", chatID, userID, len(text), len(imageFileIDs), r.previewForLog(text))
 	if cmd != "" {
 		r.logf("command dispatch: chat=%d cmd=%s raw=%q", chatID, cmd, r.previewForLog(text))
 		r.handleCommand(ctx, b, chatID, text)
@@ -299,12 +327,28 @@ func (r *Runner) handleUpdate(ctx context.Context, b *bot.Bot, update *models.Up
 	turnID, started := r.beginTurn(sessionKey, chatID, turnCancel)
 	if !started {
 		turnCancel()
-		r.logf("agent turn rejected: chat=%d session_key=%s reason=in_progress", chatID, sessionKey)
-		_, _ = b.SendMessage(ctx, &bot.SendMessageParams{ChatID: chatID, Text: "a turn is already running. send /stop to interrupt it first."})
+		queued := r.enqueuePendingTurn(sessionKey, pendingTurn{
+			chatID:       chatID,
+			userID:       userID,
+			sessionKey:   sessionKey,
+			text:         text,
+			imageFileIDs: append([]string(nil), imageFileIDs...),
+			bot:          b,
+		})
+		r.logf("agent turn queued: chat=%d session_key=%s generation=%d ready_at=%s", chatID, sessionKey, queued.generation, queued.readyAt.UTC().Format(time.RFC3339Nano))
+		r.schedulePendingTurnDrain(sessionKey, queued.generation)
 		return
 	}
+	defer turnCancel()
 	defer r.endTurn(sessionKey, turnID)
+	r.executeTurn(ctx, turnCtx, b, chatID, userID, sessionKey, text, imageFileIDs)
+}
 
+func (r *Runner) executeTurn(ctx context.Context, turnCtx context.Context, b *bot.Bot, chatID, userID int64, sessionKey, text string, imageFileIDs []string) {
+	if r.turnExecutor != nil {
+		r.turnExecutor(ctx, turnCtx, b, chatID, userID, sessionKey, text, imageFileIDs)
+		return
+	}
 	thinkValue, _ := r.Engine.SessionThinkValue(ctx, "telegram", sessionKey)
 	progressText := "Working..."
 	if thinkValue != "off" {
@@ -320,7 +364,19 @@ func (r *Runner) handleUpdate(ctx context.Context, b *bot.Bot, update *models.Up
 	if showTools {
 		r.logf("live tool stream enabled: chat=%d session_key=%s", chatID, sessionKey)
 	}
+	inputImages := []string{}
+	if len(imageFileIDs) > 0 {
+		images, imgErr := fetchTelegramImages(turnCtx, b, imageFileIDs)
+		if imgErr != nil {
+			r.logf("image fetch failed: chat=%d session_key=%s error=%v", chatID, sessionKey, r.redactError(imgErr))
+			r.replyError(ctx, b, chatID, progress, fmt.Errorf("failed to fetch image attachment: %w", imgErr))
+			return
+		}
+		inputImages = images
+		r.logf("image fetch success: chat=%d session_key=%s images=%d", chatID, sessionKey, len(inputImages))
+	}
 	res, err := r.Engine.HandleTextWithOptions(turnCtx, "telegram", sessionKey, text, agent.HandleOptions{
+		InputImages: inputImages,
 		OnToolEvent: func(ev agent.ToolEvent) {
 			if !showTools || ev.Phase != agent.ToolEventFinish {
 				return
@@ -442,6 +498,115 @@ func parseCommand(raw string) string {
 		cmd = cmd[:at]
 	}
 	return cmd
+}
+
+func extractMessageInput(msg *models.Message) (string, []string) {
+	if msg == nil {
+		return "", nil
+	}
+	text := strings.TrimSpace(msg.Text)
+	if text == "" {
+		text = strings.TrimSpace(msg.Caption)
+	}
+	imageFileIDs := collectImageFileIDs(msg)
+	if text == "" && len(imageFileIDs) > 0 {
+		text = "Please analyze this image."
+	}
+	return text, imageFileIDs
+}
+
+func collectImageFileIDs(msg *models.Message) []string {
+	if msg == nil {
+		return nil
+	}
+	out := make([]string, 0, 2)
+	seen := map[string]struct{}{}
+
+	add := func(fileID string) {
+		fileID = strings.TrimSpace(fileID)
+		if fileID == "" {
+			return
+		}
+		if _, ok := seen[fileID]; ok {
+			return
+		}
+		seen[fileID] = struct{}{}
+		out = append(out, fileID)
+	}
+
+	if len(msg.Photo) > 0 {
+		best := msg.Photo[0]
+		for _, p := range msg.Photo[1:] {
+			if p.FileSize > best.FileSize {
+				best = p
+				continue
+			}
+			if p.FileSize == best.FileSize && (p.Width*p.Height) > (best.Width*best.Height) {
+				best = p
+			}
+		}
+		add(best.FileID)
+	}
+	if msg.Document != nil && strings.HasPrefix(strings.ToLower(strings.TrimSpace(msg.Document.MimeType)), "image/") {
+		add(msg.Document.FileID)
+	}
+
+	if len(out) > maxTelegramInputImages {
+		out = out[:maxTelegramInputImages]
+	}
+	return out
+}
+
+func fetchTelegramImages(ctx context.Context, api telegramFileClient, fileIDs []string) ([]string, error) {
+	if len(fileIDs) == 0 {
+		return nil, nil
+	}
+	httpClient := &http.Client{Timeout: telegramImageFetchTimeout}
+	out := make([]string, 0, len(fileIDs))
+	for _, fileID := range fileIDs {
+		fileID = strings.TrimSpace(fileID)
+		if fileID == "" {
+			continue
+		}
+		file, err := api.GetFile(ctx, &bot.GetFileParams{FileID: fileID})
+		if err != nil {
+			return nil, fmt.Errorf("getFile(%s): %w", fileID, err)
+		}
+		if file == nil || strings.TrimSpace(file.FilePath) == "" {
+			return nil, fmt.Errorf("getFile(%s): empty file path", fileID)
+		}
+		link := strings.TrimSpace(api.FileDownloadLink(file))
+		if link == "" {
+			return nil, fmt.Errorf("getFile(%s): empty download link", fileID)
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, link, nil)
+		if err != nil {
+			return nil, fmt.Errorf("build download request for %s: %w", fileID, err)
+		}
+		res, err := httpClient.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("download file %s: %w", fileID, err)
+		}
+		body, readErr := io.ReadAll(io.LimitReader(res.Body, telegramImageMaxBytes+1))
+		_ = res.Body.Close()
+		if readErr != nil {
+			return nil, fmt.Errorf("read file %s: %w", fileID, readErr)
+		}
+		if res.StatusCode >= 300 {
+			return nil, fmt.Errorf("download file %s status %d", fileID, res.StatusCode)
+		}
+		if len(body) == 0 {
+			return nil, fmt.Errorf("download file %s: empty body", fileID)
+		}
+		if len(body) > telegramImageMaxBytes {
+			return nil, fmt.Errorf("download file %s too large (%d bytes > %d)", fileID, len(body), telegramImageMaxBytes)
+		}
+		out = append(out, base64.StdEncoding.EncodeToString(body))
+	}
+	if len(out) == 0 {
+		return nil, errors.New("no images fetched")
+	}
+	return out, nil
 }
 
 func (r *Runner) replyError(ctx context.Context, b *bot.Bot, chatID int64, progress *models.Message, err error) {
@@ -846,6 +1011,92 @@ func (r *Runner) stopTurn(sessionKey string) (inFlightTurn, bool) {
 	}
 	turn.cancel()
 	return turn, true
+}
+
+func (r *Runner) enqueuePendingTurn(sessionKey string, turn pendingTurn) pendingTurn {
+	turn.sessionKey = sessionKey
+	turn.text = strings.TrimSpace(turn.text)
+	turn.imageFileIDs = append([]string(nil), turn.imageFileIDs...)
+	turn.generation = r.nextPending.Add(1)
+	turn.readyAt = time.Now().Add(pendingTurnDebounce)
+	r.pendingMu.Lock()
+	if r.pendingTurns == nil {
+		r.pendingTurns = map[string]pendingTurn{}
+	}
+	r.pendingTurns[sessionKey] = turn
+	r.pendingMu.Unlock()
+	return turn
+}
+
+func (r *Runner) schedulePendingTurnDrain(sessionKey string, generation uint64) {
+	go r.drainPendingTurn(sessionKey, generation)
+}
+
+func (r *Runner) drainPendingTurn(sessionKey string, generation uint64) {
+	for {
+		turn, ok := r.pendingTurnByGeneration(sessionKey, generation)
+		if !ok {
+			return
+		}
+		if wait := time.Until(turn.readyAt); wait > 0 {
+			time.Sleep(wait)
+			continue
+		}
+		turnCtx, turnCancel := context.WithCancel(context.Background())
+		turnCtx = tools.WithBashApprover(turnCtx, &telegramBashApprover{
+			r:          r,
+			bot:        turn.bot,
+			chatID:     turn.chatID,
+			userID:     turn.userID,
+			sessionKey: turn.sessionKey,
+		})
+		turnID, started := r.beginTurn(turn.sessionKey, turn.chatID, turnCancel)
+		if !started {
+			turnCancel()
+			time.Sleep(pendingTurnRetry)
+			continue
+		}
+		if !r.consumePendingTurnByGeneration(turn.sessionKey, generation) {
+			r.endTurn(turn.sessionKey, turnID)
+			turnCancel()
+			time.Sleep(pendingTurnRetry)
+			continue
+		}
+		if turn.bot == nil && r.turnExecutor == nil {
+			r.logf("queued turn dropped: chat=%d session_key=%s generation=%d reason=nil_bot", turn.chatID, turn.sessionKey, generation)
+			r.endTurn(turn.sessionKey, turnID)
+			turnCancel()
+			return
+		}
+		r.logf("queued turn start: chat=%d session_key=%s generation=%d", turn.chatID, turn.sessionKey, generation)
+		func() {
+			defer turnCancel()
+			defer r.endTurn(turn.sessionKey, turnID)
+			r.executeTurn(context.Background(), turnCtx, turn.bot, turn.chatID, turn.userID, turn.sessionKey, turn.text, turn.imageFileIDs)
+		}()
+		return
+	}
+}
+
+func (r *Runner) pendingTurnByGeneration(sessionKey string, generation uint64) (pendingTurn, bool) {
+	r.pendingMu.Lock()
+	defer r.pendingMu.Unlock()
+	turn, ok := r.pendingTurns[sessionKey]
+	if !ok || turn.generation != generation {
+		return pendingTurn{}, false
+	}
+	return turn, true
+}
+
+func (r *Runner) consumePendingTurnByGeneration(sessionKey string, generation uint64) bool {
+	r.pendingMu.Lock()
+	defer r.pendingMu.Unlock()
+	turn, ok := r.pendingTurns[sessionKey]
+	if !ok || turn.generation != generation {
+		return false
+	}
+	delete(r.pendingTurns, sessionKey)
+	return true
 }
 
 func (r *Runner) sendChunked(ctx context.Context, b *bot.Bot, chatID int64, progress *models.Message, text string) {

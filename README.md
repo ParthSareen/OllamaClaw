@@ -86,6 +86,7 @@ ollamaclaw plugin update [plugin-id]
 - `/tools` lists built-in + enabled plugin tools
 - `/cron list [active|all]` lists cron jobs
 - Cron schedules and displayed cron timestamps are interpreted in `America/Los_Angeles` (PST/PDT)
+- Cron timezone prefixes (`TZ=` / `CRON_TZ=`) are intentionally rejected; OllamaClaw always runs cron schedules in `America/Los_Angeles`
 - `/cron safe <id>` marks a cron as safe (Telegram bash approvals auto-approve for that cron)
 - `/cron unsafe <id>` removes safe mode from a cron
 - `/cron prefetch list <id>` shows learned prefetched commands for a cron job
@@ -100,6 +101,8 @@ ollamaclaw plugin update [plugin-id]
 - `/reset` archives current session and starts a fresh one
 - `/stop` interrupts the active turn
 - `/restart` restarts the launch loop from Telegram
+- Send photos (or image documents) with an optional caption; image bytes are fetched from Telegram and forwarded to Ollama chat `images`
+- If a turn is already running, the latest incoming non-command message is auto-queued and runs next (1s debounce to reduce fragmented rapid-text noise)
 
 ## Built-in tools
 

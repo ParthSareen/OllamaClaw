@@ -133,7 +133,7 @@ func (m *Manager) AddJob(ctx context.Context, spec tools.CronJobSpec) (tools.Cro
 	if schedule == "" || prompt == "" || transport == "" || sessionKey == "" {
 		return tools.CronJobInfo{}, fmt.Errorf("id(optional), schedule, prompt, transport, and session_key are required")
 	}
-	if _, err := m.parser.Parse(schedule); err != nil {
+	if _, err := parseSchedulePacific(m.parser, schedule); err != nil {
 		return tools.CronJobInfo{}, fmt.Errorf("invalid cron schedule: %w", err)
 	}
 
@@ -236,7 +236,7 @@ func (m *Manager) ListJobPrefetchCommands(ctx context.Context, id string) ([]str
 }
 
 func (m *Manager) scheduleLocked(ctx context.Context, job db.CronJob) error {
-	schedule, err := m.parser.Parse(job.Schedule)
+	schedule, err := parseSchedulePacific(m.parser, job.Schedule)
 	if err != nil {
 		return err
 	}
@@ -253,7 +253,11 @@ func (m *Manager) scheduleLocked(ctx context.Context, job db.CronJob) error {
 		m.c.Remove(eid)
 		delete(m.entries, job.ID)
 	}
-	eid, err := m.c.AddFunc(job.Schedule, func() { m.runJob(job.ID) })
+	execSpec, err := scheduleSpecPacific(job.Schedule)
+	if err != nil {
+		return err
+	}
+	eid, err := m.c.AddFunc(execSpec, func() { m.runJob(job.ID) })
 	if err != nil {
 		return err
 	}
@@ -297,7 +301,7 @@ func (m *Manager) runJob(jobID string) {
 	effectivePrompt := job.Prompt
 
 	res, runErr := runner(runCtx, job.Transport, job.SessionKey, effectivePrompt)
-	spec, parseErr := m.parser.Parse(job.Schedule)
+	spec, parseErr := parseSchedulePacific(m.parser, job.Schedule)
 	var next *time.Time
 	if parseErr == nil {
 		n := spec.Next(now)
@@ -314,6 +318,26 @@ func (m *Manager) runJob(jobID string) {
 	if sink != nil && strings.TrimSpace(res.Output) != "" {
 		_ = sink(baseCtx, job.Transport, job.SessionKey, res.Output)
 	}
+}
+
+func parseSchedulePacific(parser cron.Parser, schedule string) (cron.Schedule, error) {
+	spec, err := scheduleSpecPacific(schedule)
+	if err != nil {
+		return nil, err
+	}
+	return parser.Parse(spec)
+}
+
+func scheduleSpecPacific(schedule string) (string, error) {
+	spec := strings.TrimSpace(schedule)
+	if spec == "" {
+		return "", fmt.Errorf("schedule is required")
+	}
+	upper := strings.ToUpper(spec)
+	if strings.HasPrefix(upper, "TZ=") || strings.HasPrefix(upper, "CRON_TZ=") {
+		return "", fmt.Errorf("timezone prefix is not supported; schedules run in %s", util.PacificTimezoneName)
+	}
+	return fmt.Sprintf("CRON_TZ=%s %s", util.PacificTimezoneName, spec), nil
 }
 
 func toToolInfo(j db.CronJob) tools.CronJobInfo {
