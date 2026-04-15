@@ -64,7 +64,7 @@ const (
 	maxTelegramInputImages            = 4
 	telegramImageMaxBytes             = 8 * 1024 * 1024
 	telegramImageFetchTimeout         = 20 * time.Second
-	pendingTurnDebounce               = time.Second
+	pendingTurnDebounce               = 1500 * time.Millisecond
 	pendingTurnRetry                  = 100 * time.Millisecond
 	updateWorkers                     = 8
 	approvalTTL                       = 10 * time.Minute
@@ -88,6 +88,7 @@ type pendingTurn struct {
 	sessionKey   string
 	text         string
 	imageFileIDs []string
+	messageCount int
 	readyAt      time.Time
 	bot          *bot.Bot
 }
@@ -316,32 +317,16 @@ func (r *Runner) handleUpdate(ctx context.Context, b *bot.Bot, update *models.Up
 	}
 
 	sessionKey := strconv.FormatInt(chatID, 10)
-	turnCtx, turnCancel := context.WithCancel(ctx)
-	turnCtx = tools.WithBashApprover(turnCtx, &telegramBashApprover{
-		r:          r,
-		bot:        b,
-		chatID:     chatID,
-		userID:     userID,
-		sessionKey: sessionKey,
+	queued := r.enqueuePendingTurn(sessionKey, pendingTurn{
+		chatID:       chatID,
+		userID:       userID,
+		sessionKey:   sessionKey,
+		text:         text,
+		imageFileIDs: append([]string(nil), imageFileIDs...),
+		bot:          b,
 	})
-	turnID, started := r.beginTurn(sessionKey, chatID, turnCancel)
-	if !started {
-		turnCancel()
-		queued := r.enqueuePendingTurn(sessionKey, pendingTurn{
-			chatID:       chatID,
-			userID:       userID,
-			sessionKey:   sessionKey,
-			text:         text,
-			imageFileIDs: append([]string(nil), imageFileIDs...),
-			bot:          b,
-		})
-		r.logf("agent turn queued: chat=%d session_key=%s generation=%d ready_at=%s", chatID, sessionKey, queued.generation, queued.readyAt.UTC().Format(time.RFC3339Nano))
-		r.schedulePendingTurnDrain(sessionKey, queued.generation)
-		return
-	}
-	defer turnCancel()
-	defer r.endTurn(sessionKey, turnID)
-	r.executeTurn(ctx, turnCtx, b, chatID, userID, sessionKey, text, imageFileIDs)
+	r.logf("agent turn queued: chat=%d session_key=%s generation=%d messages=%d ready_at=%s", chatID, sessionKey, queued.generation, queued.messageCount, queued.readyAt.UTC().Format(time.RFC3339Nano))
+	r.schedulePendingTurnDrain(sessionKey, queued.generation)
 }
 
 func (r *Runner) executeTurn(ctx context.Context, turnCtx context.Context, b *bot.Bot, chatID, userID int64, sessionKey, text string, imageFileIDs []string) {
@@ -1017,15 +1002,79 @@ func (r *Runner) enqueuePendingTurn(sessionKey string, turn pendingTurn) pending
 	turn.sessionKey = sessionKey
 	turn.text = strings.TrimSpace(turn.text)
 	turn.imageFileIDs = append([]string(nil), turn.imageFileIDs...)
-	turn.generation = r.nextPending.Add(1)
-	turn.readyAt = time.Now().Add(pendingTurnDebounce)
+	if turn.messageCount <= 0 {
+		turn.messageCount = 1
+	}
 	r.pendingMu.Lock()
 	if r.pendingTurns == nil {
 		r.pendingTurns = map[string]pendingTurn{}
 	}
-	r.pendingTurns[sessionKey] = turn
+	now := time.Now()
+	if existing, ok := r.pendingTurns[sessionKey]; ok {
+		existing.text = joinPendingText(existing.text, turn.text)
+		existing.imageFileIDs = mergePendingImageIDs(existing.imageFileIDs, turn.imageFileIDs)
+		if turn.chatID != 0 {
+			existing.chatID = turn.chatID
+		}
+		if turn.userID != 0 {
+			existing.userID = turn.userID
+		}
+		if turn.bot != nil {
+			existing.bot = turn.bot
+		}
+		existing.messageCount += turn.messageCount
+		existing.generation = r.nextPending.Add(1)
+		existing.readyAt = now.Add(pendingTurnDebounce)
+		r.pendingTurns[sessionKey] = existing
+		turn = existing
+	} else {
+		turn.generation = r.nextPending.Add(1)
+		turn.readyAt = now.Add(pendingTurnDebounce)
+		r.pendingTurns[sessionKey] = turn
+	}
 	r.pendingMu.Unlock()
 	return turn
+}
+
+func joinPendingText(existing, incoming string) string {
+	existing = strings.TrimSpace(existing)
+	incoming = strings.TrimSpace(incoming)
+	if existing == "" {
+		return incoming
+	}
+	if incoming == "" {
+		return existing
+	}
+	return existing + "\n" + incoming
+}
+
+func mergePendingImageIDs(existing, incoming []string) []string {
+	if len(existing) == 0 && len(incoming) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(existing)+len(incoming))
+	seen := map[string]struct{}{}
+	add := func(ids []string) {
+		for _, raw := range ids {
+			id := strings.TrimSpace(raw)
+			if id == "" {
+				continue
+			}
+			if _, ok := seen[id]; ok {
+				continue
+			}
+			seen[id] = struct{}{}
+			out = append(out, id)
+			if len(out) >= maxTelegramInputImages {
+				return
+			}
+		}
+	}
+	add(existing)
+	if len(out) < maxTelegramInputImages {
+		add(incoming)
+	}
+	return out
 }
 
 func (r *Runner) schedulePendingTurnDrain(sessionKey string, generation uint64) {

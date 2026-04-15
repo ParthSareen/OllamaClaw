@@ -332,7 +332,7 @@ func TestRunnerTurnLifecycle(t *testing.T) {
 	}
 }
 
-func TestRunnerQueuedTurnDebounceLatestWins(t *testing.T) {
+func TestRunnerQueuedTurnDebounceCoalescesMessages(t *testing.T) {
 	r := &Runner{}
 	executed := make(chan string, 4)
 	r.turnExecutor = func(ctx context.Context, turnCtx context.Context, b *bot.Bot, chatID, userID int64, sessionKey, text string, imageFileIDs []string) {
@@ -366,13 +366,13 @@ func TestRunnerQueuedTurnDebounceLatestWins(t *testing.T) {
 	select {
 	case got := <-executed:
 		t.Fatalf("queued turn ran too early before debounce elapsed: %q", got)
-	case <-time.After(700 * time.Millisecond):
+	case <-time.After(pendingTurnDebounce - 250*time.Millisecond):
 	}
 
 	select {
 	case got := <-executed:
-		if got != "second" {
-			t.Fatalf("expected latest queued message to run, got %q", got)
+		if got != "first\nsecond" {
+			t.Fatalf("expected coalesced queued message to run, got %q", got)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatalf("timed out waiting for queued turn to run")
@@ -382,6 +382,37 @@ func TestRunnerQueuedTurnDebounceLatestWins(t *testing.T) {
 	case got := <-executed:
 		t.Fatalf("expected only one queued execution, got extra %q", got)
 	case <-time.After(300 * time.Millisecond):
+	}
+}
+
+func TestRunnerQueuedTurnDebounceFirstMessageWaits(t *testing.T) {
+	r := &Runner{}
+	executed := make(chan string, 2)
+	r.turnExecutor = func(ctx context.Context, turnCtx context.Context, b *bot.Bot, chatID, userID int64, sessionKey, text string, imageFileIDs []string) {
+		executed <- text
+	}
+
+	queued := r.enqueuePendingTurn("8750063231", pendingTurn{
+		chatID:     8750063231,
+		userID:     8750063231,
+		sessionKey: "8750063231",
+		text:       "hello",
+	})
+	r.schedulePendingTurnDrain("8750063231", queued.generation)
+
+	select {
+	case got := <-executed:
+		t.Fatalf("expected first message to wait for debounce, got immediate execution: %q", got)
+	case <-time.After(pendingTurnDebounce - 250*time.Millisecond):
+	}
+
+	select {
+	case got := <-executed:
+		if got != "hello" {
+			t.Fatalf("expected queued first message to run after debounce, got %q", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for first queued turn to run")
 	}
 }
 
