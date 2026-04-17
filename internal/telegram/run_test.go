@@ -285,7 +285,7 @@ func TestParsePollerCandidates(t *testing.T) {
 		"222 ./ollamaclaw telegram run",
 		"333 ./ollamaclaw",
 		"444 /Users/parth/bin/ollamaclaw launch",
-		"445 bun run --cwd /Users/parth/.claude/plugins/cache/claude-plugins-official/telegram/0.0.1 --shell=bun --silent start",
+		"445 bun run --cwd /Users/parth/.claude/agents/telegram/0.0.1 --shell=bun --silent start telegram bot",
 		"555 pgrep -af ollamaclaw",
 		"",
 	}, "\n")
@@ -299,7 +299,7 @@ func TestParsePollerCandidates(t *testing.T) {
 	if got[1].pid != 444 || !strings.Contains(got[1].cmd, "launch") {
 		t.Fatalf("unexpected second candidate: %+v", got[1])
 	}
-	if got[2].pid != 445 || !strings.Contains(got[2].cmd, "plugins-official/telegram") {
+	if got[2].pid != 445 || !strings.Contains(got[2].cmd, "agents/telegram") {
 		t.Fatalf("unexpected third candidate: %+v", got[2])
 	}
 }
@@ -580,6 +580,93 @@ func TestFormatThinkingTrace(t *testing.T) {
 	}
 	if !strings.Contains(out, "step=2") || !strings.Contains(out, "final") {
 		t.Fatalf("missing final-step details: %q", out)
+	}
+}
+
+func TestFormatCompactionNotice(t *testing.T) {
+	notice := formatCompactionNotice(205120, 201600, 8, compactionSnapshot{
+		TotalCount: 7,
+		LastAt:     "2026-04-15T10:30:00-07:00",
+	})
+	if !strings.Contains(notice, "context compacted:") {
+		t.Fatalf("missing compaction header: %q", notice)
+	}
+	if !strings.Contains(notice, "prompt_tokens: 205120") {
+		t.Fatalf("missing prompt_tokens field: %q", notice)
+	}
+	if !strings.Contains(notice, "threshold_tokens: 201600") {
+		t.Fatalf("missing threshold_tokens field: %q", notice)
+	}
+	if !strings.Contains(notice, "keep_recent_turns: 8") {
+		t.Fatalf("missing keep_recent_turns field: %q", notice)
+	}
+	if !strings.Contains(notice, "compactions_total: 7") {
+		t.Fatalf("missing compactions_total field: %q", notice)
+	}
+	if !strings.Contains(notice, "last_compaction_at: 2026-04-15T10:30:00-07:00") {
+		t.Fatalf("missing last_compaction_at field: %q", notice)
+	}
+}
+
+func TestFormatCoreMemoryEvent(t *testing.T) {
+	start := formatCoreMemoryEvent(agent.CoreMemoryEvent{
+		Phase:         agent.CoreMemoryEventStart,
+		UserTurnCount: 10,
+		Model:         "kimi-k2.5:cloud",
+	})
+	if !strings.Contains(start, "dreaming started:") {
+		t.Fatalf("missing start header: %q", start)
+	}
+	if !strings.Contains(start, "user_turns: 10") {
+		t.Fatalf("missing user turn count: %q", start)
+	}
+
+	done := formatCoreMemoryEvent(agent.CoreMemoryEvent{
+		Phase:         agent.CoreMemoryEventDone,
+		UserTurnCount: 20,
+		Model:         "kimi-k2.5:cloud",
+		DurationMs:    1234,
+		Updated:       true,
+		Delta: agent.CoreMemoryDelta{
+			BeforeChars:    120,
+			AfterChars:     156,
+			AddedCount:     2,
+			RemovedCount:   1,
+			KeptCount:      4,
+			AddedPreview:   []string{"uses PST timestamps"},
+			RemovedPreview: []string{"uses UTC timestamps"},
+		},
+	})
+	if !strings.Contains(done, "dreaming done:") || !strings.Contains(done, "status: updated") {
+		t.Fatalf("unexpected done format: %q", done)
+	}
+	if !strings.Contains(done, "changes: +2 -1 =4") {
+		t.Fatalf("missing change summary in done format: %q", done)
+	}
+	if !strings.Contains(done, "chars: 120 -> 156") {
+		t.Fatalf("missing char summary in done format: %q", done)
+	}
+	if !strings.Contains(done, "added:\n- uses PST timestamps") {
+		t.Fatalf("missing added preview in done format: %q", done)
+	}
+	if !strings.Contains(done, "removed:\n- uses UTC timestamps") {
+		t.Fatalf("missing removed preview in done format: %q", done)
+	}
+	if !strings.Contains(done, "duration_ms: 1234") {
+		t.Fatalf("missing duration in done format: %q", done)
+	}
+
+	failed := formatCoreMemoryEvent(agent.CoreMemoryEvent{
+		Phase:         agent.CoreMemoryEventFailure,
+		UserTurnCount: 30,
+		DurationMs:    50,
+		Error:         "network timeout",
+	})
+	if !strings.Contains(failed, "dreaming failed:") {
+		t.Fatalf("missing failure header: %q", failed)
+	}
+	if !strings.Contains(failed, "error: network timeout") {
+		t.Fatalf("missing failure error body: %q", failed)
 	}
 }
 

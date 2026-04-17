@@ -15,7 +15,6 @@ import (
 	"github.com/ParthSareen/OllamaClaw/internal/config"
 	"github.com/ParthSareen/OllamaClaw/internal/db"
 	"github.com/ParthSareen/OllamaClaw/internal/ollama"
-	"github.com/ParthSareen/OllamaClaw/internal/plugin"
 	"github.com/ParthSareen/OllamaClaw/internal/tools"
 	"github.com/ParthSareen/OllamaClaw/internal/util"
 )
@@ -25,6 +24,8 @@ const (
 	coreMemoriesMaxMessages  = 40
 	coreMemoriesTimeout      = 30 * time.Second
 	coreMemoriesMaxChars     = 4000
+	coreMemoriesPreviewItems = 3
+	coreMemoriesPreviewChars = 120
 	coreMemoriesStartMarker  = "<!-- OLLAMACLAW_CORE_MEMORIES_START -->"
 	coreMemoriesEndMarker    = "<!-- OLLAMACLAW_CORE_MEMORIES_END -->"
 )
@@ -72,10 +73,11 @@ type Engine struct {
 	cfg            config.Config
 	store          *db.Store
 	client         *ollama.Client
-	pluginManager  *plugin.Manager
 	builtinTools   []tools.Tool
 	memoryMu       sync.Mutex
 	memoryInFlight map[string]struct{}
+	eventMu        sync.RWMutex
+	coreMemorySink func(CoreMemoryEvent)
 }
 
 type HandleResult struct {
@@ -86,6 +88,45 @@ type HandleResult struct {
 	Compacted        bool
 	ToolTrace        []ToolTraceEntry
 	ThinkingTrace    []ThinkingTraceEntry
+}
+
+type CoreMemoryEventPhase string
+
+const (
+	CoreMemoryEventStart   CoreMemoryEventPhase = "start"
+	CoreMemoryEventDone    CoreMemoryEventPhase = "done"
+	CoreMemoryEventFailure CoreMemoryEventPhase = "failure"
+)
+
+type CoreMemoryEvent struct {
+	Phase         CoreMemoryEventPhase
+	Transport     string
+	SessionKey    string
+	SessionID     string
+	UserTurnCount int
+	Model         string
+	DurationMs    int64
+	Updated       bool
+	Delta         CoreMemoryDelta
+	Error         string
+}
+
+type CoreMemoryDelta struct {
+	BeforeChars    int
+	AfterChars     int
+	AddedCount     int
+	RemovedCount   int
+	KeptCount      int
+	AddedPreview   []string
+	RemovedPreview []string
+}
+
+type PromptEstimate struct {
+	RequestChars     int
+	EstimatedTokens  int
+	MessageCount     int
+	ToolCount        int
+	EstimatorFormula string
 }
 
 type HandleOptions struct {
@@ -125,7 +166,7 @@ type ThinkingTraceEntry struct {
 	ToolCallCount int
 }
 
-func New(cfg config.Config, store *db.Store, client *ollama.Client, pm *plugin.Manager, cronCtrl tools.CronController) *Engine {
+func New(cfg config.Config, store *db.Store, client *ollama.Client, cronCtrl tools.CronController) *Engine {
 	builtin := tools.BuiltinTools(tools.BuiltinsConfig{
 		ToolOutputMaxBytes: cfg.ToolOutputMaxBytes,
 		BashTimeoutSec:     cfg.BashTimeoutSeconds,
@@ -136,7 +177,6 @@ func New(cfg config.Config, store *db.Store, client *ollama.Client, pm *plugin.M
 		cfg:            cfg,
 		store:          store,
 		client:         client,
-		pluginManager:  pm,
 		builtinTools:   builtin,
 		memoryInFlight: map[string]struct{}{},
 	}
@@ -365,6 +405,19 @@ func (e *Engine) emitToolEvent(cb func(ToolEvent), ev ToolEvent) {
 	cb(ev)
 }
 
+func (e *Engine) emitCoreMemoryEvent(ev CoreMemoryEvent) {
+	e.eventMu.RLock()
+	cb := e.coreMemorySink
+	e.eventMu.RUnlock()
+	if cb == nil {
+		return
+	}
+	defer func() {
+		_ = recover()
+	}()
+	cb(ev)
+}
+
 func (e *Engine) injectPrefetchedBashContext(ctx context.Context, sessionID, toolCallID string, prefetched []tools.PrefetchedBashResult) error {
 	for i, p := range prefetched {
 		call := []ollama.ToolCall{
@@ -517,24 +570,106 @@ func (e *Engine) SetSessionThinkValue(ctx context.Context, transport, sessionKey
 	return e.store.SetSetting(ctx, thinkSettingKey(transport, sessionKey), normalized)
 }
 
-func (e *Engine) combinedTools(ctx context.Context) ([]tools.Tool, error) {
-	pluginTools, err := e.pluginManager.LoadEnabledTools(ctx)
+func (e *Engine) IsSessionDreamingNotifications(ctx context.Context, transport, sessionKey string) (bool, error) {
+	v, ok, err := e.store.GetSetting(ctx, dreamingNotificationsSettingKey(transport, sessionKey))
 	if err != nil {
-		return nil, err
+		return false, err
 	}
-	all := append([]tools.Tool{}, e.builtinTools...)
-	seen := map[string]bool{}
-	for _, t := range all {
-		seen[t.Name] = true
+	if !ok {
+		return true, nil
 	}
-	for _, t := range pluginTools {
-		if seen[t.Name] {
-			continue
-		}
-		seen[t.Name] = true
-		all = append(all, t)
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "0", "false", "off", "no":
+		return false, nil
+	default:
+		return true, nil
 	}
-	return all, nil
+}
+
+func (e *Engine) SetSessionDreamingNotifications(ctx context.Context, transport, sessionKey string, enabled bool) error {
+	val := "0"
+	if enabled {
+		val = "1"
+	}
+	return e.store.SetSetting(ctx, dreamingNotificationsSettingKey(transport, sessionKey), val)
+}
+
+func (e *Engine) SetCoreMemoryEventSink(fn func(CoreMemoryEvent)) {
+	e.eventMu.Lock()
+	defer e.eventMu.Unlock()
+	e.coreMemorySink = fn
+}
+
+func (e *Engine) EstimateNextPrompt(ctx context.Context, transport, sessionKey string) (PromptEstimate, error) {
+	ctx = tools.WithSessionInfo(ctx, transport, sessionKey)
+	sess, err := e.store.GetOrCreateActiveSession(ctx, transport, sessionKey, e.cfg.DefaultModel)
+	if err != nil {
+		return PromptEstimate{}, err
+	}
+	model := sess.ModelOverride
+	if strings.TrimSpace(model) == "" {
+		model = e.cfg.DefaultModel
+	}
+	thinkSetting, _ := e.SessionThinkValue(ctx, transport, sessionKey)
+	thinkParam := thinkSettingToAPIValue(thinkSetting)
+
+	combined, err := e.combinedTools(ctx)
+	if err != nil {
+		return PromptEstimate{}, err
+	}
+	toolDefs := toOllamaTools(combined)
+	msgList, err := e.activePromptMessages(ctx, sess.ID, "")
+	if err != nil {
+		return PromptEstimate{}, err
+	}
+	req := ollama.ChatRequest{
+		Model:    model,
+		Messages: msgList,
+		Tools:    toolDefs,
+		Stream:   false,
+		Think:    thinkParam,
+	}
+	payload, err := json.Marshal(req)
+	if err != nil {
+		return PromptEstimate{}, err
+	}
+	chars := len(payload)
+	estTokens := chars / 4
+	if chars > 0 && estTokens == 0 {
+		estTokens = 1
+	}
+	return PromptEstimate{
+		RequestChars:     chars,
+		EstimatedTokens:  estTokens,
+		MessageCount:     len(msgList),
+		ToolCount:        len(toolDefs),
+		EstimatorFormula: "len(request_json)/4",
+	}, nil
+}
+
+func (e *Engine) FullSystemContext(ctx context.Context, transport, sessionKey string) (string, error) {
+	ctx = tools.WithSessionInfo(ctx, transport, sessionKey)
+	sess, err := e.store.GetOrCreateActiveSession(ctx, transport, sessionKey, e.cfg.DefaultModel)
+	if err != nil {
+		return "", err
+	}
+	sections := []string{"System prompt:\n" + strings.TrimSpace(e.runtimeSystemPrompt())}
+	if core := strings.TrimSpace(e.runtimeCoreMemories()); core != "" {
+		sections = append(sections, "Core memories:\n"+core)
+	}
+	summary, ok, err := e.store.LatestCompactionSummary(ctx, sess.ID)
+	if err != nil {
+		return "", err
+	}
+	if ok && strings.TrimSpace(summary) != "" {
+		sections = append(sections, "Conversation summary:\n"+strings.TrimSpace(summary))
+	}
+	return strings.Join(sections, "\n\n"), nil
+}
+
+func (e *Engine) combinedTools(ctx context.Context) ([]tools.Tool, error) {
+	_ = ctx
+	return append([]tools.Tool{}, e.builtinTools...), nil
 }
 
 func (e *Engine) activePromptMessages(ctx context.Context, sessionID, activePrefetchToolCallID string) ([]ollama.ChatMessage, error) {
@@ -732,37 +867,73 @@ func (e *Engine) maybeScheduleCoreMemoriesRefresh(sess db.Session, model string)
 			delete(e.memoryInFlight, sess.ID)
 			e.memoryMu.Unlock()
 		}()
+		startedAt := time.Now()
 		ctx, cancel := context.WithTimeout(context.Background(), coreMemoriesTimeout)
 		defer cancel()
-		if err := e.refreshCoreMemories(ctx, sess, model); err != nil {
+		memModel := strings.TrimSpace(model)
+		if memModel == "" {
+			memModel = e.cfg.DefaultModel
+		}
+		e.emitCoreMemoryEvent(CoreMemoryEvent{
+			Phase:         CoreMemoryEventStart,
+			Transport:     sess.Transport,
+			SessionKey:    sess.SessionKey,
+			SessionID:     sess.ID,
+			UserTurnCount: userTurnCount,
+			Model:         memModel,
+		})
+		refreshResult, err := e.refreshCoreMemories(ctx, sess, memModel)
+		if err != nil {
+			e.emitCoreMemoryEvent(CoreMemoryEvent{
+				Phase:         CoreMemoryEventFailure,
+				Transport:     sess.Transport,
+				SessionKey:    sess.SessionKey,
+				SessionID:     sess.ID,
+				UserTurnCount: userTurnCount,
+				Model:         memModel,
+				DurationMs:    time.Since(startedAt).Milliseconds(),
+				Error:         err.Error(),
+			})
 			return
 		}
+		e.emitCoreMemoryEvent(CoreMemoryEvent{
+			Phase:         CoreMemoryEventDone,
+			Transport:     sess.Transport,
+			SessionKey:    sess.SessionKey,
+			SessionID:     sess.ID,
+			UserTurnCount: userTurnCount,
+			Model:         memModel,
+			DurationMs:    time.Since(startedAt).Milliseconds(),
+			Updated:       refreshResult.Updated,
+			Delta:         refreshResult.Delta,
+		})
 		_ = e.store.SetSetting(ctx, settingKey, strconv.Itoa(userTurnCount))
 	}()
 }
 
-func (e *Engine) refreshCoreMemories(ctx context.Context, sess db.Session, model string) error {
+type coreMemoryRefreshResult struct {
+	Updated bool
+	Delta   CoreMemoryDelta
+}
+
+func (e *Engine) refreshCoreMemories(ctx context.Context, sess db.Session, model string) (coreMemoryRefreshResult, error) {
 	rows, err := e.store.ListMessages(ctx, sess.ID, false)
 	if err != nil {
-		return err
+		return coreMemoryRefreshResult{}, err
 	}
 	conversation := compactConversationForCoreMemory(rows, coreMemoriesMaxMessages)
 	if strings.TrimSpace(conversation) == "" {
-		return nil
+		return coreMemoryRefreshResult{}, nil
 	}
 	path, err := config.CoreMemoriesPath()
 	if err != nil {
-		return err
+		return coreMemoryRefreshResult{}, err
 	}
 	existing := ""
 	if b, readErr := os.ReadFile(path); readErr == nil {
 		existing = string(b)
 	}
 	existingCore := clampToMaxChars(extractManagedCoreMemories(existing), coreMemoriesMaxChars)
-	memModel := strings.TrimSpace(model)
-	if memModel == "" {
-		memModel = e.cfg.DefaultModel
-	}
 	req := []ollama.ChatMessage{
 		{
 			Role:    "system",
@@ -774,23 +945,28 @@ func (e *Engine) refreshCoreMemories(ctx context.Context, sess db.Session, model
 		},
 	}
 	resp, err := e.client.Chat(ctx, ollama.ChatRequest{
-		Model:    memModel,
+		Model:    model,
 		Messages: req,
 		Stream:   false,
 		Think:    false,
 	})
 	if err != nil {
-		return err
+		return coreMemoryRefreshResult{}, err
 	}
 	updatedCore := clampToMaxChars(strings.TrimSpace(resp.Message.Content), coreMemoriesMaxChars)
 	if updatedCore == "" {
-		return nil
+		return coreMemoryRefreshResult{Delta: summarizeCoreMemoryDelta(existingCore, "")}, nil
 	}
+	delta := summarizeCoreMemoryDelta(existingCore, updatedCore)
+	updated := delta.AddedCount > 0 || delta.RemovedCount > 0
 	merged := upsertManagedCoreMemories(existing, updatedCore)
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return err
+		return coreMemoryRefreshResult{}, err
 	}
-	return os.WriteFile(path, []byte(merged), 0o600)
+	if err := os.WriteFile(path, []byte(merged), 0o600); err != nil {
+		return coreMemoryRefreshResult{}, err
+	}
+	return coreMemoryRefreshResult{Updated: updated, Delta: delta}, nil
 }
 
 func compactConversationForCoreMemory(rows []db.Message, maxMessages int) string {
@@ -815,6 +991,103 @@ func compactConversationForCoreMemory(rows []db.Message, maxMessages int) string
 		lines = lines[len(lines)-maxMessages:]
 	}
 	return strings.Join(lines, "\n")
+}
+
+func summarizeCoreMemoryDelta(before, after string) CoreMemoryDelta {
+	beforeItems := normalizeCoreMemoryItems(before)
+	afterItems := normalizeCoreMemoryItems(after)
+	delta := CoreMemoryDelta{
+		BeforeChars: len([]rune(strings.TrimSpace(before))),
+		AfterChars:  len([]rune(strings.TrimSpace(after))),
+	}
+
+	beforeCount := map[string]int{}
+	afterCount := map[string]int{}
+	for _, item := range beforeItems {
+		beforeCount[item]++
+	}
+	for _, item := range afterItems {
+		afterCount[item]++
+	}
+
+	beforeRemain := copyStringCountMap(beforeCount)
+	for _, item := range afterItems {
+		if beforeRemain[item] > 0 {
+			beforeRemain[item]--
+			delta.KeptCount++
+			continue
+		}
+		delta.AddedCount++
+		if len(delta.AddedPreview) < coreMemoriesPreviewItems {
+			delta.AddedPreview = append(delta.AddedPreview, clampToMaxChars(item, coreMemoriesPreviewChars))
+		}
+	}
+
+	afterRemain := copyStringCountMap(afterCount)
+	for _, item := range beforeItems {
+		if afterRemain[item] > 0 {
+			afterRemain[item]--
+			continue
+		}
+		delta.RemovedCount++
+		if len(delta.RemovedPreview) < coreMemoriesPreviewItems {
+			delta.RemovedPreview = append(delta.RemovedPreview, clampToMaxChars(item, coreMemoriesPreviewChars))
+		}
+	}
+	return delta
+}
+
+func copyStringCountMap(in map[string]int) map[string]int {
+	out := make(map[string]int, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
+}
+
+func normalizeCoreMemoryItems(raw string) []string {
+	lines := strings.Split(raw, "\n")
+	out := make([]string, 0, len(lines))
+	for _, line := range lines {
+		if item := normalizeCoreMemoryItem(line); item != "" {
+			out = append(out, item)
+		}
+	}
+	return out
+}
+
+func normalizeCoreMemoryItem(line string) string {
+	item := strings.TrimSpace(line)
+	if item == "" {
+		return ""
+	}
+	if strings.HasPrefix(item, "- ") || strings.HasPrefix(item, "* ") || strings.HasPrefix(item, "+ ") {
+		item = strings.TrimSpace(item[2:])
+	}
+	item = stripOrdinalListPrefix(item)
+	item = strings.Join(strings.Fields(item), " ")
+	return strings.TrimSpace(item)
+}
+
+func stripOrdinalListPrefix(item string) string {
+	if item == "" {
+		return item
+	}
+	i := 0
+	for i < len(item) && item[i] >= '0' && item[i] <= '9' {
+		i++
+	}
+	if i == 0 || i >= len(item) || item[i] != '.' {
+		return item
+	}
+	j := i + 1
+	for j < len(item) && (item[j] == ' ' || item[j] == '\t') {
+		j++
+	}
+	if j == i+1 {
+		return item
+	}
+	return strings.TrimSpace(item[j:])
 }
 
 func extractManagedCoreMemories(existing string) string {
@@ -966,6 +1239,10 @@ func showToolsSettingKey(transport, sessionKey string) string {
 
 func thinkSettingKey(transport, sessionKey string) string {
 	return fmt.Sprintf("session_think:%s:%s", transport, sessionKey)
+}
+
+func dreamingNotificationsSettingKey(transport, sessionKey string) string {
+	return fmt.Sprintf("session_dreaming_notifications:%s:%s", transport, sessionKey)
 }
 
 func normalizeThinkSetting(raw string) (string, bool) {

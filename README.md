@@ -8,7 +8,6 @@ It supports:
 - Built-in tools: `bash`, `read_file`, `write_file`, `web_search`, `web_fetch`, `system_prompt_get`, `system_prompt_update`, `system_prompt_history`, `system_prompt_rollback`
 - Local SQLite persistence with per-chat sessions
 - Context compaction (summary + recent turns)
-- Shareable subprocess plugins (JSON-RPC over stdio)
 
 ## Install
 
@@ -66,16 +65,6 @@ ollamaclaw launch
 ollamaclaw configure
 ollamaclaw telegram init [--token <telegram-bot-token>] [--owner-id <id>] [--owner-chat-id <id>] [--owner-user-id <id>]
 ollamaclaw telegram run   # legacy alias for launch
-
-ollamaclaw plugin new <name>
-ollamaclaw plugin test [--path <dir>]
-ollamaclaw plugin pack [--path <dir>]
-ollamaclaw plugin install <git|url|path>
-ollamaclaw plugin list
-ollamaclaw plugin enable <plugin-id>
-ollamaclaw plugin disable <plugin-id>
-ollamaclaw plugin remove <plugin-id>
-ollamaclaw plugin update [plugin-id]
 ```
 
 ## Telegram commands
@@ -83,7 +72,7 @@ ollamaclaw plugin update [plugin-id]
 - `/start` shows onboarding/help text
 - `/help` shows usage
 - `/model [name]` shows/sets per-chat model
-- `/tools` lists built-in + enabled plugin tools
+- `/tools` lists built-in tools
 - `/cron list [active|all]` lists cron jobs
 - Cron schedules and displayed cron timestamps are interpreted in `America/Los_Angeles` (PST/PDT)
 - Cron timezone prefixes (`TZ=` / `CRON_TZ=`) are intentionally rejected; OllamaClaw always runs cron schedules in `America/Los_Angeles`
@@ -95,14 +84,16 @@ ollamaclaw plugin update [plugin-id]
 - Telegram bash policy defaults to allow for non-destructive commands; potentially destructive commands require approval; critical lifecycle commands remain blocked
 - `/show tools [on|off]` toggles live tool event messages
 - `/show thinking [on|off]` toggles thinking visibility mode
+- `/show dreaming [on|off]` toggles background long-term-memory (“dreaming”) event notifications for this chat (default: on)
 - `/verbose [on|off]` enables/disables tool + thinking traces for this chat session
 - `/think [on|off|low|medium|high|default]` shows/sets think value
-- `/status` shows model, token counters, compactions, enabled plugin count, DB path
+- `/status` shows model, estimated next prompt size (`len(request_json)/4`), dreaming notification state, lifetime token counters, compaction thresholds, last compaction snapshot, DB path
+- `/fullsystem` shows the exact system context currently injected (system prompt + core memories + latest conversation summary)
 - `/reset` archives current session and starts a fresh one
 - `/stop` interrupts the active turn
 - `/restart` restarts the launch loop from Telegram
 - Send photos (or image documents) with an optional caption; image bytes are fetched from Telegram and forwarded to Ollama chat `images`
-- If a turn is already running, the latest incoming non-command message is auto-queued and runs next (1s debounce to reduce fragmented rapid-text noise)
+- If messages arrive in quick succession, OllamaClaw waits for a 1.5s quiet window, coalesces them with newlines, then runs one turn
 
 ## Built-in tools
 
@@ -195,7 +186,6 @@ Defaults:
   "context_window_tokens": 252000,
   "tool_output_max_bytes": 16384,
   "bash_timeout_seconds": 120,
-  "plugin_call_timeout_sec": 60,
   "telegram": {
     "bot_token": "",
     "owner_chat_id": 0,
@@ -215,8 +205,6 @@ Tables:
 - `compactions`
 - `cron_jobs`
 - `cron_prefetch_commands`
-- `plugins`
-- `plugin_tools`
 
 Compaction archives old rows (`archived=1`) and keeps raw history in SQLite.
 
@@ -226,78 +214,18 @@ Compaction archives old rows (`archived=1`) and keeps raw history in SQLite.
 - Action: summarize older unarchived history using Ollama
 - Result: save summary in `compactions`, archive old messages, keep recent turns active
 - Active prompt: `system + latest summary + unarchived recent messages`
+- Telegram sends a compaction notice message when compaction happens during a turn (including background cron-triggered turns sent to Telegram sessions)
 
 ## Core memories behavior
 
 - Trigger: every `10` user turns per session (`role=user` messages only)
+- Telegram notifies the session when a background core-memory refresh starts/completes/fails (toggle with `/show dreaming on|off`)
+- Dreaming completion notifications include a programmatic change summary (added/removed/kept items, char count delta, and short added/removed previews) with no extra LLM call
 - Runs in background (non-blocking to active chat/cron turn)
 - Summarizes stable preferences/workflows/constraints from recent dialogue
 - Writes to `~/.ollamaclaw/core_memories.md` using managed markers
 - Enforces a hard cap of `4000` characters for stored/injected core memory content
 - Injects managed core memories into prompt context as a dedicated system message
-
-## Plugin system (v1)
-
-Runtime:
-- subprocess per call
-- JSON-RPC 2.0 over stdio
-- NDJSON framing (one JSON object per line)
-
-Required RPC methods:
-- `initialize`
-- `tools/list`
-- `tools/call`
-- `shutdown`
-
-Manifest file: `claw.plugin.json`
-
-Example:
-```json
-{
-  "id": "acme.echo",
-  "name": "Echo",
-  "version": "0.1.6",
-  "apiVersion": "1.0",
-  "entrypoint": {"command": "python3", "args": ["plugin.py"]},
-  "protocol": {"jsonrpc": "2.0", "transport": "stdio", "framing": "ndjson"},
-  "permissions": {"filesystem": ["read:*", "write:*"]}
-}
-```
-
-Install sources:
-- local path
-- git source (`git:` prefix optional)
-- archive URL (`.zip`, `.tar.gz`, `.tgz`)
-
-Lock file: `~/.ollamaclaw/plugins.lock.json`
-- Stores `id`, `version`, `source`, resolved ref, checksum, install path
-- Checksum verified when loading enabled plugin tools
-
-## Plugin onboarding
-
-Create starter plugin:
-
-```bash
-./ollamaclaw plugin new my-plugin
-```
-
-Validate handshake + tool listing:
-
-```bash
-./ollamaclaw plugin test --path my-plugin
-```
-
-Pack for sharing:
-
-```bash
-./ollamaclaw plugin pack --path my-plugin
-```
-
-Install shared plugin:
-
-```bash
-./ollamaclaw plugin install <git|url|path>
-```
 
 ## Development
 

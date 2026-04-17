@@ -14,7 +14,6 @@ import (
 	"github.com/ParthSareen/OllamaClaw/internal/config"
 	"github.com/ParthSareen/OllamaClaw/internal/db"
 	"github.com/ParthSareen/OllamaClaw/internal/ollama"
-	"github.com/ParthSareen/OllamaClaw/internal/plugin"
 	"github.com/ParthSareen/OllamaClaw/internal/tools"
 )
 
@@ -422,6 +421,43 @@ func TestSessionShowToolsRoundTrip(t *testing.T) {
 	}
 	if enabled {
 		t.Fatalf("expected show_tools=false after unsetting")
+	}
+}
+
+func TestSessionDreamingNotificationsRoundTrip(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	ctx := context.Background()
+	engine, store := newTestEngine(t, "http://127.0.0.1:65535")
+	defer store.Close()
+
+	enabled, err := engine.IsSessionDreamingNotifications(ctx, "telegram", "123")
+	if err != nil {
+		t.Fatalf("IsSessionDreamingNotifications error: %v", err)
+	}
+	if !enabled {
+		t.Fatalf("expected default dreaming notifications=true")
+	}
+
+	if err := engine.SetSessionDreamingNotifications(ctx, "telegram", "123", false); err != nil {
+		t.Fatalf("SetSessionDreamingNotifications(false) error: %v", err)
+	}
+	enabled, err = engine.IsSessionDreamingNotifications(ctx, "telegram", "123")
+	if err != nil {
+		t.Fatalf("IsSessionDreamingNotifications error: %v", err)
+	}
+	if enabled {
+		t.Fatalf("expected dreaming notifications=false after setting off")
+	}
+
+	if err := engine.SetSessionDreamingNotifications(ctx, "telegram", "123", true); err != nil {
+		t.Fatalf("SetSessionDreamingNotifications(true) error: %v", err)
+	}
+	enabled, err = engine.IsSessionDreamingNotifications(ctx, "telegram", "123")
+	if err != nil {
+		t.Fatalf("IsSessionDreamingNotifications error: %v", err)
+	}
+	if !enabled {
+		t.Fatalf("expected dreaming notifications=true after setting on")
 	}
 }
 
@@ -998,6 +1034,140 @@ func TestWithCurrentTimePromptAppendsOnce(t *testing.T) {
 	}
 }
 
+func TestFullSystemContextIncludesCoreAndCompactionSummary(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	ctx := context.Background()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatalf("FullSystemContext should not call /api/chat")
+	}))
+	defer srv.Close()
+
+	engine, store := newTestEngine(t, srv.URL)
+	defer store.Close()
+
+	sess, err := engine.GetOrCreateSession(ctx, "telegram", "8750063231")
+	if err != nil {
+		t.Fatalf("GetOrCreateSession error: %v", err)
+	}
+	if err := store.InsertCompaction(ctx, db.Compaction{
+		SessionID:         sess.ID,
+		Summary:           "User prefers concise updates and PST timestamps.",
+		FirstKeptMessage:  0,
+		ArchivedBeforeSeq: 0,
+	}); err != nil {
+		t.Fatalf("InsertCompaction error: %v", err)
+	}
+
+	corePath, err := config.CoreMemoriesPath()
+	if err != nil {
+		t.Fatalf("CoreMemoriesPath error: %v", err)
+	}
+	core := coreMemoriesStartMarker + "\n- User likes terse but warm responses.\n" + coreMemoriesEndMarker + "\n"
+	if err := os.MkdirAll(filepath.Dir(corePath), 0o755); err != nil {
+		t.Fatalf("mkdir core memory dir: %v", err)
+	}
+	if err := os.WriteFile(corePath, []byte(core), 0o600); err != nil {
+		t.Fatalf("write core memories file: %v", err)
+	}
+
+	full, err := engine.FullSystemContext(ctx, "telegram", "8750063231")
+	if err != nil {
+		t.Fatalf("FullSystemContext error: %v", err)
+	}
+	if !strings.Contains(full, "System prompt:\n") {
+		t.Fatalf("expected system prompt section, got %q", full)
+	}
+	if !strings.Contains(full, "Current runtime time:") {
+		t.Fatalf("expected runtime time in system prompt, got %q", full)
+	}
+	if !strings.Contains(full, "Core memories:\n- User likes terse but warm responses.") {
+		t.Fatalf("expected core memories section, got %q", full)
+	}
+	if !strings.Contains(full, "Conversation summary:\nUser prefers concise updates and PST timestamps.") {
+		t.Fatalf("expected conversation summary section, got %q", full)
+	}
+}
+
+func TestEstimateNextPromptUsesJSONHeuristic(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	ctx := context.Background()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatalf("EstimateNextPrompt should not call /api/chat")
+	}))
+	defer srv.Close()
+
+	engine, store := newTestEngine(t, srv.URL)
+	defer store.Close()
+
+	sess, err := engine.GetOrCreateSession(ctx, "telegram", "8750063231")
+	if err != nil {
+		t.Fatalf("GetOrCreateSession error: %v", err)
+	}
+	if err := store.InsertMessage(ctx, &db.Message{SessionID: sess.ID, Role: "user", Content: "hello"}); err != nil {
+		t.Fatalf("InsertMessage error: %v", err)
+	}
+
+	estimate, err := engine.EstimateNextPrompt(ctx, "telegram", "8750063231")
+	if err != nil {
+		t.Fatalf("EstimateNextPrompt error: %v", err)
+	}
+	if estimate.EstimatorFormula != "len(request_json)/4" {
+		t.Fatalf("unexpected estimator formula: %q", estimate.EstimatorFormula)
+	}
+	if estimate.RequestChars <= 0 {
+		t.Fatalf("expected positive request chars, got %d", estimate.RequestChars)
+	}
+	if estimate.EstimatedTokens <= 0 {
+		t.Fatalf("expected positive estimated tokens, got %d", estimate.EstimatedTokens)
+	}
+	if estimate.EstimatedTokens != estimate.RequestChars/4 {
+		t.Fatalf("expected tokens to match chars/4, got chars=%d tokens=%d", estimate.RequestChars, estimate.EstimatedTokens)
+	}
+	if estimate.MessageCount < 2 {
+		t.Fatalf("expected at least system+user message count, got %d", estimate.MessageCount)
+	}
+	if estimate.ToolCount == 0 {
+		t.Fatalf("expected built-in tools to be counted")
+	}
+}
+
+func TestSummarizeCoreMemoryDelta(t *testing.T) {
+	before := "- prefers concise replies\n- runs cron checks in morning\n- tone: founder copilot"
+	after := "- prefers concise replies\n- tone: founder copilot\n- asks for PST timestamps\n- likes command previews"
+	delta := summarizeCoreMemoryDelta(before, after)
+
+	if delta.AddedCount != 2 {
+		t.Fatalf("expected AddedCount=2, got %d", delta.AddedCount)
+	}
+	if delta.RemovedCount != 1 {
+		t.Fatalf("expected RemovedCount=1, got %d", delta.RemovedCount)
+	}
+	if delta.KeptCount != 2 {
+		t.Fatalf("expected KeptCount=2, got %d", delta.KeptCount)
+	}
+	if len(delta.AddedPreview) != 2 {
+		t.Fatalf("expected two added previews, got %v", delta.AddedPreview)
+	}
+	if len(delta.RemovedPreview) != 1 {
+		t.Fatalf("expected one removed preview, got %v", delta.RemovedPreview)
+	}
+	if delta.BeforeChars <= 0 || delta.AfterChars <= 0 {
+		t.Fatalf("expected non-zero char counts, got before=%d after=%d", delta.BeforeChars, delta.AfterChars)
+	}
+}
+
+func TestSummarizeCoreMemoryDeltaNormalizesListPrefixes(t *testing.T) {
+	before := "1. Keeps responses concise\n2. Uses PST"
+	after := "- Keeps responses concise\n- Uses PST"
+	delta := summarizeCoreMemoryDelta(before, after)
+	if delta.AddedCount != 0 || delta.RemovedCount != 0 {
+		t.Fatalf("expected normalized items to match exactly, got %+v", delta)
+	}
+}
+
 func newTestEngine(t *testing.T, ollamaHost string) (*Engine, *db.Store) {
 	t.Helper()
 	cfg := config.Default()
@@ -1011,6 +1181,5 @@ func newTestEngine(t *testing.T, ollamaHost string) (*Engine, *db.Store) {
 		t.Fatalf("open store: %v", err)
 	}
 	client := ollama.NewClient(cfg.OllamaHost)
-	pm := plugin.NewManager(store, cfg)
-	return New(cfg, store, client, pm, nil), store
+	return New(cfg, store, client, nil), store
 }

@@ -185,6 +185,38 @@ func (r *Runner) Run(ctx context.Context) error {
 		r.logf("bot init failed: %v", r.redactError(err))
 		return r.redactError(err)
 	}
+	r.Engine.SetCoreMemoryEventSink(func(ev agent.CoreMemoryEvent) {
+		if !strings.EqualFold(strings.TrimSpace(ev.Transport), "telegram") {
+			return
+		}
+		sessionKey := strings.TrimSpace(ev.SessionKey)
+		if sessionKey == "" {
+			return
+		}
+		checkCtx, checkCancel := context.WithTimeout(context.Background(), 3*time.Second)
+		enabled, err := r.Engine.IsSessionDreamingNotifications(checkCtx, "telegram", sessionKey)
+		checkCancel()
+		if err != nil {
+			r.logf("dreaming event toggle check failed: session_key=%s error=%v", sessionKey, r.redactError(err))
+			return
+		}
+		if !enabled {
+			return
+		}
+		chatID, err := strconv.ParseInt(sessionKey, 10, 64)
+		if err != nil {
+			r.logf("dreaming event drop: invalid session_key=%q error=%v", sessionKey, r.redactError(err))
+			return
+		}
+		text := formatCoreMemoryEvent(ev)
+		r.logf("dreaming event: chat=%d %s", chatID, r.previewForLog(text))
+		sendCtx, sendCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer sendCancel()
+		if _, err := b.SendMessage(sendCtx, &bot.SendMessageParams{ChatID: chatID, Text: text}); err != nil {
+			r.logf("dreaming event send failed: chat=%d error=%v", chatID, r.redactError(err))
+		}
+	})
+	defer r.Engine.SetCoreMemoryEventSink(nil)
 	r.logf("telegram client initialized (long polling, private chats)")
 	if err := SyncCommands(runCtx, r.Cfg.Telegram.BotToken); err != nil {
 		r.logf("telegram command sync warning: %v", r.redactError(err))
@@ -391,6 +423,18 @@ func (r *Runner) executeTurn(ctx context.Context, turnCtx context.Context, b *bo
 		return
 	}
 	r.logf("agent turn complete: chat=%d model=%s prompt_tokens=%d eval_tokens=%d compacted=%t tool_calls=%d elapsed_ms=%d", chatID, res.Session.ModelOverride, res.PromptTokens, res.EvalTokens, res.Compacted, len(res.ToolTrace), time.Since(startedAt).Milliseconds())
+	if res.Compacted {
+		thresholdTokens := int(float64(r.Cfg.ContextWindowTokens) * r.Cfg.CompactionThreshold)
+		compaction := r.readCompactionSnapshot(context.Background(), sessionKey, res.Session)
+		notice := formatCompactionNotice(res.PromptTokens, thresholdTokens, r.Cfg.KeepRecentTurns, compaction)
+		r.logf("compaction notice: chat=%d %s", chatID, r.previewForLog(notice))
+		sendCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		_, sendErr := b.SendMessage(sendCtx, &bot.SendMessageParams{ChatID: chatID, Text: notice})
+		cancel()
+		if sendErr != nil {
+			r.logf("compaction notice send failed: chat=%d error=%v", chatID, r.redactError(sendErr))
+		}
+	}
 	for i, tr := range res.ToolTrace {
 		line := fmt.Sprintf("tool trace [%d/%d]: chat=%d name=%s duration_ms=%d args=%q", i+1, len(res.ToolTrace), chatID, tr.Name, tr.DurationMs, r.previewForLog(tr.ArgsJSON))
 		if strings.TrimSpace(tr.Error) != "" {
@@ -636,10 +680,11 @@ func (r *Runner) handleCommand(ctx context.Context, b *bot.Bot, chatID int64, ra
 	switch cmd {
 	case "start":
 		r.logf("command start: chat=%d", chatID)
-		send("OllamaClaw is ready.\nCommands:\n/start\n/help\n/model [name]\n/tools\n/cron list [active|all]\n/cron safe <id>\n/cron unsafe <id>\n/cron prefetch list <id>\n/show tools [on|off]\n/show thinking [on|off]\n/verbose [on|off]\n/think [on|off|low|medium|high|default]\n/status\n/reset\n/stop\n/restart")
+		r.resyncCommandsBestEffort("start")
+		send("OllamaClaw is ready.\nCommands:\n/start\n/help\n/model [name]\n/tools\n/cron list [active|all]\n/cron safe <id>\n/cron unsafe <id>\n/cron prefetch list <id>\n/show tools [on|off]\n/show thinking [on|off]\n/show dreaming [on|off]\n/verbose [on|off]\n/think [on|off|low|medium|high|default]\n/status\n/fullsystem\n/reset\n/stop\n/restart")
 	case "help":
 		r.logf("command help: chat=%d", chatID)
-		send("Commands:\n/start\n/help\n/model [name]\n/tools\n/cron list [active|all]\n/cron safe <id>\n/cron unsafe <id>\n/cron prefetch list <id>\n/show tools [on|off]\n/show thinking [on|off]\n/verbose [on|off]\n/think [on|off|low|medium|high|default]\n/status\n/reset\n/stop\n/restart\n\nSend any text to chat with OllamaClaw.")
+		send("Commands:\n/start\n/help\n/model [name]\n/tools\n/cron list [active|all]\n/cron safe <id>\n/cron unsafe <id>\n/cron prefetch list <id>\n/show tools [on|off]\n/show thinking [on|off]\n/show dreaming [on|off]\n/verbose [on|off]\n/think [on|off|low|medium|high|default]\n/status\n/fullsystem\n/reset\n/stop\n/restart\n\nSend any text to chat with OllamaClaw.")
 	case "reset":
 		r.logf("command reset: chat=%d", chatID)
 		newSess, err := r.Engine.ResetSession(ctx, "telegram", sessionKey)
@@ -678,11 +723,7 @@ func (r *Runner) handleCommand(ctx context.Context, b *bot.Bot, chatID int64, ra
 		}
 		lines := []string{"tools:"}
 		for _, t := range all {
-			if t.Source == "plugin" {
-				lines = append(lines, fmt.Sprintf("- %s (plugin:%s)", t.Name, t.PluginID))
-			} else {
-				lines = append(lines, "- "+t.Name)
-			}
+			lines = append(lines, "- "+t.Name)
 		}
 		send(strings.Join(lines, "\n"))
 	case "verbose":
@@ -712,7 +753,7 @@ func (r *Runner) handleCommand(ctx context.Context, b *bot.Bot, chatID int64, ra
 	case "show":
 		r.logf("command show: chat=%d args=%q", chatID, r.previewForLog(strings.Join(parts[1:], " ")))
 		if len(parts) < 2 {
-			send("usage: /show <tools|thinking> [on|off]")
+			send("usage: /show <tools|thinking|dreaming> [on|off]")
 			return
 		}
 		target := strings.ToLower(strings.TrimSpace(parts[1]))
@@ -761,8 +802,30 @@ func (r *Runner) handleCommand(ctx context.Context, b *bot.Bot, chatID int64, ra
 			}
 			r.logf("command show thinking set: chat=%d enabled=%t", chatID, enabled)
 			send(fmt.Sprintf("thinking: %t", enabled))
+		case "dreaming", "dream", "memory", "memories":
+			if len(parts) == 2 {
+				if err := r.Engine.SetSessionDreamingNotifications(ctx, "telegram", sessionKey, true); err != nil {
+					r.logf("command show dreaming set failed: chat=%d error=%v", chatID, r.redactError(err))
+					sendErr(err)
+					return
+				}
+				send("dreaming notifications: true")
+				return
+			}
+			enabled, ok := parseOnOff(parts[2])
+			if !ok {
+				send("usage: /show dreaming [on|off]")
+				return
+			}
+			if err := r.Engine.SetSessionDreamingNotifications(ctx, "telegram", sessionKey, enabled); err != nil {
+				r.logf("command show dreaming set failed: chat=%d error=%v", chatID, r.redactError(err))
+				sendErr(err)
+				return
+			}
+			r.logf("command show dreaming set: chat=%d enabled=%t", chatID, enabled)
+			send(fmt.Sprintf("dreaming notifications: %t", enabled))
 		default:
-			send("usage: /show <tools|thinking> [on|off]")
+			send("usage: /show <tools|thinking|dreaming> [on|off]")
 		}
 	case "think":
 		r.logf("command think: chat=%d args=%q", chatID, r.previewForLog(strings.Join(parts[1:], " ")))
@@ -899,16 +962,34 @@ func (r *Runner) handleCommand(ctx context.Context, b *bot.Bot, chatID int64, ra
 		}
 	case "status":
 		r.logf("command status: chat=%d", chatID)
-		enabledPlugins, _ := r.Store.ListPlugins(ctx, true)
 		verbose, _ := r.Engine.IsSessionVerbose(ctx, "telegram", sessionKey)
 		showTools, _ := r.Engine.IsSessionShowTools(ctx, "telegram", sessionKey)
 		thinkValue, _ := r.Engine.SessionThinkValue(ctx, "telegram", sessionKey)
+		dreamingNotifications, _ := r.Engine.IsSessionDreamingNotifications(ctx, "telegram", sessionKey)
+		estimate, estErr := r.Engine.EstimateNextPrompt(ctx, "telegram", sessionKey)
+		if estErr != nil {
+			r.logf("command status prompt estimate failed: chat=%d error=%v", chatID, r.redactError(estErr))
+		}
 		version := strings.TrimSpace(r.AppVersion)
 		if version == "" {
 			version = "dev"
 		}
-		text := fmt.Sprintf("status:\nversion: %s\nmodel: %s\nverbose: %t\nshow_tools: %t\nthink: %s\ntimezone: %s\nprompt_tokens: %d\ncompletion_tokens: %d\ncompactions: %d\nenabled_plugins: %d\ndb: %s\nlog: %s", version, redactTelegramToken(r.Cfg.Telegram.BotToken, sess.ModelOverride), verbose, showTools, thinkValue, util.PacificTimezoneName, sess.TotalPromptToken, sess.TotalEvalToken, sess.CompactionCount, len(enabledPlugins), r.Cfg.DBPath, strings.TrimSpace(r.Cfg.LogPath))
+		thresholdTokens := int(float64(r.Cfg.ContextWindowTokens) * r.Cfg.CompactionThreshold)
+		compaction := r.readCompactionSnapshot(ctx, sessionKey, sess)
+		text := fmt.Sprintf("status:\nversion: %s\nmodel: %s\nverbose: %t\nshow_tools: %t\nthink: %s\ndreaming_notifications: %t\ntimezone: %s\nnext_prompt_tokens_est: %d\nnext_prompt_chars_est: %d\nnext_prompt_messages: %d\nnext_prompt_tools: %d\nprompt_estimator: %s\nlifetime_prompt_tokens: %d\nlifetime_completion_tokens: %d\ncompactions: %d\ncontext_window_tokens: %d\ncompaction_threshold: %.2f\ncompaction_trigger_tokens: %d\nkeep_recent_turns: %d\nlast_compaction_at: %s\nlast_compaction_summary_chars: %d\nlast_compaction_archived_before_seq: %d\ndb: %s\nlog: %s", version, redactTelegramToken(r.Cfg.Telegram.BotToken, sess.ModelOverride), verbose, showTools, thinkValue, dreamingNotifications, util.PacificTimezoneName, estimate.EstimatedTokens, estimate.RequestChars, estimate.MessageCount, estimate.ToolCount, estimate.EstimatorFormula, sess.TotalPromptToken, sess.TotalEvalToken, compaction.TotalCount, r.Cfg.ContextWindowTokens, r.Cfg.CompactionThreshold, thresholdTokens, r.Cfg.KeepRecentTurns, compaction.LastAt, compaction.SummaryChars, compaction.ArchivedBeforeSeq, r.Cfg.DBPath, strings.TrimSpace(r.Cfg.LogPath))
 		send(text)
+	case "fullsystem":
+		r.logf("command fullsystem: chat=%d", chatID)
+		full, err := r.Engine.FullSystemContext(ctx, "telegram", sessionKey)
+		if err != nil {
+			r.logf("command fullsystem failed: chat=%d error=%v", chatID, r.redactError(err))
+			sendErr(err)
+			return
+		}
+		if strings.TrimSpace(full) == "" {
+			full = "(system context unavailable)"
+		}
+		r.sendChunked(ctx, b, chatID, nil, full)
 	case "stop":
 		r.logf("command stop: chat=%d", chatID)
 		turn, ok := r.stopTurn(sessionKey)
@@ -957,6 +1038,20 @@ func (r *Runner) requestRestart() bool {
 	r.restarting.Store(true)
 	cancel()
 	return true
+}
+
+func (r *Runner) resyncCommandsBestEffort(reason string) {
+	token := strings.TrimSpace(r.Cfg.Telegram.BotToken)
+	if token == "" {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	if err := SyncCommands(ctx, token); err != nil {
+		r.logf("telegram command resync (%s) failed: %v", reason, r.redactError(err))
+		return
+	}
+	r.logf("telegram commands resynced (%s)", reason)
 }
 
 func (r *Runner) beginTurn(sessionKey string, chatID int64, cancel context.CancelFunc) (uint64, bool) {
@@ -1146,6 +1241,92 @@ func (r *Runner) consumePendingTurnByGeneration(sessionKey string, generation ui
 	}
 	delete(r.pendingTurns, sessionKey)
 	return true
+}
+
+type compactionSnapshot struct {
+	TotalCount        int
+	LastAt            string
+	SummaryChars      int
+	ArchivedBeforeSeq int
+}
+
+func (r *Runner) readCompactionSnapshot(ctx context.Context, sessionKey string, fallback db.Session) compactionSnapshot {
+	snap := compactionSnapshot{
+		TotalCount:        fallback.CompactionCount,
+		LastAt:            "-",
+		SummaryChars:      0,
+		ArchivedBeforeSeq: 0,
+	}
+	if r.Store == nil {
+		return snap
+	}
+	if sess, ok, err := r.Store.GetActiveSession(ctx, "telegram", sessionKey); err == nil && ok {
+		snap.TotalCount = sess.CompactionCount
+	}
+	sessionID := strings.TrimSpace(fallback.ID)
+	if sessionID == "" {
+		return snap
+	}
+	if c, ok, err := r.Store.LatestCompaction(ctx, sessionID); err == nil && ok {
+		if !c.CreatedAt.IsZero() {
+			snap.LastAt = util.FormatPacificRFC3339(c.CreatedAt)
+		}
+		snap.SummaryChars = len([]rune(strings.TrimSpace(c.Summary)))
+		snap.ArchivedBeforeSeq = c.ArchivedBeforeSeq
+	}
+	return snap
+}
+
+func formatCompactionNotice(promptTokens, thresholdTokens, keepRecentTurns int, snap compactionSnapshot) string {
+	return fmt.Sprintf("context compacted:\nprompt_tokens: %d\nthreshold_tokens: %d\nkeep_recent_turns: %d\ncompactions_total: %d\nlast_compaction_at: %s", promptTokens, thresholdTokens, keepRecentTurns, snap.TotalCount, snap.LastAt)
+}
+
+func formatCoreMemoryEvent(ev agent.CoreMemoryEvent) string {
+	model := strings.TrimSpace(ev.Model)
+	if model == "" {
+		model = "(default)"
+	}
+	switch ev.Phase {
+	case agent.CoreMemoryEventStart:
+		return fmt.Sprintf("dreaming started:\nuser_turns: %d\nmodel: %s", ev.UserTurnCount, model)
+	case agent.CoreMemoryEventDone:
+		status := "unchanged"
+		if ev.Updated {
+			status = "updated"
+		}
+		lines := []string{
+			"dreaming done:",
+			fmt.Sprintf("status: %s", status),
+			fmt.Sprintf("changes: +%d -%d =%d", ev.Delta.AddedCount, ev.Delta.RemovedCount, ev.Delta.KeptCount),
+			fmt.Sprintf("chars: %d -> %d", ev.Delta.BeforeChars, ev.Delta.AfterChars),
+		}
+		if len(ev.Delta.AddedPreview) > 0 {
+			lines = append(lines, "added:")
+			for _, item := range ev.Delta.AddedPreview {
+				lines = append(lines, "- "+item)
+			}
+		}
+		if len(ev.Delta.RemovedPreview) > 0 {
+			lines = append(lines, "removed:")
+			for _, item := range ev.Delta.RemovedPreview {
+				lines = append(lines, "- "+item)
+			}
+		}
+		lines = append(lines,
+			fmt.Sprintf("duration_ms: %d", ev.DurationMs),
+			fmt.Sprintf("user_turns: %d", ev.UserTurnCount),
+			fmt.Sprintf("model: %s", model),
+		)
+		return strings.Join(lines, "\n")
+	case agent.CoreMemoryEventFailure:
+		errMsg := strings.TrimSpace(ev.Error)
+		if errMsg == "" {
+			errMsg = "unknown error"
+		}
+		return fmt.Sprintf("dreaming failed:\nerror: %s\nduration_ms: %d\nuser_turns: %d\nmodel: %s", truncateForLive(errMsg), ev.DurationMs, ev.UserTurnCount, model)
+	default:
+		return fmt.Sprintf("dreaming event:\nphase: %s\nduration_ms: %d\nuser_turns: %d\nmodel: %s", strings.TrimSpace(string(ev.Phase)), ev.DurationMs, ev.UserTurnCount, model)
+	}
 }
 
 func (r *Runner) sendChunked(ctx context.Context, b *bot.Bot, chatID int64, progress *models.Message, text string) {
@@ -1376,7 +1557,7 @@ func parsePollerCandidates(psOutput string, selfPID int) []pollerCandidate {
 			continue
 		}
 		// Include known external Telegram bot runner patterns for easier diagnosis.
-		if strings.Contains(cmdLower, "telegram") && (strings.Contains(cmdLower, "plugins-official/telegram") || strings.Contains(cmdLower, " bot") || strings.Contains(cmdLower, " getupdates ")) {
+		if strings.Contains(cmdLower, "telegram") && (strings.Contains(cmdLower, " bot") || strings.Contains(cmdLower, " getupdates ")) {
 			out = append(out, pollerCandidate{pid: pid, cmd: cmd})
 		}
 	}
