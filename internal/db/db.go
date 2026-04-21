@@ -104,32 +104,6 @@ CREATE TABLE IF NOT EXISTS compactions (
 );
 
 CREATE INDEX IF NOT EXISTS idx_compactions_session ON compactions(session_id, id DESC);
-
-CREATE TABLE IF NOT EXISTS plugins (
-  id TEXT PRIMARY KEY,
-  name TEXT NOT NULL,
-  version TEXT NOT NULL,
-  source TEXT NOT NULL,
-  resolved_ref TEXT NOT NULL,
-  checksum TEXT NOT NULL,
-  install_path TEXT NOT NULL,
-  permissions_json TEXT NOT NULL DEFAULT '{}',
-  enabled INTEGER NOT NULL DEFAULT 1,
-  installed_at TEXT NOT NULL,
-  last_updated_at TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS plugin_tools (
-  plugin_id TEXT NOT NULL,
-  tool_name TEXT NOT NULL,
-  description TEXT NOT NULL,
-  schema_json TEXT NOT NULL,
-  timeout_sec INTEGER NOT NULL DEFAULT 60,
-  enabled INTEGER NOT NULL DEFAULT 1,
-  updated_at TEXT NOT NULL,
-  PRIMARY KEY(plugin_id, tool_name),
-  FOREIGN KEY(plugin_id) REFERENCES plugins(id)
-);
 `,
 		`
 CREATE TABLE IF NOT EXISTS cron_jobs (
@@ -164,6 +138,12 @@ CREATE TABLE IF NOT EXISTS cron_prefetch_commands (
 );
 
 CREATE INDEX IF NOT EXISTS idx_cron_prefetch_job ON cron_prefetch_commands(job_id);
+`,
+		`
+ALTER TABLE cron_jobs ADD COLUMN reminder_mode TEXT NOT NULL DEFAULT 'legacy_cron';
+ALTER TABLE cron_jobs ADD COLUMN reminder_spec_json TEXT NOT NULL DEFAULT '{}';
+ALTER TABLE cron_jobs ADD COLUMN once_fire_at TEXT NULL;
+UPDATE cron_jobs SET reminder_mode = 'legacy_cron' WHERE TRIM(COALESCE(reminder_mode, '')) = '';
 `,
 	}
 
@@ -484,189 +464,45 @@ func (s *Store) LatestCompactionSummary(ctx context.Context, sessionID string) (
 	return summary, true, nil
 }
 
-func (s *Store) UpsertPlugin(ctx context.Context, p Plugin) error {
-	now := time.Now().UTC().Format(time.RFC3339Nano)
-	_, err := s.db.ExecContext(ctx, `
-INSERT INTO plugins(id, name, version, source, resolved_ref, checksum, install_path, permissions_json, enabled, installed_at, last_updated_at)
-VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-ON CONFLICT(id) DO UPDATE SET
-  name=excluded.name,
-  version=excluded.version,
-  source=excluded.source,
-  resolved_ref=excluded.resolved_ref,
-  checksum=excluded.checksum,
-  install_path=excluded.install_path,
-  permissions_json=excluded.permissions_json,
-  enabled=excluded.enabled,
-  last_updated_at=excluded.last_updated_at
-`, p.ID, p.Name, p.Version, p.Source, p.ResolvedRef, p.Checksum, p.InstallPath, p.Permissions, boolToInt(p.Enabled), now, now)
-	if err != nil {
-		return fmt.Errorf("upsert plugin: %w", err)
-	}
-	return nil
-}
-
-func (s *Store) GetPlugin(ctx context.Context, id string) (Plugin, bool, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT id, name, version, source, resolved_ref, checksum, install_path, permissions_json, enabled, installed_at, last_updated_at FROM plugins WHERE id = ?`, id)
-	var p Plugin
-	var enabled int
-	var installedAt, updatedAt string
-	err := row.Scan(&p.ID, &p.Name, &p.Version, &p.Source, &p.ResolvedRef, &p.Checksum, &p.InstallPath, &p.Permissions, &enabled, &installedAt, &updatedAt)
+func (s *Store) LatestCompaction(ctx context.Context, sessionID string) (Compaction, bool, error) {
+	row := s.db.QueryRowContext(ctx, `
+SELECT id, session_id, summary, first_kept_message_id, archived_before_seq, created_at
+FROM compactions
+WHERE session_id = ?
+ORDER BY id DESC
+LIMIT 1
+`, sessionID)
+	var (
+		c          Compaction
+		createdRaw string
+	)
+	err := row.Scan(&c.ID, &c.SessionID, &c.Summary, &c.FirstKeptMessage, &c.ArchivedBeforeSeq, &createdRaw)
 	if errors.Is(err, sql.ErrNoRows) {
-		return Plugin{}, false, nil
+		return Compaction{}, false, nil
 	}
 	if err != nil {
-		return Plugin{}, false, fmt.Errorf("get plugin: %w", err)
+		return Compaction{}, false, fmt.Errorf("latest compaction row: %w", err)
 	}
-	p.Enabled = enabled == 1
-	p.InstalledAt, _ = time.Parse(time.RFC3339Nano, installedAt)
-	p.LastUpdatedAt, _ = time.Parse(time.RFC3339Nano, updatedAt)
-	return p, true, nil
+	c.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdRaw)
+	return c, true, nil
 }
 
-func (s *Store) ListPlugins(ctx context.Context, enabledOnly bool) ([]Plugin, error) {
-	query := `SELECT id, name, version, source, resolved_ref, checksum, install_path, permissions_json, enabled, installed_at, last_updated_at FROM plugins`
-	if enabledOnly {
-		query += ` WHERE enabled = 1`
-	}
-	query += ` ORDER BY id ASC`
-	rows, err := s.db.QueryContext(ctx, query)
-	if err != nil {
-		return nil, fmt.Errorf("list plugins: %w", err)
-	}
-	defer rows.Close()
-	var out []Plugin
-	for rows.Next() {
-		var p Plugin
-		var enabled int
-		var installedAt, updatedAt string
-		if err := rows.Scan(&p.ID, &p.Name, &p.Version, &p.Source, &p.ResolvedRef, &p.Checksum, &p.InstallPath, &p.Permissions, &enabled, &installedAt, &updatedAt); err != nil {
-			return nil, fmt.Errorf("scan plugin: %w", err)
-		}
-		p.Enabled = enabled == 1
-		p.InstalledAt, _ = time.Parse(time.RFC3339Nano, installedAt)
-		p.LastUpdatedAt, _ = time.Parse(time.RFC3339Nano, updatedAt)
-		out = append(out, p)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate plugins: %w", err)
-	}
-	return out, nil
-}
-
-func (s *Store) SetPluginEnabled(ctx context.Context, id string, enabled bool) error {
-	res, err := s.db.ExecContext(ctx, `UPDATE plugins SET enabled = ?, last_updated_at = ? WHERE id = ?`, boolToInt(enabled), time.Now().UTC().Format(time.RFC3339Nano), id)
-	if err != nil {
-		return fmt.Errorf("set plugin enabled: %w", err)
-	}
-	rows, _ := res.RowsAffected()
-	if rows == 0 {
-		return fmt.Errorf("plugin %s not found", id)
-	}
-	return nil
-}
-
-func (s *Store) DeletePlugin(ctx context.Context, id string) error {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM plugin_tools WHERE plugin_id = ?`, id); err != nil {
-		tx.Rollback()
-		return fmt.Errorf("delete plugin tools: %w", err)
-	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM plugins WHERE id = ?`, id); err != nil {
-		tx.Rollback()
-		return fmt.Errorf("delete plugin: %w", err)
-	}
-	if err := tx.Commit(); err != nil {
-		return err
-	}
-	return nil
-}
-
-func (s *Store) ReplacePluginTools(ctx context.Context, pluginID string, tools []PluginTool) error {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM plugin_tools WHERE plugin_id = ?`, pluginID); err != nil {
-		tx.Rollback()
-		return fmt.Errorf("clear plugin tools: %w", err)
-	}
-	for _, t := range tools {
-		if _, err := tx.ExecContext(ctx, `
-INSERT INTO plugin_tools(plugin_id, tool_name, description, schema_json, timeout_sec, enabled, updated_at)
-VALUES(?, ?, ?, ?, ?, ?, ?)
-`, pluginID, t.ToolName, t.Description, t.SchemaJSON, t.TimeoutSec, boolToInt(t.Enabled), time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
-			tx.Rollback()
-			return fmt.Errorf("insert plugin tool %s: %w", t.ToolName, err)
-		}
-	}
-	if err := tx.Commit(); err != nil {
-		return err
-	}
-	return nil
-}
-
-func (s *Store) ListEnabledPluginTools(ctx context.Context) ([]PluginTool, error) {
-	rows, err := s.db.QueryContext(ctx, `
-SELECT pt.plugin_id, pt.tool_name, pt.description, pt.schema_json, pt.timeout_sec, pt.enabled, pt.updated_at
-FROM plugin_tools pt
-JOIN plugins p ON p.id = pt.plugin_id
-WHERE p.enabled = 1 AND pt.enabled = 1
-ORDER BY pt.tool_name ASC
-`)
-	if err != nil {
-		return nil, fmt.Errorf("list enabled plugin tools: %w", err)
-	}
-	defer rows.Close()
-	var out []PluginTool
-	for rows.Next() {
-		var t PluginTool
-		var enabled int
-		var updated string
-		if err := rows.Scan(&t.PluginID, &t.ToolName, &t.Description, &t.SchemaJSON, &t.TimeoutSec, &enabled, &updated); err != nil {
-			return nil, fmt.Errorf("scan plugin tool: %w", err)
-		}
-		t.Enabled = enabled == 1
-		t.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updated)
-		out = append(out, t)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate plugin tools: %w", err)
-	}
-	return out, nil
-}
-
-func (s *Store) ListPluginTools(ctx context.Context, pluginID string) ([]PluginTool, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT plugin_id, tool_name, description, schema_json, timeout_sec, enabled, updated_at FROM plugin_tools WHERE plugin_id = ? ORDER BY tool_name`, pluginID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []PluginTool
-	for rows.Next() {
-		var t PluginTool
-		var enabled int
-		var updated string
-		if err := rows.Scan(&t.PluginID, &t.ToolName, &t.Description, &t.SchemaJSON, &t.TimeoutSec, &enabled, &updated); err != nil {
-			return nil, err
-		}
-		t.Enabled = enabled == 1
-		t.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updated)
-		out = append(out, t)
-	}
-	return out, rows.Err()
-}
-
-func (s *Store) UpsertCronJob(ctx context.Context, job CronJob) error {
+func (s *Store) UpsertReminderJob(ctx context.Context, job ReminderJob) error {
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	lastRun := nullableTimeString(job.LastRunAt)
 	nextRun := nullableTimeString(job.NextRunAt)
+	onceFireAt := nullableTimeString(job.OnceFireAt)
+	mode := strings.TrimSpace(job.ReminderMode)
+	if mode == "" {
+		mode = "legacy_cron"
+	}
+	specJSON := strings.TrimSpace(job.ReminderSpecJSON)
+	if specJSON == "" {
+		specJSON = "{}"
+	}
 	_, err := s.db.ExecContext(ctx, `
-INSERT INTO cron_jobs(id, schedule, prompt, transport, session_key, active, safe, auto_prefetch, last_run_at, next_run_at, last_error, created_at, updated_at)
-VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+INSERT INTO cron_jobs(id, schedule, prompt, transport, session_key, active, safe, auto_prefetch, reminder_mode, reminder_spec_json, once_fire_at, last_run_at, next_run_at, last_error, created_at, updated_at)
+VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(id) DO UPDATE SET
   schedule=excluded.schedule,
   prompt=excluded.prompt,
@@ -675,33 +511,44 @@ ON CONFLICT(id) DO UPDATE SET
   active=excluded.active,
   safe=excluded.safe,
   auto_prefetch=excluded.auto_prefetch,
+  reminder_mode=excluded.reminder_mode,
+  reminder_spec_json=excluded.reminder_spec_json,
+  once_fire_at=excluded.once_fire_at,
   last_run_at=excluded.last_run_at,
   next_run_at=excluded.next_run_at,
   last_error=excluded.last_error,
   updated_at=excluded.updated_at
-`, job.ID, job.Schedule, job.Prompt, job.Transport, job.SessionKey, boolToInt(job.Active), boolToInt(job.Safe), boolToInt(job.AutoPrefetch), lastRun, nextRun, job.LastError, now, now)
+`, job.ID, job.Schedule, job.Prompt, job.Transport, job.SessionKey, boolToInt(job.Active), boolToInt(job.Safe), boolToInt(job.AutoPrefetch), mode, specJSON, onceFireAt, lastRun, nextRun, job.LastError, now, now)
 	if err != nil {
-		return fmt.Errorf("upsert cron job: %w", err)
+		return fmt.Errorf("upsert reminder job: %w", err)
 	}
 	return nil
 }
 
-func (s *Store) GetCronJob(ctx context.Context, id string) (CronJob, bool, error) {
+func (s *Store) UpsertCronJob(ctx context.Context, job CronJob) error {
+	return s.UpsertReminderJob(ctx, job)
+}
+
+func (s *Store) GetReminderJob(ctx context.Context, id string) (ReminderJob, bool, error) {
 	row := s.db.QueryRowContext(ctx, `
-SELECT id, schedule, prompt, transport, session_key, active, safe, auto_prefetch, last_run_at, next_run_at, last_error, created_at, updated_at
+SELECT id, schedule, prompt, transport, session_key, active, safe, auto_prefetch, reminder_mode, reminder_spec_json, once_fire_at, last_run_at, next_run_at, last_error, created_at, updated_at
 FROM cron_jobs
 WHERE id = ?
 `, id)
-	job, ok, err := scanCronJob(row)
+	job, ok, err := scanReminderJob(row)
 	if err != nil {
-		return CronJob{}, false, err
+		return ReminderJob{}, false, err
 	}
 	return job, ok, nil
 }
 
-func (s *Store) ListCronJobs(ctx context.Context, activeOnly bool) ([]CronJob, error) {
+func (s *Store) GetCronJob(ctx context.Context, id string) (CronJob, bool, error) {
+	return s.GetReminderJob(ctx, id)
+}
+
+func (s *Store) ListReminderJobs(ctx context.Context, activeOnly bool) ([]ReminderJob, error) {
 	query := `
-SELECT id, schedule, prompt, transport, session_key, active, safe, auto_prefetch, last_run_at, next_run_at, last_error, created_at, updated_at
+SELECT id, schedule, prompt, transport, session_key, active, safe, auto_prefetch, reminder_mode, reminder_spec_json, once_fire_at, last_run_at, next_run_at, last_error, created_at, updated_at
 FROM cron_jobs
 `
 	if activeOnly {
@@ -710,23 +557,25 @@ FROM cron_jobs
 	query += ` ORDER BY id ASC`
 	rows, err := s.db.QueryContext(ctx, query)
 	if err != nil {
-		return nil, fmt.Errorf("list cron jobs: %w", err)
+		return nil, fmt.Errorf("list reminder jobs: %w", err)
 	}
 	defer rows.Close()
-	out := []CronJob{}
+	out := []ReminderJob{}
 	for rows.Next() {
 		var (
-			job                    CronJob
+			job                    ReminderJob
 			active, safe, prefetch int
+			onceFireAtRaw          sql.NullString
 			lastRunRaw, nextRaw    sql.NullString
 			createdRaw, updatedRaw string
 		)
-		if err := rows.Scan(&job.ID, &job.Schedule, &job.Prompt, &job.Transport, &job.SessionKey, &active, &safe, &prefetch, &lastRunRaw, &nextRaw, &job.LastError, &createdRaw, &updatedRaw); err != nil {
-			return nil, fmt.Errorf("scan cron job: %w", err)
+		if err := rows.Scan(&job.ID, &job.Schedule, &job.Prompt, &job.Transport, &job.SessionKey, &active, &safe, &prefetch, &job.ReminderMode, &job.ReminderSpecJSON, &onceFireAtRaw, &lastRunRaw, &nextRaw, &job.LastError, &createdRaw, &updatedRaw); err != nil {
+			return nil, fmt.Errorf("scan reminder job: %w", err)
 		}
 		job.Active = active == 1
 		job.Safe = safe == 1
 		job.AutoPrefetch = prefetch == 1
+		job.OnceFireAt = parseNullTime(onceFireAtRaw)
 		job.LastRunAt = parseNullTime(lastRunRaw)
 		job.NextRunAt = parseNullTime(nextRaw)
 		job.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdRaw)
@@ -734,52 +583,78 @@ FROM cron_jobs
 		out = append(out, job)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate cron jobs: %w", err)
+		return nil, fmt.Errorf("iterate reminder jobs: %w", err)
 	}
 	return out, nil
 }
 
-func (s *Store) DeleteCronJob(ctx context.Context, id string) error {
+func (s *Store) ListCronJobs(ctx context.Context, activeOnly bool) ([]CronJob, error) {
+	return s.ListReminderJobs(ctx, activeOnly)
+}
+
+func (s *Store) DeleteReminderJob(ctx context.Context, id string) error {
 	res, err := s.db.ExecContext(ctx, `DELETE FROM cron_jobs WHERE id = ?`, id)
 	if err != nil {
-		return fmt.Errorf("delete cron job: %w", err)
+		return fmt.Errorf("delete reminder job: %w", err)
 	}
 	affected, _ := res.RowsAffected()
 	if affected == 0 {
-		return fmt.Errorf("cron job %s not found", id)
+		return fmt.Errorf("reminder job %s not found", id)
 	}
 	return nil
 }
 
-func (s *Store) UpdateCronRun(ctx context.Context, id string, lastRun, nextRun *time.Time, lastError string) error {
+func (s *Store) DeleteCronJob(ctx context.Context, id string) error {
+	return s.DeleteReminderJob(ctx, id)
+}
+
+func (s *Store) UpdateReminderRun(ctx context.Context, id string, lastRun, nextRun *time.Time, lastError string) error {
 	_, err := s.db.ExecContext(ctx, `
 UPDATE cron_jobs
 SET last_run_at = ?, next_run_at = ?, last_error = ?, updated_at = ?
 WHERE id = ?
 `, nullableTimeString(lastRun), nullableTimeString(nextRun), lastError, time.Now().UTC().Format(time.RFC3339Nano), id)
 	if err != nil {
-		return fmt.Errorf("update cron job run: %w", err)
+		return fmt.Errorf("update reminder job run: %w", err)
 	}
 	return nil
 }
 
-func scanCronJob(row *sql.Row) (CronJob, bool, error) {
+func (s *Store) UpdateCronRun(ctx context.Context, id string, lastRun, nextRun *time.Time, lastError string) error {
+	return s.UpdateReminderRun(ctx, id, lastRun, nextRun, lastError)
+}
+
+func (s *Store) SetReminderActive(ctx context.Context, id string, active bool) error {
+	_, err := s.db.ExecContext(ctx, `
+UPDATE cron_jobs
+SET active = ?, updated_at = ?
+WHERE id = ?
+`, boolToInt(active), time.Now().UTC().Format(time.RFC3339Nano), id)
+	if err != nil {
+		return fmt.Errorf("set reminder job active: %w", err)
+	}
+	return nil
+}
+
+func scanReminderJob(row *sql.Row) (ReminderJob, bool, error) {
 	var (
-		job                    CronJob
+		job                    ReminderJob
 		active, safe, prefetch int
+		onceFireAtRaw          sql.NullString
 		lastRunRaw, nextRaw    sql.NullString
 		createdRaw, updatedRaw string
 	)
-	err := row.Scan(&job.ID, &job.Schedule, &job.Prompt, &job.Transport, &job.SessionKey, &active, &safe, &prefetch, &lastRunRaw, &nextRaw, &job.LastError, &createdRaw, &updatedRaw)
+	err := row.Scan(&job.ID, &job.Schedule, &job.Prompt, &job.Transport, &job.SessionKey, &active, &safe, &prefetch, &job.ReminderMode, &job.ReminderSpecJSON, &onceFireAtRaw, &lastRunRaw, &nextRaw, &job.LastError, &createdRaw, &updatedRaw)
 	if errors.Is(err, sql.ErrNoRows) {
-		return CronJob{}, false, nil
+		return ReminderJob{}, false, nil
 	}
 	if err != nil {
-		return CronJob{}, false, fmt.Errorf("scan cron job: %w", err)
+		return ReminderJob{}, false, fmt.Errorf("scan reminder job: %w", err)
 	}
 	job.Active = active == 1
 	job.Safe = safe == 1
 	job.AutoPrefetch = prefetch == 1
+	job.OnceFireAt = parseNullTime(onceFireAtRaw)
 	job.LastRunAt = parseNullTime(lastRunRaw)
 	job.NextRunAt = parseNullTime(nextRaw)
 	job.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdRaw)
@@ -787,27 +662,35 @@ func scanCronJob(row *sql.Row) (CronJob, bool, error) {
 	return job, true, nil
 }
 
-func (s *Store) ListCronPrefetchCommands(ctx context.Context, jobID string) ([]string, error) {
+func scanCronJob(row *sql.Row) (CronJob, bool, error) {
+	return scanReminderJob(row)
+}
+
+func (s *Store) ListReminderPrefetchCommands(ctx context.Context, jobID string) ([]string, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT command FROM cron_prefetch_commands WHERE job_id = ? ORDER BY command ASC`, jobID)
 	if err != nil {
-		return nil, fmt.Errorf("list cron prefetch commands: %w", err)
+		return nil, fmt.Errorf("list reminder prefetch commands: %w", err)
 	}
 	defer rows.Close()
 	out := make([]string, 0, 8)
 	for rows.Next() {
 		var cmd string
 		if err := rows.Scan(&cmd); err != nil {
-			return nil, fmt.Errorf("scan cron prefetch command: %w", err)
+			return nil, fmt.Errorf("scan reminder prefetch command: %w", err)
 		}
 		out = append(out, cmd)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate cron prefetch commands: %w", err)
+		return nil, fmt.Errorf("iterate reminder prefetch commands: %w", err)
 	}
 	return out, nil
 }
 
-func (s *Store) UpsertCronPrefetchCommands(ctx context.Context, jobID string, commands []string) error {
+func (s *Store) ListCronPrefetchCommands(ctx context.Context, jobID string) ([]string, error) {
+	return s.ListReminderPrefetchCommands(ctx, jobID)
+}
+
+func (s *Store) UpsertReminderPrefetchCommands(ctx context.Context, jobID string, commands []string) error {
 	if strings.TrimSpace(jobID) == "" {
 		return fmt.Errorf("job id is required")
 	}
@@ -831,13 +714,17 @@ ON CONFLICT(job_id, command) DO UPDATE SET
   updated_at=excluded.updated_at
 `, jobID, command, now, now); err != nil {
 			tx.Rollback()
-			return fmt.Errorf("upsert cron prefetch command: %w", err)
+			return fmt.Errorf("upsert reminder prefetch command: %w", err)
 		}
 	}
 	if err := tx.Commit(); err != nil {
 		return err
 	}
 	return nil
+}
+
+func (s *Store) UpsertCronPrefetchCommands(ctx context.Context, jobID string, commands []string) error {
+	return s.UpsertReminderPrefetchCommands(ctx, jobID, commands)
 }
 
 func parseNullTime(v sql.NullString) *time.Time {

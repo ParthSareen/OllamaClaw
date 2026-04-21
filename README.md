@@ -1,6 +1,6 @@
 # OllamaClaw
 
-OllamaClaw is a Telegram-first Go coding agent which uses Ollama. Hacking on this to use as a playground for different ideas and experiements. Currently using it to run crons, reminders, and small tasks.
+OllamaClaw is a Telegram-first Go coding agent which uses Ollama. Hacking on this to use as a playground for different ideas and experiements. Currently using it to run reminders and small tasks.
 Current app version: `0.1.6`.
 
 It supports:
@@ -49,7 +49,7 @@ The owner ID is used for both `owner_chat_id` and `owner_user_id`.
 ```
 
 The bot only handles **private chats** and only responds to the configured owner allowlist.
-`launch` prints live runtime logs (updates, commands, tool calls, cron output, and errors) to stdout.
+`launch` prints live runtime logs (updates, commands, tool calls, reminder output, and errors) to stdout.
 
 Optional:
 
@@ -73,14 +73,13 @@ ollamaclaw telegram run   # legacy alias for launch
 - `/help` shows usage
 - `/model [name]` shows/sets per-chat model
 - `/tools` lists built-in tools
-- `/cron list [active|all]` lists cron jobs
-- Cron schedules and displayed cron timestamps are interpreted in `America/Los_Angeles` (PST/PDT)
-- Cron timezone prefixes (`TZ=` / `CRON_TZ=`) are intentionally rejected; OllamaClaw always runs cron schedules in `America/Los_Angeles`
-- `/cron safe <id>` marks a cron as safe (Telegram bash approvals auto-approve for that cron)
-- `/cron unsafe <id>` removes safe mode from a cron
-- `/cron prefetch list <id>` shows learned prefetched commands for a cron job
-- Cron jobs auto-learn stable bash commands from prior runs and prefetch them on future runs (`auto_prefetch` on by default)
-- Prefetched commands are executed immediately before each cron agent turn and injected as synthetic `bash` tool-call context with `run_id`, `run_started_at`, and per-command `fetched_at` timestamps; only the current run's `run_id` context is visible to the model
+- `/reminder list [active|all]` lists reminders
+- All reminder schedules and timestamps are interpreted in `America/Los_Angeles` (PST/PDT)
+- `/reminder safe <id>` marks a reminder as safe (Telegram bash approvals auto-approve for that reminder)
+- `/reminder unsafe <id>` removes safe mode from a reminder
+- `/reminder prefetch list <id>` shows learned prefetched commands for a reminder
+- Reminders auto-learn stable bash commands from prior runs and prefetch them on future runs (`auto_prefetch` on by default)
+- Prefetched commands are executed immediately before each reminder agent turn and injected as synthetic `bash` tool-call context with `run_id`, `run_started_at`, and per-command `fetched_at` timestamps; only the current run's `run_id` context is visible to the model
 - Telegram bash policy defaults to allow for non-destructive commands; potentially destructive commands require approval; critical lifecycle commands remain blocked
 - `/show tools [on|off]` toggles live tool event messages
 - `/show thinking [on|off]` toggles thinking visibility mode
@@ -146,6 +145,15 @@ Output:
 ```json
 {"title":"...","content":"...","links":["..."]}
 ```
+
+### `reminder_add`
+Structured reminder creation in PST/PDT. Modes: `once`, `interval`, `weekdays`, `monthly`.
+
+### `reminder_list`
+Lists reminders with normalized spec and compiled cron schedule.
+
+### `reminder_remove`
+Removes a reminder by `id`.
 
 ### `system_prompt_get`
 Reads managed system prompt details (base/overlay paths, overlay content, optional revision history).
@@ -214,14 +222,14 @@ Compaction archives old rows (`archived=1`) and keeps raw history in SQLite.
 - Action: summarize older unarchived history using Ollama
 - Result: save summary in `compactions`, archive old messages, keep recent turns active
 - Active prompt: `system + latest summary + unarchived recent messages`
-- Telegram sends a compaction notice message when compaction happens during a turn (including background cron-triggered turns sent to Telegram sessions)
+- Telegram sends a compaction notice message when compaction happens during a turn (including background reminder-triggered turns sent to Telegram sessions)
 
 ## Core memories behavior
 
 - Trigger: every `10` user turns per session (`role=user` messages only)
 - Telegram notifies the session when a background core-memory refresh starts/completes/fails (toggle with `/show dreaming on|off`)
 - Dreaming completion notifications include a programmatic change summary (added/removed/kept items, char count delta, and short added/removed previews) with no extra LLM call
-- Runs in background (non-blocking to active chat/cron turn)
+- Runs in background (non-blocking to active chat/reminder turn)
 - Summarizes stable preferences/workflows/constraints from recent dialogue
 - Writes to `~/.ollamaclaw/core_memories.md` using managed markers
 - Enforces a hard cap of `4000` characters for stored/injected core memory content

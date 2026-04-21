@@ -13,7 +13,7 @@ import (
 	"github.com/robfig/cron/v3"
 )
 
-func TestAddListRemoveJob(t *testing.T) {
+func TestAddListRemoveReminder(t *testing.T) {
 	store, err := db.Open(filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {
 		t.Fatalf("open db: %v", err)
@@ -29,17 +29,19 @@ func TestAddListRemoveJob(t *testing.T) {
 	}
 	defer mgr.Stop()
 
-	job, err := mgr.AddJob(context.Background(), tools.CronJobSpec{
-		ID:         "job-test",
-		Schedule:   "0 * * * *",
-		Prompt:     "ping",
-		Transport:  "repl",
-		SessionKey: "default",
+	job, err := mgr.AddReminder(context.Background(), tools.ReminderSpec{
+		ID:           "reminder-test",
+		Mode:         "interval",
+		IntervalUnit: "minute",
+		Interval:     5,
+		Prompt:       "ping",
+		Transport:    "repl",
+		SessionKey:   "default",
 	})
 	if err != nil {
-		t.Fatalf("add job: %v", err)
+		t.Fatalf("add reminder: %v", err)
 	}
-	if job.ID != "job-test" {
+	if job.ID != "reminder-test" {
 		t.Fatalf("unexpected id %s", job.ID)
 	}
 	if job.Safe {
@@ -48,26 +50,26 @@ func TestAddListRemoveJob(t *testing.T) {
 	if !job.AutoPrefetch {
 		t.Fatalf("expected new job auto_prefetch=true by default")
 	}
-	jobs, err := mgr.ListJobs(context.Background(), true)
+	jobs, err := mgr.ListReminders(context.Background(), true)
 	if err != nil {
-		t.Fatalf("list jobs: %v", err)
+		t.Fatalf("list reminders: %v", err)
 	}
 	if len(jobs) != 1 {
-		t.Fatalf("expected 1 job, got %d", len(jobs))
+		t.Fatalf("expected 1 reminder, got %d", len(jobs))
 	}
-	if err := mgr.RemoveJob(context.Background(), "job-test"); err != nil {
-		t.Fatalf("remove job: %v", err)
+	if err := mgr.RemoveReminder(context.Background(), "reminder-test"); err != nil {
+		t.Fatalf("remove reminder: %v", err)
 	}
-	jobs, err = mgr.ListJobs(context.Background(), false)
+	jobs, err = mgr.ListReminders(context.Background(), false)
 	if err != nil {
-		t.Fatalf("list jobs: %v", err)
+		t.Fatalf("list reminders: %v", err)
 	}
 	if len(jobs) != 0 {
-		t.Fatalf("expected 0 jobs, got %d", len(jobs))
+		t.Fatalf("expected 0 reminders, got %d", len(jobs))
 	}
 }
 
-func TestSetJobSafeAndApproverInjection(t *testing.T) {
+func TestSetReminderSafeAndApproverInjection(t *testing.T) {
 	store, err := db.Open(filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {
 		t.Fatalf("open db: %v", err)
@@ -89,15 +91,17 @@ func TestSetJobSafeAndApproverInjection(t *testing.T) {
 	}
 	defer mgr.Stop()
 
-	job, err := mgr.AddJob(context.Background(), tools.CronJobSpec{
-		ID:         "job-safe",
-		Schedule:   "0 * * * *",
-		Prompt:     "ping",
-		Transport:  "telegram",
-		SessionKey: "8750063231",
+	job, err := mgr.AddReminder(context.Background(), tools.ReminderSpec{
+		ID:           "reminder-safe",
+		Mode:         "interval",
+		IntervalUnit: "minute",
+		Interval:     5,
+		Prompt:       "ping",
+		Transport:    "telegram",
+		SessionKey:   "8750063231",
 	})
 	if err != nil {
-		t.Fatalf("add job: %v", err)
+		t.Fatalf("add reminder: %v", err)
 	}
 
 	lastHadApprover = false
@@ -109,12 +113,12 @@ func TestSetJobSafeAndApproverInjection(t *testing.T) {
 		t.Fatalf("expected approver absent for safe=false jobs")
 	}
 
-	updated, err := mgr.SetJobSafe(context.Background(), job.ID, true)
+	updated, err := mgr.SetReminderSafe(context.Background(), job.ID, true)
 	if err != nil {
-		t.Fatalf("SetJobSafe(true) error: %v", err)
+		t.Fatalf("SetReminderSafe(true) error: %v", err)
 	}
 	if !updated.Safe {
-		t.Fatalf("expected SetJobSafe(true) to return safe=true")
+		t.Fatalf("expected SetReminderSafe(true) to return safe=true")
 	}
 
 	lastHadApprover = false
@@ -126,12 +130,12 @@ func TestSetJobSafeAndApproverInjection(t *testing.T) {
 		t.Fatalf("expected approver present for safe=true jobs")
 	}
 
-	updated, err = mgr.SetJobSafe(context.Background(), job.ID, false)
+	updated, err = mgr.SetReminderSafe(context.Background(), job.ID, false)
 	if err != nil {
-		t.Fatalf("SetJobSafe(false) error: %v", err)
+		t.Fatalf("SetReminderSafe(false) error: %v", err)
 	}
 	if updated.Safe {
-		t.Fatalf("expected SetJobSafe(false) to return safe=false")
+		t.Fatalf("expected SetReminderSafe(false) to return safe=false")
 	}
 
 	lastHadApprover = false
@@ -144,7 +148,7 @@ func TestSetJobSafeAndApproverInjection(t *testing.T) {
 	}
 }
 
-func TestSetJobSafeMissingJob(t *testing.T) {
+func TestSetReminderSafeMissingReminder(t *testing.T) {
 	store, err := db.Open(filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {
 		t.Fatalf("open db: %v", err)
@@ -152,8 +156,8 @@ func TestSetJobSafeMissingJob(t *testing.T) {
 	defer store.Close()
 
 	mgr := NewManager(store)
-	if _, err := mgr.SetJobSafe(context.Background(), "does-not-exist", true); err == nil {
-		t.Fatalf("expected error for missing job")
+	if _, err := mgr.SetReminderSafe(context.Background(), "does-not-exist", true); err == nil {
+		t.Fatalf("expected error for missing reminder")
 	}
 }
 
@@ -165,7 +169,7 @@ func TestRunJobPrefetchInjectsRunnerContextAndLearnsCommands(t *testing.T) {
 	defer store.Close()
 
 	now := context.Background()
-	if err := store.UpsertCronJob(now, db.CronJob{
+	if err := store.UpsertReminderJob(now, db.ReminderJob{
 		ID:           "job-prefetch",
 		Schedule:     "0 * * * *",
 		Prompt:       "check PR status",
@@ -174,10 +178,11 @@ func TestRunJobPrefetchInjectsRunnerContextAndLearnsCommands(t *testing.T) {
 		Active:       true,
 		Safe:         true,
 		AutoPrefetch: true,
+		ReminderMode: "legacy_cron",
 	}); err != nil {
-		t.Fatalf("upsert cron job: %v", err)
+		t.Fatalf("upsert reminder job: %v", err)
 	}
-	if err := store.UpsertCronPrefetchCommands(now, "job-prefetch", []string{"pwd"}); err != nil {
+	if err := store.UpsertReminderPrefetchCommands(now, "job-prefetch", []string{"pwd"}); err != nil {
 		t.Fatalf("seed prefetch commands: %v", err)
 	}
 
@@ -236,7 +241,7 @@ func TestRunJobPrefetchInjectsRunnerContextAndLearnsCommands(t *testing.T) {
 	if secondRunID == firstRunID {
 		t.Fatalf("expected new run_id each run, got identical value %q", secondRunID)
 	}
-	learned, err := store.ListCronPrefetchCommands(context.Background(), "job-prefetch")
+	learned, err := store.ListReminderPrefetchCommands(context.Background(), "job-prefetch")
 	if err != nil {
 		t.Fatalf("list learned prefetch commands: %v", err)
 	}
@@ -249,7 +254,7 @@ func TestRunJobPrefetchInjectsRunnerContextAndLearnsCommands(t *testing.T) {
 	}
 }
 
-func TestListJobPrefetchCommands(t *testing.T) {
+func TestListReminderPrefetchCommands(t *testing.T) {
 	store, err := db.Open(filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {
 		t.Fatalf("open db: %v", err)
@@ -258,11 +263,11 @@ func TestListJobPrefetchCommands(t *testing.T) {
 
 	mgr := NewManager(store)
 	ctx := context.Background()
-	if _, err := mgr.ListJobPrefetchCommands(ctx, "missing"); err == nil {
-		t.Fatalf("expected missing job error")
+	if _, err := mgr.ListReminderPrefetchCommands(ctx, "missing"); err == nil {
+		t.Fatalf("expected missing reminder error")
 	}
 
-	if err := store.UpsertCronJob(ctx, db.CronJob{
+	if err := store.UpsertReminderJob(ctx, db.ReminderJob{
 		ID:           "job-prefetch-list",
 		Schedule:     "0 * * * *",
 		Prompt:       "check",
@@ -270,16 +275,17 @@ func TestListJobPrefetchCommands(t *testing.T) {
 		SessionKey:   "8750063231",
 		Active:       true,
 		AutoPrefetch: true,
+		ReminderMode: "legacy_cron",
 	}); err != nil {
-		t.Fatalf("upsert cron job: %v", err)
+		t.Fatalf("upsert reminder job: %v", err)
 	}
-	if err := store.UpsertCronPrefetchCommands(ctx, "job-prefetch-list", []string{"pwd", "gh pr view 1 --json number"}); err != nil {
+	if err := store.UpsertReminderPrefetchCommands(ctx, "job-prefetch-list", []string{"pwd", "gh pr view 1 --json number"}); err != nil {
 		t.Fatalf("upsert prefetch commands: %v", err)
 	}
 
-	commands, err := mgr.ListJobPrefetchCommands(ctx, "job-prefetch-list")
+	commands, err := mgr.ListReminderPrefetchCommands(ctx, "job-prefetch-list")
 	if err != nil {
-		t.Fatalf("ListJobPrefetchCommands() error: %v", err)
+		t.Fatalf("ListReminderPrefetchCommands() error: %v", err)
 	}
 	if len(commands) != 2 {
 		t.Fatalf("expected 2 commands, got %d (%v)", len(commands), commands)
@@ -289,7 +295,7 @@ func TestListJobPrefetchCommands(t *testing.T) {
 func TestToToolInfoFormatsTimesInPacific(t *testing.T) {
 	last := time.Date(2026, time.January, 15, 20, 0, 0, 0, time.UTC)
 	next := time.Date(2026, time.January, 15, 21, 30, 0, 0, time.UTC)
-	info := toToolInfo(db.CronJob{
+	info := toToolInfo(db.ReminderJob{
 		ID:           "job-tz",
 		Schedule:     "0 * * * *",
 		Prompt:       "check status",
@@ -298,6 +304,7 @@ func TestToToolInfoFormatsTimesInPacific(t *testing.T) {
 		Active:       true,
 		Safe:         false,
 		AutoPrefetch: true,
+		ReminderMode: "legacy_cron",
 		LastRunAt:    &last,
 		NextRunAt:    &next,
 	})
@@ -353,25 +360,25 @@ func TestParseSchedulePacificUsesPacificIndependentlyOfTimeLocal(t *testing.T) {
 	}
 }
 
-func TestAddJobRejectsTimezonePrefixedSpec(t *testing.T) {
+func TestAddReminderRejectsUnsupportedMode(t *testing.T) {
 	store, err := db.Open(filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {
 		t.Fatalf("open db: %v", err)
 	}
 	defer store.Close()
 	mgr := NewManager(store)
-	_, err = mgr.AddJob(context.Background(), tools.CronJobSpec{
-		ID:         "job-tz-reject",
-		Schedule:   "CRON_TZ=UTC 0 9 * * *",
+	_, err = mgr.AddReminder(context.Background(), tools.ReminderSpec{
+		ID:         "reminder-mode-reject",
+		Mode:       "nonsense",
 		Prompt:     "ping",
 		Transport:  "repl",
 		SessionKey: "default",
 	})
 	if err == nil {
-		t.Fatalf("expected timezone-prefixed spec rejection")
+		t.Fatalf("expected unsupported mode rejection")
 	}
-	if !strings.Contains(strings.ToLower(err.Error()), "timezone") {
-		t.Fatalf("expected timezone-related error, got %v", err)
+	if !strings.Contains(strings.ToLower(err.Error()), "unsupported reminder mode") {
+		t.Fatalf("expected unsupported mode error, got %v", err)
 	}
 }
 
@@ -392,5 +399,101 @@ func TestParseSchedulePacificRespectsDSTOffsets(t *testing.T) {
 	summerNext := sched.Next(summerNow).In(util.PacificLocation())
 	if _, offset := summerNext.Zone(); offset != -7*60*60 {
 		t.Fatalf("expected summer PDT offset -0700, got %s (%d)", summerNext.Format(time.RFC3339), offset)
+	}
+}
+
+func TestRunJobDeactivatesOnceReminder(t *testing.T) {
+	store, err := db.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer store.Close()
+
+	now := time.Now().In(util.PacificLocation())
+	if err := store.UpsertReminderJob(context.Background(), db.ReminderJob{
+		ID:               "once-reminder",
+		Schedule:         "*/5 * * * *",
+		Prompt:           "one shot",
+		Transport:        "telegram",
+		SessionKey:       "8750063231",
+		Active:           true,
+		AutoPrefetch:     true,
+		ReminderMode:     "once",
+		ReminderSpecJSON: `{"mode":"once","date":"2026-05-01","time":"09:00"}`,
+		OnceFireAt:       &now,
+	}); err != nil {
+		t.Fatalf("seed once reminder: %v", err)
+	}
+
+	mgr := NewManager(store)
+	runCount := 0
+	mgr.SetRunner(func(ctx context.Context, transport, sessionKey, prompt string) (RunResult, error) {
+		runCount++
+		return RunResult{Output: "done"}, nil
+	})
+
+	mgr.runJob("once-reminder")
+	if runCount != 1 {
+		t.Fatalf("expected one run, got %d", runCount)
+	}
+	updated, ok, err := store.GetReminderJob(context.Background(), "once-reminder")
+	if err != nil || !ok {
+		t.Fatalf("GetReminderJob() failed: ok=%t err=%v", ok, err)
+	}
+	if updated.Active {
+		t.Fatalf("expected once reminder to be deactivated after run")
+	}
+	if updated.NextRunAt != nil {
+		t.Fatalf("expected once reminder next_run_at to be cleared")
+	}
+
+	mgr.runJob("once-reminder")
+	if runCount != 1 {
+		t.Fatalf("expected inactive once reminder to not run again, got runCount=%d", runCount)
+	}
+}
+
+func TestStartRunsStartupCatchUpForDueReminders(t *testing.T) {
+	store, err := db.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer store.Close()
+
+	now := time.Now().In(util.PacificLocation())
+	past := now.Add(-15 * time.Minute)
+	if err := store.UpsertReminderJob(context.Background(), db.ReminderJob{
+		ID:               "due-reminder",
+		Schedule:         "0 9 * * *",
+		Prompt:           "due on launch",
+		Transport:        "telegram",
+		SessionKey:       "8750063231",
+		Active:           true,
+		AutoPrefetch:     false,
+		ReminderMode:     "legacy_cron",
+		ReminderSpecJSON: `{"schedule":"0 9 * * *"}`,
+		NextRunAt:        &past,
+	}); err != nil {
+		t.Fatalf("seed due reminder: %v", err)
+	}
+
+	mgr := NewManager(store)
+	ran := make(chan struct{}, 1)
+	mgr.SetRunner(func(ctx context.Context, transport, sessionKey, prompt string) (RunResult, error) {
+		select {
+		case ran <- struct{}{}:
+		default:
+		}
+		return RunResult{Output: "ok"}, nil
+	})
+	if err := mgr.Start(context.Background()); err != nil {
+		t.Fatalf("Start() error: %v", err)
+	}
+	defer mgr.Stop()
+
+	select {
+	case <-ran:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("expected startup catch-up run for due reminder")
 	}
 }

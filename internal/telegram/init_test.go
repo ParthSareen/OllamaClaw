@@ -122,7 +122,7 @@ func TestBotCommandDefinitionsIncludesCoreCommands(t *testing.T) {
 	for _, c := range cmds {
 		got[c["command"]] = true
 	}
-	for _, want := range []string{"start", "help", "cron", "show", "status", "stop", "restart"} {
+	for _, want := range []string{"start", "help", "reminder", "show", "status", "fullsystem", "stop", "restart"} {
 		if !got[want] {
 			t.Fatalf("expected command %q to be present", want)
 		}

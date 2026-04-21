@@ -14,7 +14,6 @@ const (
 	defaultConfigFile    = "config.json"
 	defaultStateDBFile   = "state.db"
 	defaultLogFile       = "ollamaclaw.log"
-	defaultLockFile      = "plugins.lock.json"
 	defaultPromptFile    = "system_prompt.txt"
 	defaultPromptOverlay = "system_prompt.overlay.md"
 	defaultPromptHistory = "system_prompt.overlay.history.jsonl"
@@ -23,17 +22,16 @@ const (
 
 // Config stores runtime settings for OllamaClaw.
 type Config struct {
-	OllamaHost           string         `json:"ollama_host"`
-	DefaultModel         string         `json:"default_model"`
-	DBPath               string         `json:"db_path"`
-	LogPath              string         `json:"log_path"`
-	CompactionThreshold  float64        `json:"compaction_threshold"`
-	KeepRecentTurns      int            `json:"keep_recent_turns"`
-	ContextWindowTokens  int            `json:"context_window_tokens"`
-	ToolOutputMaxBytes   int            `json:"tool_output_max_bytes"`
-	BashTimeoutSeconds   int            `json:"bash_timeout_seconds"`
-	PluginCallTimeoutSec int            `json:"plugin_call_timeout_sec"`
-	Telegram             TelegramConfig `json:"telegram"`
+	OllamaHost          string         `json:"ollama_host"`
+	DefaultModel        string         `json:"default_model"`
+	DBPath              string         `json:"db_path"`
+	LogPath             string         `json:"log_path"`
+	CompactionThreshold float64        `json:"compaction_threshold"`
+	KeepRecentTurns     int            `json:"keep_recent_turns"`
+	ContextWindowTokens int            `json:"context_window_tokens"`
+	ToolOutputMaxBytes  int            `json:"tool_output_max_bytes"`
+	BashTimeoutSeconds  int            `json:"bash_timeout_seconds"`
+	Telegram            TelegramConfig `json:"telegram"`
 }
 
 type TelegramConfig struct {
@@ -46,17 +44,16 @@ func Default() Config {
 	home, _ := os.UserHomeDir()
 	base := filepath.Join(home, defaultConfigDirName)
 	return Config{
-		OllamaHost:           "http://localhost:11434",
-		DefaultModel:         "kimi-k2.5:cloud",
-		DBPath:               filepath.Join(base, defaultStateDBFile),
-		LogPath:              filepath.Join(base, defaultLogFile),
-		CompactionThreshold:  0.8,
-		KeepRecentTurns:      8,
-		ContextWindowTokens:  252000,
-		ToolOutputMaxBytes:   16 * 1024,
-		BashTimeoutSeconds:   120,
-		PluginCallTimeoutSec: 60,
-		Telegram:             TelegramConfig{},
+		OllamaHost:          "http://localhost:11434",
+		DefaultModel:        "kimi-k2.5:cloud",
+		DBPath:              filepath.Join(base, defaultStateDBFile),
+		LogPath:             filepath.Join(base, defaultLogFile),
+		CompactionThreshold: 0.8,
+		KeepRecentTurns:     8,
+		ContextWindowTokens: 252000,
+		ToolOutputMaxBytes:  16 * 1024,
+		BashTimeoutSeconds:  120,
+		Telegram:            TelegramConfig{},
 	}
 }
 
@@ -74,22 +71,6 @@ func ConfigPath() (string, error) {
 		return "", err
 	}
 	return filepath.Join(dir, defaultConfigFile), nil
-}
-
-func PluginsLockPath() (string, error) {
-	dir, err := ConfigDir()
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(dir, defaultLockFile), nil
-}
-
-func PluginsDir() (string, error) {
-	dir, err := ConfigDir()
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(dir, "plugins"), nil
 }
 
 func SystemPromptPath() (string, error) {
@@ -174,9 +155,6 @@ func sanitize(cfg *Config) {
 	}
 	if cfg.BashTimeoutSeconds <= 0 {
 		cfg.BashTimeoutSeconds = defaults.BashTimeoutSeconds
-	}
-	if cfg.PluginCallTimeoutSec <= 0 {
-		cfg.PluginCallTimeoutSec = defaults.PluginCallTimeoutSec
 	}
 }
 

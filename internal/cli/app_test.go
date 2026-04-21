@@ -243,3 +243,34 @@ func TestRuntimeBuildLabel(t *testing.T) {
 		t.Fatalf("expected fallback build label 0.1.6, got %q", got)
 	}
 }
+
+func TestAppendCompactionNoticeNoCompaction(t *testing.T) {
+	cfg := config.Default()
+	got := appendCompactionNotice("done", false, 100, cfg)
+	if got != "done" {
+		t.Fatalf("expected output unchanged when not compacted, got %q", got)
+	}
+}
+
+func TestAppendCompactionNoticeAddsPrefix(t *testing.T) {
+	cfg := config.Default()
+	cfg.ContextWindowTokens = 252000
+	cfg.CompactionThreshold = 0.8
+	cfg.KeepRecentTurns = 8
+	got := appendCompactionNotice("final output", true, 205000, cfg)
+	if !strings.Contains(got, "context compacted in background:") {
+		t.Fatalf("expected compaction notice prefix, got %q", got)
+	}
+	if !strings.Contains(got, "prompt_tokens=205000") {
+		t.Fatalf("expected prompt token count in notice, got %q", got)
+	}
+	if !strings.Contains(got, "threshold_tokens=201600") {
+		t.Fatalf("expected threshold token count in notice, got %q", got)
+	}
+	if !strings.Contains(got, "keep_recent_turns=8") {
+		t.Fatalf("expected keep recent turns in notice, got %q", got)
+	}
+	if !strings.Contains(got, "\n\nfinal output") {
+		t.Fatalf("expected original output appended after notice, got %q", got)
+	}
+}

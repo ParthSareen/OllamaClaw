@@ -224,11 +224,11 @@ func (r *Runner) Run(ctx context.Context) error {
 		r.logf("telegram commands synced")
 	}
 	if r.Scheduler != nil {
-		jobs, err := r.Scheduler.ListJobs(ctx, true)
+		reminders, err := r.Scheduler.ListReminders(ctx, true)
 		if err != nil {
-			r.logf("cron preload list failed: %v", err)
+			r.logf("reminder preload list failed: %v", err)
 		} else {
-			r.logf("cron active jobs loaded: %d", len(jobs))
+			r.logf("active reminders loaded: %d", len(reminders))
 		}
 		r.Scheduler.SetOutputSink(func(ctx context.Context, transport, sessionKey, content string) error {
 			if transport != "telegram" {
@@ -236,20 +236,20 @@ func (r *Runner) Run(ctx context.Context) error {
 			}
 			chatID, err := strconv.ParseInt(sessionKey, 10, 64)
 			if err != nil {
-				r.logf("cron output drop: invalid session_key=%q error=%v", sessionKey, r.redactError(err))
+				r.logf("reminder output drop: invalid session_key=%q error=%v", sessionKey, r.redactError(err))
 				return err
 			}
-			r.logf("cron output -> chat=%d bytes=%d preview=%q", chatID, len(content), r.previewForLog(content))
+			r.logf("reminder output -> chat=%d bytes=%d preview=%q", chatID, len(content), r.previewForLog(content))
 			r.sendChunked(ctx, b, chatID, nil, content)
 			return nil
 		})
 		if err := r.Scheduler.Start(runCtx); err != nil {
-			r.logf("cron scheduler start failed: %v", err)
+			r.logf("reminder scheduler start failed: %v", err)
 			return err
 		}
-		r.logf("cron scheduler started")
+		r.logf("reminder scheduler started")
 		defer r.Scheduler.Stop()
-		defer r.logf("cron scheduler stopped")
+		defer r.logf("reminder scheduler stopped")
 	}
 	r.logf("telegram bot running")
 	b.Start(runCtx)
@@ -681,10 +681,10 @@ func (r *Runner) handleCommand(ctx context.Context, b *bot.Bot, chatID int64, ra
 	case "start":
 		r.logf("command start: chat=%d", chatID)
 		r.resyncCommandsBestEffort("start")
-		send("OllamaClaw is ready.\nCommands:\n/start\n/help\n/model [name]\n/tools\n/cron list [active|all]\n/cron safe <id>\n/cron unsafe <id>\n/cron prefetch list <id>\n/show tools [on|off]\n/show thinking [on|off]\n/show dreaming [on|off]\n/verbose [on|off]\n/think [on|off|low|medium|high|default]\n/status\n/fullsystem\n/reset\n/stop\n/restart")
+		send("OllamaClaw is ready.\nCommands:\n/start\n/help\n/model [name]\n/tools\n/reminder list [active|all]\n/reminder safe <id>\n/reminder unsafe <id>\n/reminder prefetch list <id>\n/show tools [on|off]\n/show thinking [on|off]\n/show dreaming [on|off]\n/verbose [on|off]\n/think [on|off|low|medium|high|default]\n/status\n/fullsystem\n/reset\n/stop\n/restart")
 	case "help":
 		r.logf("command help: chat=%d", chatID)
-		send("Commands:\n/start\n/help\n/model [name]\n/tools\n/cron list [active|all]\n/cron safe <id>\n/cron unsafe <id>\n/cron prefetch list <id>\n/show tools [on|off]\n/show thinking [on|off]\n/show dreaming [on|off]\n/verbose [on|off]\n/think [on|off|low|medium|high|default]\n/status\n/fullsystem\n/reset\n/stop\n/restart\n\nSend any text to chat with OllamaClaw.")
+		send("Commands:\n/start\n/help\n/model [name]\n/tools\n/reminder list [active|all]\n/reminder safe <id>\n/reminder unsafe <id>\n/reminder prefetch list <id>\n/show tools [on|off]\n/show thinking [on|off]\n/show dreaming [on|off]\n/verbose [on|off]\n/think [on|off|low|medium|high|default]\n/status\n/fullsystem\n/reset\n/stop\n/restart\n\nSend any text to chat with OllamaClaw.")
 	case "reset":
 		r.logf("command reset: chat=%d", chatID)
 		newSess, err := r.Engine.ResetSession(ctx, "telegram", sessionKey)
@@ -851,14 +851,14 @@ func (r *Runner) handleCommand(ctx context.Context, b *bot.Bot, chatID int64, ra
 		}
 		r.logf("command think set: chat=%d value=%s", chatID, value)
 		send(fmt.Sprintf("think: %s", value))
-	case "cron":
-		r.logf("command cron: chat=%d args=%q", chatID, r.previewForLog(strings.Join(parts[1:], " ")))
+	case "reminder":
+		r.logf("command reminder: chat=%d args=%q", chatID, r.previewForLog(strings.Join(parts[1:], " ")))
 		if r.Scheduler == nil {
-			send("cron scheduler is unavailable")
+			send("reminder scheduler is unavailable")
 			return
 		}
 		if len(parts) < 2 {
-			send("usage: /cron <list|safe|unsafe|prefetch>")
+			send("usage: /reminder <list|safe|unsafe|prefetch>")
 			return
 		}
 		action := strings.ToLower(strings.TrimSpace(parts[1]))
@@ -873,13 +873,13 @@ func (r *Runner) handleCommand(ctx context.Context, b *bot.Bot, chatID int64, ra
 				case "active", "":
 					activeOnly = true
 				default:
-					send("usage: /cron list [active|all]")
+					send("usage: /reminder list [active|all]")
 					return
 				}
 			}
-			jobs, err := r.Scheduler.ListJobs(ctx, activeOnly)
+			jobs, err := r.Scheduler.ListReminders(ctx, activeOnly)
 			if err != nil {
-				r.logf("command cron list failed: chat=%d error=%v", chatID, r.redactError(err))
+				r.logf("command reminder list failed: chat=%d error=%v", chatID, r.redactError(err))
 				sendErr(err)
 				return
 			}
@@ -888,11 +888,11 @@ func (r *Runner) handleCommand(ctx context.Context, b *bot.Bot, chatID int64, ra
 				scopeLabel = "all"
 			}
 			if len(jobs) == 0 {
-				send(fmt.Sprintf("cron jobs (%s): none", scopeLabel))
+				send(fmt.Sprintf("reminders (%s): none", scopeLabel))
 				return
 			}
 			lines := make([]string, 0, len(jobs)+1)
-			lines = append(lines, fmt.Sprintf("cron jobs (%s, timezone=%s):", scopeLabel, util.PacificTimezoneName))
+			lines = append(lines, fmt.Sprintf("reminders (%s, timezone=%s):", scopeLabel, util.PacificTimezoneName))
 			for _, job := range jobs {
 				nextRun := "-"
 				if strings.TrimSpace(job.NextRunAt) != "" {
@@ -904,61 +904,61 @@ func (r *Runner) handleCommand(ctx context.Context, b *bot.Bot, chatID int64, ra
 				} else {
 					lastErr = truncateForLive(lastErr)
 				}
-				lines = append(lines, fmt.Sprintf("- %s safe=%t auto_prefetch=%t active=%t schedule=%q next=%s err=%s", job.ID, job.Safe, job.AutoPrefetch, job.Active, job.Schedule, nextRun, lastErr))
+				lines = append(lines, fmt.Sprintf("- %s mode=%s safe=%t auto_prefetch=%t active=%t schedule=%q next=%s err=%s", job.ID, job.Mode, job.Safe, job.AutoPrefetch, job.Active, job.CompiledSchedule, nextRun, lastErr))
 			}
 			r.sendChunked(ctx, b, chatID, nil, strings.Join(lines, "\n"))
 		case "safe", "unsafe":
 			if len(parts) < 3 {
-				send(fmt.Sprintf("usage: /cron %s <id>", action))
+				send(fmt.Sprintf("usage: /reminder %s <id>", action))
 				return
 			}
 			id := strings.TrimSpace(parts[2])
 			if id == "" {
-				send(fmt.Sprintf("usage: /cron %s <id>", action))
+				send(fmt.Sprintf("usage: /reminder %s <id>", action))
 				return
 			}
 			safe := action == "safe"
-			info, err := r.Scheduler.SetJobSafe(ctx, id, safe)
+			info, err := r.Scheduler.SetReminderSafe(ctx, id, safe)
 			if err != nil {
-				r.logf("command cron %s failed: chat=%d id=%s error=%v", action, chatID, id, r.redactError(err))
+				r.logf("command reminder %s failed: chat=%d id=%s error=%v", action, chatID, id, r.redactError(err))
 				sendErr(err)
 				return
 			}
-			r.logf("command cron %s set: chat=%d id=%s safe=%t", action, chatID, id, safe)
-			send(fmt.Sprintf("cron %s: %s (safe=%t)", action, info.ID, info.Safe))
+			r.logf("command reminder %s set: chat=%d id=%s safe=%t", action, chatID, id, safe)
+			send(fmt.Sprintf("reminder %s: %s (safe=%t)", action, info.ID, info.Safe))
 		case "prefetch":
 			if len(parts) < 4 {
-				send("usage: /cron prefetch list <id>")
+				send("usage: /reminder prefetch list <id>")
 				return
 			}
 			prefetchAction := strings.ToLower(strings.TrimSpace(parts[2]))
 			if prefetchAction != "list" {
-				send("usage: /cron prefetch list <id>")
+				send("usage: /reminder prefetch list <id>")
 				return
 			}
 			id := strings.TrimSpace(parts[3])
 			if id == "" {
-				send("usage: /cron prefetch list <id>")
+				send("usage: /reminder prefetch list <id>")
 				return
 			}
-			commands, err := r.Scheduler.ListJobPrefetchCommands(ctx, id)
+			commands, err := r.Scheduler.ListReminderPrefetchCommands(ctx, id)
 			if err != nil {
-				r.logf("command cron prefetch list failed: chat=%d id=%s error=%v", chatID, id, r.redactError(err))
+				r.logf("command reminder prefetch list failed: chat=%d id=%s error=%v", chatID, id, r.redactError(err))
 				sendErr(err)
 				return
 			}
 			if len(commands) == 0 {
-				send(fmt.Sprintf("cron prefetch %s: none", id))
+				send(fmt.Sprintf("reminder prefetch %s: none", id))
 				return
 			}
 			lines := make([]string, 0, len(commands)+1)
-			lines = append(lines, fmt.Sprintf("cron prefetch %s:", id))
+			lines = append(lines, fmt.Sprintf("reminder prefetch %s:", id))
 			for _, command := range commands {
 				lines = append(lines, "- "+command)
 			}
 			r.sendChunked(ctx, b, chatID, nil, strings.Join(lines, "\n"))
 		default:
-			send("usage: /cron <list|safe|unsafe|prefetch>")
+			send("usage: /reminder <list|safe|unsafe|prefetch>")
 		}
 	case "status":
 		r.logf("command status: chat=%d", chatID)

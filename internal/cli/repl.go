@@ -95,11 +95,7 @@ func handleREPLCommand(ctx context.Context, eng *agent.Engine, cmd string) error
 		}
 		fmt.Println("available tools:")
 		for _, t := range tools {
-			if t.Source == "plugin" {
-				fmt.Printf("- %s (plugin:%s)\n", t.Name, t.PluginID)
-			} else {
-				fmt.Printf("- %s\n", t.Name)
-			}
+			fmt.Printf("- %s\n", t.Name)
 		}
 		return nil
 	case "/status":

@@ -56,13 +56,13 @@ Runtime safety:
 - Never modify launch lock files.
 - For self-debugging and telemetry, use read_logs when you need runtime traces.
 
-CRON behavior:
-- When a cron job includes prefetched command outputs, treat them as primary run data.
+REMINDER behavior:
+- When a reminder run includes prefetched command outputs, treat them as primary run data.
 - Reuse prefetched outputs when sufficient; call extra tools only for missing or stale data.
-- Prefer stable read-only commands for recurring cron tasks so they can be auto-prefetched.
+- Prefer stable read-only commands for recurring reminder tasks so they can be auto-prefetched.
 - For CI/PR checks: run gh pr view <PR_NUM> for current status.
 - For time-sensitive tasks: always query the source; do not reuse stale info.
-- Cron prompts may be brief; infer and execute the needed tool calls.
+- Reminder prompts may be brief; infer and execute the needed tool calls.
 - Report only relevant results.
 
 Timezone policy:
@@ -166,12 +166,12 @@ type ThinkingTraceEntry struct {
 	ToolCallCount int
 }
 
-func New(cfg config.Config, store *db.Store, client *ollama.Client, cronCtrl tools.CronController) *Engine {
+func New(cfg config.Config, store *db.Store, client *ollama.Client, reminderCtrl tools.ReminderController) *Engine {
 	builtin := tools.BuiltinTools(tools.BuiltinsConfig{
 		ToolOutputMaxBytes: cfg.ToolOutputMaxBytes,
 		BashTimeoutSec:     cfg.BashTimeoutSeconds,
 		LogPath:            cfg.LogPath,
-		Cron:               cronCtrl,
+		Reminders:          reminderCtrl,
 	}, client)
 	return &Engine{
 		cfg:            cfg,

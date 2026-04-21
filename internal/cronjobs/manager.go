@@ -22,14 +22,15 @@ import (
 type RunResult struct {
 	Output       string
 	BashCommands []string
+	Compacted    bool
 }
 
 type RunnerFunc func(ctx context.Context, transport, sessionKey, prompt string) (RunResult, error)
 type OutputSinkFunc func(ctx context.Context, transport, sessionKey, content string) error
 
-type safeCronBashApprover struct{}
+type safeReminderBashApprover struct{}
 
-func (safeCronBashApprover) ApproveBashCommand(context.Context, tools.BashApprovalRequest) error {
+func (safeReminderBashApprover) ApproveBashCommand(context.Context, tools.BashApprovalRequest) error {
 	return nil
 }
 
@@ -96,16 +97,24 @@ func (m *Manager) Start(ctx context.Context) error {
 	m.started = true
 	m.mu.Unlock()
 
-	jobs, err := m.store.ListCronJobs(ctx, true)
+	reminders, err := m.store.ListReminderJobs(ctx, true)
 	if err != nil {
 		return err
 	}
-	for _, j := range jobs {
-		if err := m.scheduleLocked(ctx, j); err != nil {
-			_ = m.store.UpdateCronRun(ctx, j.ID, nil, nil, "schedule error: "+err.Error())
+	nowPacific := time.Now().In(util.PacificLocation())
+	dueOnStartup := make([]string, 0, len(reminders))
+	for _, r := range reminders {
+		if r.NextRunAt != nil && !r.NextRunAt.After(nowPacific) {
+			dueOnStartup = append(dueOnStartup, r.ID)
+		}
+		if err := m.scheduleLocked(ctx, r); err != nil {
+			_ = m.store.UpdateReminderRun(ctx, r.ID, nil, nil, "schedule error: "+err.Error())
 		}
 	}
 	m.c.Start()
+	if len(dueOnStartup) > 0 {
+		go m.runStartupCatchUp(dueOnStartup)
+	}
 	return nil
 }
 
@@ -121,20 +130,23 @@ func (m *Manager) Stop() {
 	<-ctx.Done()
 }
 
-func (m *Manager) AddJob(ctx context.Context, spec tools.CronJobSpec) (tools.CronJobInfo, error) {
+func (m *Manager) AddReminder(ctx context.Context, spec tools.ReminderSpec) (tools.ReminderInfo, error) {
 	id := strings.TrimSpace(spec.ID)
 	if id == "" {
-		id = fmt.Sprintf("job-%d", time.Now().UTC().UnixNano())
+		id = fmt.Sprintf("reminder-%d", time.Now().UTC().UnixNano())
 	}
-	schedule := strings.TrimSpace(spec.Schedule)
 	prompt := strings.TrimSpace(spec.Prompt)
 	transport := strings.TrimSpace(spec.Transport)
 	sessionKey := strings.TrimSpace(spec.SessionKey)
-	if schedule == "" || prompt == "" || transport == "" || sessionKey == "" {
-		return tools.CronJobInfo{}, fmt.Errorf("id(optional), schedule, prompt, transport, and session_key are required")
+	if prompt == "" || transport == "" || sessionKey == "" {
+		return tools.ReminderInfo{}, fmt.Errorf("id(optional), prompt, transport, and session_key are required")
 	}
-	if _, err := parseSchedulePacific(m.parser, schedule); err != nil {
-		return tools.CronJobInfo{}, fmt.Errorf("invalid cron schedule: %w", err)
+	compiled, err := CompileReminderSpecPacific(spec, time.Now())
+	if err != nil {
+		return tools.ReminderInfo{}, err
+	}
+	if _, err := parseSchedulePacific(m.parser, compiled.CompiledSchedule); err != nil {
+		return tools.ReminderInfo{}, fmt.Errorf("compiled reminder schedule is invalid: %w", err)
 	}
 
 	now := time.Now().UTC()
@@ -142,45 +154,48 @@ func (m *Manager) AddJob(ctx context.Context, spec tools.CronJobSpec) (tools.Cro
 	if spec.AutoPrefetch != nil {
 		autoPrefetch = *spec.AutoPrefetch
 	}
-	job := db.CronJob{
-		ID:           id,
-		Schedule:     schedule,
-		Prompt:       prompt,
-		Transport:    transport,
-		SessionKey:   sessionKey,
-		Active:       true,
-		Safe:         spec.Safe,
-		AutoPrefetch: autoPrefetch,
-		CreatedAt:    now,
-		UpdatedAt:    now,
+	job := db.ReminderJob{
+		ID:               id,
+		Schedule:         compiled.CompiledSchedule,
+		Prompt:           prompt,
+		Transport:        transport,
+		SessionKey:       sessionKey,
+		Active:           true,
+		Safe:             spec.Safe,
+		AutoPrefetch:     autoPrefetch,
+		ReminderMode:     compiled.Mode,
+		ReminderSpecJSON: compiled.NormalizedSpecJSON,
+		OnceFireAt:       compiled.OnceFireAt,
+		CreatedAt:        now,
+		UpdatedAt:        now,
 	}
-	if err := m.store.UpsertCronJob(ctx, job); err != nil {
-		return tools.CronJobInfo{}, err
+	if err := m.store.UpsertReminderJob(ctx, job); err != nil {
+		return tools.ReminderInfo{}, err
 	}
 	if err := m.scheduleLocked(ctx, job); err != nil {
-		return tools.CronJobInfo{}, err
+		return tools.ReminderInfo{}, err
 	}
-	stored, _, err := m.store.GetCronJob(ctx, id)
+	stored, _, err := m.store.GetReminderJob(ctx, id)
 	if err != nil {
-		return tools.CronJobInfo{}, err
+		return tools.ReminderInfo{}, err
 	}
 	return toToolInfo(stored), nil
 }
 
-func (m *Manager) ListJobs(ctx context.Context, activeOnly bool) ([]tools.CronJobInfo, error) {
-	jobs, err := m.store.ListCronJobs(ctx, activeOnly)
+func (m *Manager) ListReminders(ctx context.Context, activeOnly bool) ([]tools.ReminderInfo, error) {
+	reminders, err := m.store.ListReminderJobs(ctx, activeOnly)
 	if err != nil {
 		return nil, err
 	}
-	sort.Slice(jobs, func(i, j int) bool { return jobs[i].ID < jobs[j].ID })
-	out := make([]tools.CronJobInfo, 0, len(jobs))
-	for _, j := range jobs {
+	sort.Slice(reminders, func(i, j int) bool { return reminders[i].ID < reminders[j].ID })
+	out := make([]tools.ReminderInfo, 0, len(reminders))
+	for _, j := range reminders {
 		out = append(out, toToolInfo(j))
 	}
 	return out, nil
 }
 
-func (m *Manager) RemoveJob(ctx context.Context, id string) error {
+func (m *Manager) RemoveReminder(ctx context.Context, id string) error {
 	id = strings.TrimSpace(id)
 	if id == "" {
 		return fmt.Errorf("id is required")
@@ -191,51 +206,51 @@ func (m *Manager) RemoveJob(ctx context.Context, id string) error {
 		delete(m.entries, id)
 	}
 	m.mu.Unlock()
-	return m.store.DeleteCronJob(ctx, id)
+	return m.store.DeleteReminderJob(ctx, id)
 }
 
-func (m *Manager) SetJobSafe(ctx context.Context, id string, safe bool) (tools.CronJobInfo, error) {
+func (m *Manager) SetReminderSafe(ctx context.Context, id string, safe bool) (tools.ReminderInfo, error) {
 	id = strings.TrimSpace(id)
 	if id == "" {
-		return tools.CronJobInfo{}, fmt.Errorf("id is required")
+		return tools.ReminderInfo{}, fmt.Errorf("id is required")
 	}
-	job, ok, err := m.store.GetCronJob(ctx, id)
+	job, ok, err := m.store.GetReminderJob(ctx, id)
 	if err != nil {
-		return tools.CronJobInfo{}, err
+		return tools.ReminderInfo{}, err
 	}
 	if !ok {
-		return tools.CronJobInfo{}, fmt.Errorf("cron job %s not found", id)
+		return tools.ReminderInfo{}, fmt.Errorf("reminder %s not found", id)
 	}
 	job.Safe = safe
-	if err := m.store.UpsertCronJob(ctx, job); err != nil {
-		return tools.CronJobInfo{}, err
+	if err := m.store.UpsertReminderJob(ctx, job); err != nil {
+		return tools.ReminderInfo{}, err
 	}
-	updated, ok, err := m.store.GetCronJob(ctx, id)
+	updated, ok, err := m.store.GetReminderJob(ctx, id)
 	if err != nil {
-		return tools.CronJobInfo{}, err
+		return tools.ReminderInfo{}, err
 	}
 	if !ok {
-		return tools.CronJobInfo{}, fmt.Errorf("cron job %s not found after update", id)
+		return tools.ReminderInfo{}, fmt.Errorf("reminder %s not found after update", id)
 	}
 	return toToolInfo(updated), nil
 }
 
-func (m *Manager) ListJobPrefetchCommands(ctx context.Context, id string) ([]string, error) {
+func (m *Manager) ListReminderPrefetchCommands(ctx context.Context, id string) ([]string, error) {
 	id = strings.TrimSpace(id)
 	if id == "" {
 		return nil, fmt.Errorf("id is required")
 	}
-	_, ok, err := m.store.GetCronJob(ctx, id)
+	_, ok, err := m.store.GetReminderJob(ctx, id)
 	if err != nil {
 		return nil, err
 	}
 	if !ok {
-		return nil, fmt.Errorf("cron job %s not found", id)
+		return nil, fmt.Errorf("reminder %s not found", id)
 	}
-	return m.store.ListCronPrefetchCommands(ctx, id)
+	return m.store.ListReminderPrefetchCommands(ctx, id)
 }
 
-func (m *Manager) scheduleLocked(ctx context.Context, job db.CronJob) error {
+func (m *Manager) scheduleLocked(ctx context.Context, job db.ReminderJob) error {
 	schedule, err := parseSchedulePacific(m.parser, job.Schedule)
 	if err != nil {
 		return err
@@ -243,7 +258,7 @@ func (m *Manager) scheduleLocked(ctx context.Context, job db.CronJob) error {
 	nowPacific := time.Now().In(util.PacificLocation())
 	next := schedule.Next(nowPacific)
 	job.NextRunAt = &next
-	if err := m.store.UpsertCronJob(ctx, job); err != nil {
+	if err := m.store.UpsertReminderJob(ctx, job); err != nil {
 		return err
 	}
 
@@ -267,7 +282,7 @@ func (m *Manager) scheduleLocked(ctx context.Context, job db.CronJob) error {
 
 func (m *Manager) runJob(jobID string) {
 	baseCtx := context.Background()
-	job, ok, err := m.store.GetCronJob(baseCtx, jobID)
+	job, ok, err := m.store.GetReminderJob(baseCtx, jobID)
 	if err != nil || !ok || !job.Active {
 		return
 	}
@@ -277,16 +292,16 @@ func (m *Manager) runJob(jobID string) {
 	sink := m.sink
 	m.mu.Unlock()
 	if runner == nil {
-		_ = m.store.UpdateCronRun(baseCtx, job.ID, nil, job.NextRunAt, "no runner configured")
+		_ = m.store.UpdateReminderRun(baseCtx, job.ID, nil, job.NextRunAt, "no runner configured")
 		return
 	}
 
 	now := time.Now().In(util.PacificLocation())
 	runCtx := baseCtx
 	if job.Safe {
-		runCtx = tools.WithBashApprover(runCtx, safeCronBashApprover{})
+		runCtx = tools.WithBashApprover(runCtx, safeReminderBashApprover{})
 	}
-	prefetchCommands, prefetchErr := m.store.ListCronPrefetchCommands(baseCtx, job.ID)
+	prefetchCommands, prefetchErr := m.store.ListReminderPrefetchCommands(baseCtx, job.ID)
 	if prefetchErr != nil {
 		prefetchCommands = nil
 	}
@@ -307,16 +322,55 @@ func (m *Manager) runJob(jobID string) {
 		n := spec.Next(now)
 		next = &n
 	}
+	isOnce := strings.EqualFold(strings.TrimSpace(job.ReminderMode), "once")
 	if runErr != nil {
-		_ = m.store.UpdateCronRun(baseCtx, job.ID, &now, next, runErr.Error())
+		if isOnce {
+			next = nil
+		}
+		_ = m.store.UpdateReminderRun(baseCtx, job.ID, &now, next, runErr.Error())
+		if isOnce {
+			_ = m.store.SetReminderActive(baseCtx, job.ID, false)
+			m.unschedule(job.ID)
+		}
 		return
 	}
 	if job.AutoPrefetch {
 		m.learnPrefetchCommands(baseCtx, job.ID, res.BashCommands)
 	}
-	_ = m.store.UpdateCronRun(baseCtx, job.ID, &now, next, "")
+	if isOnce {
+		next = nil
+	}
+	_ = m.store.UpdateReminderRun(baseCtx, job.ID, &now, next, "")
+	if isOnce {
+		_ = m.store.SetReminderActive(baseCtx, job.ID, false)
+		m.unschedule(job.ID)
+	}
 	if sink != nil && strings.TrimSpace(res.Output) != "" {
 		_ = sink(baseCtx, job.Transport, job.SessionKey, res.Output)
+	}
+}
+
+func (m *Manager) runStartupCatchUp(ids []string) {
+	seen := map[string]struct{}{}
+	for _, id := range ids {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		m.runJob(id)
+	}
+}
+
+func (m *Manager) unschedule(id string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if eid, ok := m.entries[id]; ok {
+		m.c.Remove(eid)
+		delete(m.entries, id)
 	}
 }
 
@@ -340,17 +394,33 @@ func scheduleSpecPacific(schedule string) (string, error) {
 	return fmt.Sprintf("CRON_TZ=%s %s", util.PacificTimezoneName, spec), nil
 }
 
-func toToolInfo(j db.CronJob) tools.CronJobInfo {
-	info := tools.CronJobInfo{
-		ID:           j.ID,
-		Schedule:     j.Schedule,
-		Prompt:       j.Prompt,
-		Transport:    j.Transport,
-		SessionKey:   j.SessionKey,
-		Active:       j.Active,
-		Safe:         j.Safe,
-		AutoPrefetch: j.AutoPrefetch,
-		LastError:    j.LastError,
+func toToolInfo(j db.ReminderJob) tools.ReminderInfo {
+	mode := strings.TrimSpace(j.ReminderMode)
+	if mode == "" {
+		mode = "legacy_cron"
+	}
+	spec := map[string]interface{}{}
+	if strings.TrimSpace(j.ReminderSpecJSON) != "" {
+		_ = json.Unmarshal([]byte(j.ReminderSpecJSON), &spec)
+	}
+	if len(spec) == 0 && mode == "legacy_cron" {
+		spec["schedule"] = j.Schedule
+	}
+	info := tools.ReminderInfo{
+		ID:               j.ID,
+		Mode:             mode,
+		CompiledSchedule: j.Schedule,
+		Prompt:           j.Prompt,
+		Transport:        j.Transport,
+		SessionKey:       j.SessionKey,
+		Active:           j.Active,
+		Safe:             j.Safe,
+		AutoPrefetch:     j.AutoPrefetch,
+		Spec:             spec,
+		LastError:        j.LastError,
+	}
+	if j.OnceFireAt != nil {
+		info.OnceFireAt = util.FormatPacificRFC3339(*j.OnceFireAt)
 	}
 	if j.LastRunAt != nil {
 		info.LastRunAt = util.FormatPacificRFC3339(*j.LastRunAt)
@@ -408,7 +478,7 @@ func (m *Manager) learnPrefetchCommands(ctx context.Context, jobID string, comma
 	if len(commands) == 0 {
 		return
 	}
-	existing, err := m.store.ListCronPrefetchCommands(ctx, jobID)
+	existing, err := m.store.ListReminderPrefetchCommands(ctx, jobID)
 	if err != nil {
 		return
 	}
@@ -437,7 +507,7 @@ func (m *Manager) learnPrefetchCommands(ctx context.Context, jobID string, comma
 	if len(additions) == 0 {
 		return
 	}
-	_ = m.store.UpsertCronPrefetchCommands(ctx, jobID, additions)
+	_ = m.store.UpsertReminderPrefetchCommands(ctx, jobID, additions)
 }
 
 func normalizeCronCommand(command string) string {

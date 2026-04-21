@@ -26,45 +26,55 @@ type Tool struct {
 	Schema      json.RawMessage
 	Execute     Executor
 	Source      string
-	PluginID    string
 	TimeoutSec  int
 }
 
-type CronJobSpec struct {
+type ReminderSpec struct {
 	ID           string
-	Schedule     string
 	Prompt       string
 	Transport    string
 	SessionKey   string
 	Safe         bool
 	AutoPrefetch *bool
+
+	Mode         string
+	Date         string
+	Time         string
+	IntervalUnit string
+	Interval     int
+	Minute       *int
+	Days         []string
+	DayOfMonth   int
 }
 
-type CronJobInfo struct {
-	ID           string `json:"id"`
-	Schedule     string `json:"schedule"`
-	Prompt       string `json:"prompt"`
-	Transport    string `json:"transport"`
-	SessionKey   string `json:"session_key"`
-	Active       bool   `json:"active"`
-	Safe         bool   `json:"safe"`
-	AutoPrefetch bool   `json:"auto_prefetch"`
-	LastRunAt    string `json:"last_run_at,omitempty"`
-	NextRunAt    string `json:"next_run_at,omitempty"`
-	LastError    string `json:"last_error,omitempty"`
+type ReminderInfo struct {
+	ID               string                 `json:"id"`
+	Mode             string                 `json:"mode"`
+	CompiledSchedule string                 `json:"compiled_schedule"`
+	Prompt           string                 `json:"prompt"`
+	Transport        string                 `json:"transport"`
+	SessionKey       string                 `json:"session_key"`
+	Active           bool                   `json:"active"`
+	Safe             bool                   `json:"safe"`
+	AutoPrefetch     bool                   `json:"auto_prefetch"`
+	Spec             map[string]interface{} `json:"spec,omitempty"`
+	OnceFireAt       string                 `json:"once_fire_at,omitempty"`
+	LastRunAt        string                 `json:"last_run_at,omitempty"`
+	NextRunAt        string                 `json:"next_run_at,omitempty"`
+	LastError        string                 `json:"last_error,omitempty"`
 }
 
-type CronController interface {
-	AddJob(ctx context.Context, spec CronJobSpec) (CronJobInfo, error)
-	ListJobs(ctx context.Context, activeOnly bool) ([]CronJobInfo, error)
-	RemoveJob(ctx context.Context, id string) error
+type ReminderController interface {
+	AddReminder(ctx context.Context, spec ReminderSpec) (ReminderInfo, error)
+	ListReminders(ctx context.Context, activeOnly bool) ([]ReminderInfo, error)
+	RemoveReminder(ctx context.Context, id string) error
 }
 
 type BuiltinsConfig struct {
 	ToolOutputMaxBytes int
 	BashTimeoutSec     int
 	LogPath            string
-	Cron               CronController
+	Reminders          ReminderController
 }
 
 const (
@@ -715,40 +725,47 @@ func BuiltinTools(cfg BuiltinsConfig, client *ollama.Client) []Tool {
 		},
 	}
 
-	if cfg.Cron != nil {
-		out = append(out, cronTools(cfg.Cron)...)
+	if cfg.Reminders != nil {
+		out = append(out, reminderTools(cfg.Reminders)...)
 	}
 	return out
 }
 
-func cronTools(ctrl CronController) []Tool {
+func reminderTools(ctrl ReminderController) []Tool {
 	return []Tool{
 		{
-			Name:        "cron_add",
-			Description: "Create or update a cron job that periodically sends a prompt to OllamaClaw (schedule interpreted in America/Los_Angeles, PST/PDT)",
+			Name:        "reminder_add",
+			Description: "Create or update a reminder in America/Los_Angeles (PST/PDT). The reminder is deterministically compiled to a cron schedule for runtime triggering.",
 			Schema: mustSchema(`{
   "type": "object",
   "properties": {
     "id": {"type": "string"},
-    "schedule": {"type": "string", "description": "Cron schedule in America/Los_Angeles (PST/PDT), e.g. '0 * * * *'"},
-    "prompt": {"type": "string", "description": "Prompt to run when the job triggers"},
-    "safe": {"type": "boolean", "description": "When true, Telegram bash approvals are auto-approved for this cron job"},
+    "prompt": {"type": "string", "description": "Prompt to run when the reminder triggers"},
+    "mode": {"type": "string", "enum": ["once", "interval", "weekdays", "monthly"]},
+    "date": {"type": "string", "description": "For once mode: YYYY-MM-DD in America/Los_Angeles"},
+    "time": {"type": "string", "description": "For once/day/weekdays/monthly modes: HH:MM in America/Los_Angeles"},
+    "interval_unit": {"type": "string", "enum": ["minute", "hour", "day"], "description": "For interval mode"},
+    "interval": {"type": "integer", "description": "For interval mode: >= 1"},
+    "minute": {"type": "integer", "description": "For interval hour mode: minute of the hour (default 0)"},
+    "days": {"type": "array", "items": {"type": "string"}, "description": "For weekdays mode: subset of [mon,tue,wed,thu,fri,sat,sun]"},
+    "day_of_month": {"type": "integer", "description": "For monthly mode: 1..31"},
+    "safe": {"type": "boolean", "description": "When true, Telegram bash approvals are auto-approved for this reminder"},
     "auto_prefetch": {"type": "boolean", "description": "When true, model-chosen stable bash commands can be prefetched automatically on future runs"},
     "transport": {"type": "string", "description": "Target transport, defaults to current session transport"},
     "session_key": {"type": "string", "description": "Target session key, defaults to current session key"}
   },
-  "required": ["schedule", "prompt"]
+  "required": ["mode", "prompt"]
 }`),
 			Execute: func(ctx context.Context, args map[string]interface{}) (map[string]interface{}, error) {
-				schedule, ok := args["schedule"].(string)
-				if !ok || strings.TrimSpace(schedule) == "" {
-					return nil, errors.New("schedule is required")
+				mode, ok := args["mode"].(string)
+				if !ok || strings.TrimSpace(mode) == "" {
+					return nil, errors.New("mode is required")
 				}
 				prompt, ok := args["prompt"].(string)
 				if !ok || strings.TrimSpace(prompt) == "" {
 					return nil, errors.New("prompt is required")
 				}
-				spec := CronJobSpec{Schedule: schedule, Prompt: prompt}
+				spec := ReminderSpec{Mode: mode, Prompt: prompt}
 				if v, ok := args["id"].(string); ok {
 					spec.ID = v
 				}
@@ -764,6 +781,35 @@ func cronTools(ctrl CronController) []Tool {
 				if v, ok := args["auto_prefetch"].(bool); ok {
 					spec.AutoPrefetch = &v
 				}
+				if v, ok := args["date"].(string); ok {
+					spec.Date = v
+				}
+				if v, ok := args["time"].(string); ok {
+					spec.Time = v
+				}
+				if v, ok := args["interval_unit"].(string); ok {
+					spec.IntervalUnit = v
+				}
+				if v, ok := asInt(args["interval"]); ok {
+					spec.Interval = v
+				}
+				if v, ok := asInt(args["minute"]); ok {
+					spec.Minute = &v
+				}
+				if rawDays, ok := args["days"].([]interface{}); ok {
+					days := make([]string, 0, len(rawDays))
+					for _, raw := range rawDays {
+						day, ok := raw.(string)
+						if !ok {
+							continue
+						}
+						days = append(days, day)
+					}
+					spec.Days = days
+				}
+				if v, ok := asInt(args["day_of_month"]); ok {
+					spec.DayOfMonth = v
+				}
 				if info, ok := SessionInfoFromContext(ctx); ok {
 					if strings.TrimSpace(spec.Transport) == "" {
 						spec.Transport = info.Transport
@@ -772,28 +818,31 @@ func cronTools(ctrl CronController) []Tool {
 						spec.SessionKey = info.SessionKey
 					}
 				}
-				job, err := ctrl.AddJob(ctx, spec)
+				reminder, err := ctrl.AddReminder(ctx, spec)
 				if err != nil {
 					return nil, err
 				}
 				return map[string]interface{}{
-					"id":            job.ID,
-					"schedule":      job.Schedule,
-					"prompt":        job.Prompt,
-					"transport":     job.Transport,
-					"session_key":   job.SessionKey,
-					"active":        job.Active,
-					"safe":          job.Safe,
-					"auto_prefetch": job.AutoPrefetch,
-					"next_run_at":   job.NextRunAt,
-					"timezone":      util.PacificTimezoneName,
+					"id":                reminder.ID,
+					"mode":              reminder.Mode,
+					"compiled_schedule": reminder.CompiledSchedule,
+					"prompt":            reminder.Prompt,
+					"transport":         reminder.Transport,
+					"session_key":       reminder.SessionKey,
+					"active":            reminder.Active,
+					"safe":              reminder.Safe,
+					"auto_prefetch":     reminder.AutoPrefetch,
+					"spec":              reminder.Spec,
+					"once_fire_at":      reminder.OnceFireAt,
+					"next_run_at":       reminder.NextRunAt,
+					"timezone":          util.PacificTimezoneName,
 				}, nil
 			},
 			Source: "builtin",
 		},
 		{
-			Name:        "cron_list",
-			Description: "List configured cron jobs (timestamps returned in America/Los_Angeles, PST/PDT)",
+			Name:        "reminder_list",
+			Description: "List configured reminders (timestamps returned in America/Los_Angeles, PST/PDT)",
 			Schema: mustSchema(`{
   "type": "object",
   "properties": {
@@ -805,34 +854,37 @@ func cronTools(ctrl CronController) []Tool {
 				if v, ok := args["active_only"].(bool); ok {
 					activeOnly = v
 				}
-				jobs, err := ctrl.ListJobs(ctx, activeOnly)
+				reminders, err := ctrl.ListReminders(ctx, activeOnly)
 				if err != nil {
 					return nil, err
 				}
-				items := make([]map[string]interface{}, 0, len(jobs))
-				for _, j := range jobs {
+				items := make([]map[string]interface{}, 0, len(reminders))
+				for _, j := range reminders {
 					items = append(items, map[string]interface{}{
-						"id":            j.ID,
-						"schedule":      j.Schedule,
-						"prompt":        j.Prompt,
-						"transport":     j.Transport,
-						"session_key":   j.SessionKey,
-						"active":        j.Active,
-						"safe":          j.Safe,
-						"auto_prefetch": j.AutoPrefetch,
-						"last_run_at":   j.LastRunAt,
-						"next_run_at":   j.NextRunAt,
-						"last_error":    j.LastError,
-						"timezone":      util.PacificTimezoneName,
+						"id":                j.ID,
+						"mode":              j.Mode,
+						"compiled_schedule": j.CompiledSchedule,
+						"prompt":            j.Prompt,
+						"transport":         j.Transport,
+						"session_key":       j.SessionKey,
+						"active":            j.Active,
+						"safe":              j.Safe,
+						"auto_prefetch":     j.AutoPrefetch,
+						"spec":              j.Spec,
+						"once_fire_at":      j.OnceFireAt,
+						"last_run_at":       j.LastRunAt,
+						"next_run_at":       j.NextRunAt,
+						"last_error":        j.LastError,
+						"timezone":          util.PacificTimezoneName,
 					})
 				}
-				return map[string]interface{}{"jobs": items}, nil
+				return map[string]interface{}{"reminders": items}, nil
 			},
 			Source: "builtin",
 		},
 		{
-			Name:        "cron_remove",
-			Description: "Remove a cron job by id",
+			Name:        "reminder_remove",
+			Description: "Remove a reminder by id",
 			Schema: mustSchema(`{
   "type": "object",
   "properties": {
@@ -845,7 +897,7 @@ func cronTools(ctrl CronController) []Tool {
 				if !ok || strings.TrimSpace(id) == "" {
 					return nil, errors.New("id is required")
 				}
-				if err := ctrl.RemoveJob(ctx, id); err != nil {
+				if err := ctrl.RemoveReminder(ctx, id); err != nil {
 					return nil, err
 				}
 				return map[string]interface{}{"removed": true, "id": id}, nil

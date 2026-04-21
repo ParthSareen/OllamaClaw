@@ -41,42 +41,23 @@ type Compaction struct {
 	CreatedAt         time.Time
 }
 
-type Plugin struct {
-	ID            string
-	Name          string
-	Version       string
-	Source        string
-	ResolvedRef   string
-	Checksum      string
-	InstallPath   string
-	Permissions   string
-	Enabled       bool
-	InstalledAt   time.Time
-	LastUpdatedAt time.Time
+type ReminderJob struct {
+	ID               string
+	Schedule         string
+	Prompt           string
+	Transport        string
+	SessionKey       string
+	Active           bool
+	Safe             bool
+	AutoPrefetch     bool
+	ReminderMode     string
+	ReminderSpecJSON string
+	OnceFireAt       *time.Time
+	LastRunAt        *time.Time
+	NextRunAt        *time.Time
+	LastError        string
+	CreatedAt        time.Time
+	UpdatedAt        time.Time
 }
 
-type PluginTool struct {
-	PluginID    string
-	ToolName    string
-	Description string
-	SchemaJSON  string
-	TimeoutSec  int
-	Enabled     bool
-	UpdatedAt   time.Time
-}
-
-type CronJob struct {
-	ID           string
-	Schedule     string
-	Prompt       string
-	Transport    string
-	SessionKey   string
-	Active       bool
-	Safe         bool
-	AutoPrefetch bool
-	LastRunAt    *time.Time
-	NextRunAt    *time.Time
-	LastError    string
-	CreatedAt    time.Time
-	UpdatedAt    time.Time
-}
+type CronJob = ReminderJob

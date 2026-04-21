@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -76,6 +77,25 @@ func TestMessageArchiveAndCompactionSummary(t *testing.T) {
 	}
 	if summary != "summary" {
 		t.Fatalf("unexpected summary %q", summary)
+	}
+	latest, ok, err := store.LatestCompaction(ctx, sess.ID)
+	if err != nil || !ok {
+		t.Fatalf("expected latest compaction row, got ok=%v err=%v", ok, err)
+	}
+	if latest.SessionID != sess.ID {
+		t.Fatalf("unexpected latest compaction session id: got %q want %q", latest.SessionID, sess.ID)
+	}
+	if latest.Summary != "summary" {
+		t.Fatalf("unexpected latest compaction summary %q", latest.Summary)
+	}
+	if latest.FirstKeptMessage != m2.ID {
+		t.Fatalf("unexpected latest compaction first kept message: got %d want %d", latest.FirstKeptMessage, m2.ID)
+	}
+	if latest.ArchivedBeforeSeq != m2.Seq {
+		t.Fatalf("unexpected latest compaction archived_before_seq: got %d want %d", latest.ArchivedBeforeSeq, m2.Seq)
+	}
+	if latest.CreatedAt.IsZero() {
+		t.Fatalf("expected latest compaction timestamp to be set")
 	}
 	countUser, err := store.CountMessagesByRole(ctx, sess.ID, "user")
 	if err != nil {
@@ -272,6 +292,56 @@ VALUES('legacy-job', '0 * * * *', 'ping', 'telegram', '123', 1, '2026-01-01T00:0
 	}
 	if !job.AutoPrefetch {
 		t.Fatalf("expected migrated job auto_prefetch=true by default")
+	}
+	if strings.TrimSpace(job.ReminderMode) != "legacy_cron" {
+		t.Fatalf("expected migrated reminder_mode=legacy_cron, got %q", job.ReminderMode)
+	}
+	if strings.TrimSpace(job.ReminderSpecJSON) != "{}" {
+		t.Fatalf("expected migrated reminder_spec_json default {}, got %q", job.ReminderSpecJSON)
+	}
+}
+
+func TestReminderMetadataPersistence(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	store, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open() error: %v", err)
+	}
+	defer store.Close()
+
+	now := time.Now().UTC()
+	fire := now.Add(45 * time.Minute)
+	job := ReminderJob{
+		ID:               "reminder-meta",
+		Schedule:         "15 9 * * 1,3,5",
+		Prompt:           "status ping",
+		Transport:        "telegram",
+		SessionKey:       "8750063231",
+		Active:           true,
+		Safe:             true,
+		AutoPrefetch:     true,
+		ReminderMode:     "weekdays",
+		ReminderSpecJSON: `{"mode":"weekdays","days":["mon","wed","fri"],"time":"09:15"}`,
+		OnceFireAt:       &fire,
+		LastError:        "",
+		CreatedAt:        now,
+		UpdatedAt:        now,
+	}
+	if err := store.UpsertReminderJob(context.Background(), job); err != nil {
+		t.Fatalf("UpsertReminderJob() error: %v", err)
+	}
+	got, ok, err := store.GetReminderJob(context.Background(), job.ID)
+	if err != nil || !ok {
+		t.Fatalf("GetReminderJob() failed ok=%t err=%v", ok, err)
+	}
+	if got.ReminderMode != "weekdays" {
+		t.Fatalf("expected reminder_mode weekdays, got %q", got.ReminderMode)
+	}
+	if strings.TrimSpace(got.ReminderSpecJSON) != strings.TrimSpace(job.ReminderSpecJSON) {
+		t.Fatalf("expected reminder_spec_json %q, got %q", job.ReminderSpecJSON, got.ReminderSpecJSON)
+	}
+	if got.OnceFireAt == nil {
+		t.Fatalf("expected once_fire_at to be persisted")
 	}
 }
 

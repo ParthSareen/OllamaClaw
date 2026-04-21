@@ -19,8 +19,8 @@ import (
 	"github.com/ParthSareen/OllamaClaw/internal/cronjobs"
 	"github.com/ParthSareen/OllamaClaw/internal/db"
 	"github.com/ParthSareen/OllamaClaw/internal/ollama"
-	"github.com/ParthSareen/OllamaClaw/internal/plugin"
 	"github.com/ParthSareen/OllamaClaw/internal/telegram"
+	"github.com/ParthSareen/OllamaClaw/internal/util"
 )
 
 type App struct{}
@@ -47,8 +47,6 @@ func (a *App) Run(args []string) error {
 		return a.runConfigure(args[1:])
 	case "telegram":
 		return a.runTelegram(args[1:])
-	case "plugin":
-		return a.runPlugin(args[1:])
 	case "version", "--version":
 		fmt.Println(runtimeBuildLabel())
 		return nil
@@ -69,15 +67,6 @@ Usage:
   ollamaclaw configure
   ollamaclaw telegram init [--token <telegram-bot-token>] [--owner-id <id>] [--owner-chat-id <id>] [--owner-user-id <id>]
   ollamaclaw telegram run (legacy alias)
-  ollamaclaw plugin new <name>
-  ollamaclaw plugin test [--path <dir>]
-  ollamaclaw plugin pack [--path <dir>]
-  ollamaclaw plugin install <git|url|path>
-  ollamaclaw plugin list
-  ollamaclaw plugin enable <plugin-id>
-  ollamaclaw plugin disable <plugin-id>
-  ollamaclaw plugin remove <plugin-id>
-  ollamaclaw plugin update [plugin-id]
   ollamaclaw version
 `)
 }
@@ -94,7 +83,7 @@ func (a *App) runRepl(args []string) error {
 	}
 	defer cleanup()
 	r.cron.SetOutputSink(func(ctx context.Context, transport, sessionKey, content string) error {
-		fmt.Printf("\n[cron %s/%s]\n%s\n", transport, sessionKey, content)
+		fmt.Printf("\n[reminder %s/%s]\n%s\n", transport, sessionKey, content)
 		return nil
 	})
 	if err := r.cron.Start(context.Background()); err != nil {
@@ -175,6 +164,9 @@ func (a *App) runLaunch(args []string) error {
 	}
 	buildLabel := runtimeBuildLabel()
 	fmt.Printf("ollamaclaw %s\n", buildLabel)
+	now := time.Now()
+	fmt.Printf("launch start: %s (%s)\n", util.FormatPacificRFC3339(now), util.PacificTimezoneName)
+	fmt.Printf("launch start (UTC): %s\n", now.UTC().Format(time.RFC3339))
 	cfg, err := config.Load()
 	if err != nil {
 		return err
@@ -249,131 +241,6 @@ func runtimeBuildLabel() string {
 		parts = append(parts, "built="+buildDate)
 	}
 	return strings.Join(parts, " ")
-}
-
-func (a *App) runPlugin(args []string) error {
-	if len(args) == 0 {
-		return errors.New("plugin requires subcommand")
-	}
-	sub := args[0]
-	switch sub {
-	case "new":
-		if len(args) < 2 {
-			return errors.New("usage: ollamaclaw plugin new <name>")
-		}
-		dir, err := plugin.Scaffold(args[1])
-		if err != nil {
-			return err
-		}
-		fmt.Printf("Created plugin scaffold at %s\n", dir)
-		return nil
-	case "test":
-		fs := flag.NewFlagSet("plugin test", flag.ContinueOnError)
-		path := fs.String("path", ".", "Plugin directory")
-		if err := fs.Parse(args[1:]); err != nil {
-			return err
-		}
-		tools, err := plugin.Test(context.Background(), *path, 30)
-		if err != nil {
-			return err
-		}
-		b, _ := json.MarshalIndent(tools, "", "  ")
-		fmt.Println(string(b))
-		return nil
-	case "pack":
-		fs := flag.NewFlagSet("plugin pack", flag.ContinueOnError)
-		path := fs.String("path", ".", "Plugin directory")
-		if err := fs.Parse(args[1:]); err != nil {
-			return err
-		}
-		archive, checksum, err := plugin.Pack(*path)
-		if err != nil {
-			return err
-		}
-		fmt.Printf("Packed plugin: %s\nsha256: %s\n", archive, checksum)
-		return nil
-	case "install":
-		if len(args) < 2 {
-			return errors.New("usage: ollamaclaw plugin install <git|url|path>")
-		}
-		r, cleanup, err := a.bootstrap()
-		if err != nil {
-			return err
-		}
-		defer cleanup()
-		p, t, err := r.pluginManager.Install(context.Background(), args[1])
-		if err != nil {
-			return err
-		}
-		fmt.Printf("Installed plugin %s@%s (%d tools)\n", p.ID, p.Version, len(t))
-		return nil
-	case "list":
-		r, cleanup, err := a.bootstrap()
-		if err != nil {
-			return err
-		}
-		defer cleanup()
-		plugins, err := r.store.ListPlugins(context.Background(), false)
-		if err != nil {
-			return err
-		}
-		if len(plugins) == 0 {
-			fmt.Println("No plugins installed")
-			return nil
-		}
-		for _, p := range plugins {
-			status := "disabled"
-			if p.Enabled {
-				status = "enabled"
-			}
-			fmt.Printf("%s\t%s\t%s\t%s\n", p.ID, p.Version, status, p.Source)
-		}
-		return nil
-	case "enable", "disable", "remove":
-		if len(args) < 2 {
-			return fmt.Errorf("usage: ollamaclaw plugin %s <plugin-id>", sub)
-		}
-		r, cleanup, err := a.bootstrap()
-		if err != nil {
-			return err
-		}
-		defer cleanup()
-		id := args[1]
-		switch sub {
-		case "enable":
-			err = r.pluginManager.SetEnabled(context.Background(), id, true)
-		case "disable":
-			err = r.pluginManager.SetEnabled(context.Background(), id, false)
-		case "remove":
-			err = r.pluginManager.Remove(context.Background(), id)
-		}
-		if err != nil {
-			return err
-		}
-		fmt.Printf("Plugin %s %sd\n", id, sub)
-		return nil
-	case "update":
-		var target string
-		if len(args) >= 2 {
-			target = args[1]
-		}
-		r, cleanup, err := a.bootstrap()
-		if err != nil {
-			return err
-		}
-		defer cleanup()
-		if err := r.pluginManager.Update(context.Background(), target); err != nil {
-			return err
-		}
-		if target == "" {
-			fmt.Println("Updated all plugins")
-		} else {
-			fmt.Printf("Updated plugin %s\n", target)
-		}
-		return nil
-	default:
-		return fmt.Errorf("unknown plugin subcommand: %s", sub)
-	}
 }
 
 func launchConfigReady(cfg config.Config) bool {
@@ -538,11 +405,10 @@ func previewCommandForError(cmd string) string {
 }
 
 type runtime struct {
-	cfg           config.Config
-	store         *db.Store
-	engine        *agent.Engine
-	pluginManager *plugin.Manager
-	cron          *cronjobs.Manager
+	cfg    config.Config
+	store  *db.Store
+	engine *agent.Engine
+	cron   *cronjobs.Manager
 }
 
 func (a *App) bootstrap() (*runtime, func(), error) {
@@ -555,17 +421,18 @@ func (a *App) bootstrap() (*runtime, func(), error) {
 		return nil, nil, err
 	}
 	client := ollama.NewClient(cfg.OllamaHost)
-	pm := plugin.NewManager(store, cfg)
 	cronMgr := cronjobs.NewManager(store)
-	eng := agent.New(cfg, store, client, pm, cronMgr)
+	eng := agent.New(cfg, store, client, cronMgr)
 	cronMgr.SetRunner(func(ctx context.Context, transport, sessionKey, prompt string) (cronjobs.RunResult, error) {
 		res, err := eng.HandleText(ctx, transport, sessionKey, prompt)
 		if err != nil {
 			return cronjobs.RunResult{}, err
 		}
+		output := appendCompactionNotice(res.AssistantContent, res.Compacted, res.PromptTokens, cfg)
 		return cronjobs.RunResult{
-			Output:       res.AssistantContent,
+			Output:       output,
 			BashCommands: extractBashCommands(res.ToolTrace),
+			Compacted:    res.Compacted,
 		}, nil
 	})
 	cleanup := func() {
@@ -575,7 +442,7 @@ func (a *App) bootstrap() (*runtime, func(), error) {
 		_ = store.SetSetting(ctx, "last_shutdown", time.Now().UTC().Format(time.RFC3339Nano))
 		_ = store.Close()
 	}
-	return &runtime{cfg: cfg, store: store, engine: eng, pluginManager: pm, cron: cronMgr}, cleanup, nil
+	return &runtime{cfg: cfg, store: store, engine: eng, cron: cronMgr}, cleanup, nil
 }
 
 func extractBashCommands(trace []agent.ToolTraceEntry) []string {
@@ -599,4 +466,16 @@ func extractBashCommands(trace []agent.ToolTraceEntry) []string {
 		out = append(out, command)
 	}
 	return cronjobs.BashCommandsFromTrace(out)
+}
+
+func appendCompactionNotice(output string, compacted bool, promptTokens int, cfg config.Config) string {
+	if !compacted {
+		return output
+	}
+	thresholdTokens := int(float64(cfg.ContextWindowTokens) * cfg.CompactionThreshold)
+	notice := fmt.Sprintf("context compacted in background: prompt_tokens=%d threshold_tokens=%d keep_recent_turns=%d", promptTokens, thresholdTokens, cfg.KeepRecentTurns)
+	if strings.TrimSpace(output) == "" {
+		return notice
+	}
+	return notice + "\n\n" + output
 }

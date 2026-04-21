@@ -75,7 +75,7 @@ func botCommandDefinitions() []map[string]string {
 		{"command": "reset", "description": "Reset chat session"},
 		{"command": "model", "description": "Show/set active model"},
 		{"command": "tools", "description": "List available tools"},
-		{"command": "cron", "description": "List cron jobs, safety, and prefetch"},
+		{"command": "reminder", "description": "List reminders, safety, and prefetch"},
 		{"command": "show", "description": "Show/toggle tools, thinking, or dreaming"},
 		{"command": "verbose", "description": "Show or set tool/thinking traces"},
 		{"command": "think", "description": "Show or set think value"},
