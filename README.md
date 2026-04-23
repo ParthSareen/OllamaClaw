@@ -8,6 +8,7 @@ It supports:
 - Built-in tools: `bash`, `read_file`, `write_file`, `web_search`, `web_fetch`, `system_prompt_get`, `system_prompt_update`, `system_prompt_history`, `system_prompt_rollback`
 - Local SQLite persistence with per-chat sessions
 - Context compaction (summary + recent turns)
+- Optional GitHub webhook trigger path for proactive Telegram updates
 
 ## Install
 
@@ -33,6 +34,10 @@ It will ask for:
 - Default model
 - Telegram bot token
 - Telegram owner ID
+- GitHub webhook owner login (optional)
+- GitHub webhook secret (optional)
+- GitHub webhook listen addr (optional)
+- GitHub repo allowlist (optional, comma-separated)
 
 The owner ID is used for both `owner_chat_id` and `owner_user_id`.
 
@@ -86,6 +91,7 @@ ollamaclaw telegram run   # legacy alias for launch
 - `/show dreaming [on|off]` toggles background long-term-memory (“dreaming”) event notifications for this chat (default: on)
 - `/verbose [on|off]` enables/disables tool + thinking traces for this chat session
 - `/think [on|off|low|medium|high|default]` shows/sets think value
+- `/dream` manually triggers a core-memory refresh for the current chat session
 - `/status` shows model, estimated next prompt size (`len(request_json)/4`), dreaming notification state, lifetime token counters, compaction thresholds, last compaction snapshot, DB path
 - `/fullsystem` shows the exact system context currently injected (system prompt + core memories + latest conversation summary)
 - `/reset` archives current session and starts a fresh one
@@ -93,6 +99,23 @@ ollamaclaw telegram run   # legacy alias for launch
 - `/restart` restarts the launch loop from Telegram
 - Send photos (or image documents) with an optional caption; image bytes are fetched from Telegram and forwarded to Ollama chat `images`
 - If messages arrive in quick succession, OllamaClaw waits for a 1.5s quiet window, coalesces them with newlines, then runs one turn
+
+## GitHub webhook triggers
+
+If `github_webhook.owner_login` and `github_webhook.secret` are configured, `ollamaclaw launch` starts a local webhook endpoint:
+
+- `POST /webhooks/github` on `github_webhook.listen_addr` (default `127.0.0.1:8787`)
+- Signature verified via `X-Hub-Signature-256` (HMAC-SHA256)
+- Deduplicated by `X-GitHub-Delivery`
+- Filtered to your configured GitHub login and optional repo allowlist
+- Accepted events:
+  - `pull_request`: `opened`, `synchronize`, `reopened`, `ready_for_review`
+  - `pull_request_review`: `submitted`, `edited`, `dismissed`
+  - `pull_request_review_comment`: `created`, `edited`
+  - `check_run`: `completed`
+  - `check_suite`: `completed`
+
+Accepted webhook events are queued into your owner Telegram session as proactive turns.
 
 ## Built-in tools
 
@@ -147,7 +170,7 @@ Output:
 ```
 
 ### `reminder_add`
-Structured reminder creation in PST/PDT. Modes: `once`, `interval`, `weekdays`, `monthly`.
+Structured reminder creation in PST/PDT. Modes: `once`, `daily`, `interval`, `weekdays`, `monthly`.
 
 ### `reminder_list`
 Lists reminders with normalized spec and compiled cron schedule.
@@ -198,6 +221,13 @@ Defaults:
     "bot_token": "",
     "owner_chat_id": 0,
     "owner_user_id": 0
+  },
+  "github_webhook": {
+    "enabled": false,
+    "listen_addr": "127.0.0.1:8787",
+    "secret": "",
+    "owner_login": "",
+    "repo_allowlist": []
   }
 }
 ```

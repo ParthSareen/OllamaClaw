@@ -600,6 +600,23 @@ func (e *Engine) SetCoreMemoryEventSink(fn func(CoreMemoryEvent)) {
 	e.coreMemorySink = fn
 }
 
+func (e *Engine) TriggerCoreMemoriesRefresh(ctx context.Context, transport, sessionKey string) (bool, error) {
+	sess, err := e.store.GetOrCreateActiveSession(ctx, transport, sessionKey, e.cfg.DefaultModel)
+	if err != nil {
+		return false, err
+	}
+	userTurnCount, err := e.store.CountMessagesByRole(ctx, sess.ID, "user")
+	if err != nil {
+		return false, err
+	}
+	memModel := strings.TrimSpace(sess.ModelOverride)
+	if memModel == "" {
+		memModel = e.cfg.DefaultModel
+	}
+	settingKey := coreMemoriesLastTurnSettingKey(sess.ID)
+	return e.launchCoreMemoryRefresh(sess, memModel, userTurnCount, settingKey), nil
+}
+
 func (e *Engine) EstimateNextPrompt(ctx context.Context, transport, sessionKey string) (PromptEstimate, error) {
 	ctx = tools.WithSessionInfo(ctx, transport, sessionKey)
 	sess, err := e.store.GetOrCreateActiveSession(ctx, transport, sessionKey, e.cfg.DefaultModel)
@@ -852,11 +869,14 @@ func (e *Engine) maybeScheduleCoreMemoriesRefresh(sess db.Session, model string)
 	if lastTurn >= userTurnCount {
 		return
 	}
+	_ = e.launchCoreMemoryRefresh(sess, model, userTurnCount, settingKey)
+}
 
+func (e *Engine) launchCoreMemoryRefresh(sess db.Session, model string, userTurnCount int, settingKey string) bool {
 	e.memoryMu.Lock()
 	if _, exists := e.memoryInFlight[sess.ID]; exists {
 		e.memoryMu.Unlock()
-		return
+		return false
 	}
 	e.memoryInFlight[sess.ID] = struct{}{}
 	e.memoryMu.Unlock()
@@ -907,8 +927,11 @@ func (e *Engine) maybeScheduleCoreMemoriesRefresh(sess db.Session, model string)
 			Updated:       refreshResult.Updated,
 			Delta:         refreshResult.Delta,
 		})
-		_ = e.store.SetSetting(ctx, settingKey, strconv.Itoa(userTurnCount))
+		if strings.TrimSpace(settingKey) != "" {
+			_ = e.store.SetSetting(ctx, settingKey, strconv.Itoa(userTurnCount))
+		}
 	}()
+	return true
 }
 
 type coreMemoryRefreshResult struct {

@@ -199,6 +199,14 @@ var (
 			Reason: "contains network write operations",
 		},
 		{
+			RX:     regexp.MustCompile(`\bcurl\b[^\n]*\s(?:-d|--data|--data-raw|--data-binary|--data-urlencode|--form)\b`),
+			Reason: "contains network write operations",
+		},
+		{
+			RX:     regexp.MustCompile(`\b(?:curl|wget)\b[^\n]*\s(?:-o|--output|--remote-name|--output-document)\b`),
+			Reason: "contains network-to-file write operations",
+		},
+		{
 			RX:     regexp.MustCompile(`\b(?:bash|sh|zsh)\s+-c\b`),
 			Reason: "contains nested shell execution",
 		},
@@ -741,9 +749,9 @@ func reminderTools(ctrl ReminderController) []Tool {
   "properties": {
     "id": {"type": "string"},
     "prompt": {"type": "string", "description": "Prompt to run when the reminder triggers"},
-    "mode": {"type": "string", "enum": ["once", "interval", "weekdays", "monthly"]},
+    "mode": {"type": "string", "enum": ["once", "daily", "interval", "weekdays", "monthly"]},
     "date": {"type": "string", "description": "For once mode: YYYY-MM-DD in America/Los_Angeles"},
-    "time": {"type": "string", "description": "For once/day/weekdays/monthly modes: HH:MM in America/Los_Angeles"},
+    "time": {"type": "string", "description": "For once/daily/day/weekdays/monthly modes: HH:MM in America/Los_Angeles"},
     "interval_unit": {"type": "string", "enum": ["minute", "hour", "day"], "description": "For interval mode"},
     "interval": {"type": "integer", "description": "For interval mode: >= 1"},
     "minute": {"type": "integer", "description": "For interval hour mode: minute of the hour (default 0)"},
@@ -1164,6 +1172,9 @@ func classifyTelegramBashCommand(normalized string) (telegramBashPolicy, string)
 	if normalized == "" {
 		return telegramBashPolicyRequireApproval, "empty command"
 	}
+	if isGhPrefixAllowedTelegramCommand(normalized) {
+		return telegramBashPolicyAllow, ""
+	}
 	if reason := disallowedTelegramLifecycleReason(normalized); reason != "" {
 		return telegramBashPolicyDeny, reason
 	}
@@ -1186,6 +1197,10 @@ func classifyTelegramBashCommand(normalized string) (telegramBashPolicy, string)
 
 func normalizeTelegramBashCommand(cmd string) string {
 	return strings.ToLower(strings.Join(strings.Fields(strings.TrimSpace(cmd)), " "))
+}
+
+func isGhPrefixAllowedTelegramCommand(normalized string) bool {
+	return normalized == "gh" || strings.HasPrefix(normalized, "gh ")
 }
 
 func canAlwaysAllowTelegramCommand(_ string) bool {

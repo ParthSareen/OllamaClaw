@@ -41,6 +41,7 @@ func (a *App) runConfigure(args []string) error {
 	}
 	fmt.Println("Configuration saved.")
 	fmt.Printf("owner_chat_id=%d owner_user_id=%d default_model=%s\n", updated.Telegram.OwnerChatID, updated.Telegram.OwnerUserID, updated.DefaultModel)
+	fmt.Printf("github_webhook_enabled=%t github_webhook_listen_addr=%s github_owner_login=%s\n", updated.GitHubWebhook.Enabled, strings.TrimSpace(updated.GitHubWebhook.ListenAddr), strings.TrimSpace(updated.GitHubWebhook.OwnerLogin))
 	return nil
 }
 
@@ -53,6 +54,7 @@ type configureField struct {
 }
 
 type configureModel struct {
+	fields    []configureField
 	inputs    []textinput.Model
 	index     int
 	errText   string
@@ -95,6 +97,31 @@ func newConfigureModel(cfg config.Config) configureModel {
 			Placeholder: "123456789",
 			Value:       ownerID,
 		},
+		{
+			Key:         "github_owner_login",
+			Label:       "GitHub Owner Login",
+			Placeholder: "parth",
+			Value:       strings.TrimSpace(cfg.GitHubWebhook.OwnerLogin),
+		},
+		{
+			Key:         "github_webhook_secret",
+			Label:       "GitHub Webhook Secret",
+			Placeholder: "random-shared-secret",
+			Value:       strings.TrimSpace(cfg.GitHubWebhook.Secret),
+			Secret:      true,
+		},
+		{
+			Key:         "github_webhook_listen_addr",
+			Label:       "GitHub Webhook Listen Addr",
+			Placeholder: "127.0.0.1:8787",
+			Value:       strings.TrimSpace(cfg.GitHubWebhook.ListenAddr),
+		},
+		{
+			Key:         "github_repo_allowlist",
+			Label:       "GitHub Repo Allowlist",
+			Placeholder: "owner/repo, owner/repo2 (optional)",
+			Value:       strings.Join(cfg.GitHubWebhook.RepoAllowlist, ", "),
+		},
 	}
 
 	inputs := make([]textinput.Model, 0, len(fields))
@@ -118,6 +145,7 @@ func newConfigureModel(cfg config.Config) configureModel {
 	}
 
 	return configureModel{
+		fields: fields,
 		inputs: inputs,
 		index:  0,
 	}
@@ -178,9 +206,11 @@ func (m configureModel) View() string {
 	title := configureTitleStyle.Render("OllamaClaw Configure")
 	help := configureHelpStyle.Render("Tab/Shift+Tab: move  Enter: save  Ctrl+C: cancel")
 	lines := []string{title, help, ""}
-	labels := []string{"Ollama Host", "Default Model", "Log Path", "Telegram Bot Token", "Telegram Owner ID"}
 	for i := range m.inputs {
-		label := labels[i]
+		label := "Field"
+		if i < len(m.fields) && strings.TrimSpace(m.fields[i].Label) != "" {
+			label = m.fields[i].Label
+		}
 		if i == m.index {
 			label = configureFocusLabelStyle.Render(label)
 		} else {
@@ -191,6 +221,7 @@ func (m configureModel) View() string {
 		lines = append(lines, "")
 	}
 	lines = append(lines, configureHintStyle.Render("Owner ID sets both owner_chat_id and owner_user_id."))
+	lines = append(lines, configureHintStyle.Render("GitHub webhook activates when both Owner Login and Webhook Secret are set."))
 	if strings.TrimSpace(m.errText) != "" {
 		lines = append(lines, "", configureErrorStyle.Render(m.errText))
 	}
@@ -199,10 +230,9 @@ func (m configureModel) View() string {
 
 func (m configureModel) readValues() map[string]string {
 	out := map[string]string{}
-	keys := []string{"ollama_host", "default_model", "log_path", "bot_token", "owner_id"}
-	for i, key := range keys {
+	for i, field := range m.fields {
 		if i < len(m.inputs) {
-			out[key] = strings.TrimSpace(m.inputs[i].Value())
+			out[field.Key] = strings.TrimSpace(m.inputs[i].Value())
 		}
 	}
 	return out
@@ -244,6 +274,13 @@ func runConfigureTUI(cfg config.Config) (config.Config, bool, error) {
 	}
 	updated.Telegram.BotToken = strings.TrimSpace(values["bot_token"])
 	updated.Telegram.OwnerChatID, updated.Telegram.OwnerUserID = normalizeOwnerIDs(ownerID, 0, 0)
+	updated.GitHubWebhook.OwnerLogin = strings.TrimSpace(values["github_owner_login"])
+	updated.GitHubWebhook.Secret = strings.TrimSpace(values["github_webhook_secret"])
+	if v := strings.TrimSpace(values["github_webhook_listen_addr"]); v != "" {
+		updated.GitHubWebhook.ListenAddr = v
+	}
+	updated.GitHubWebhook.RepoAllowlist = parseCSV(values["github_repo_allowlist"])
+	updated.GitHubWebhook.Enabled = updated.GitHubWebhook.OwnerLogin != "" && updated.GitHubWebhook.Secret != ""
 	return updated, false, nil
 }
 
@@ -259,6 +296,14 @@ func validateConfigureValues(values map[string]string) error {
 	if err != nil || ownerID <= 0 {
 		return fmt.Errorf("telegram owner id must be a positive integer")
 	}
+	githubOwner := strings.TrimSpace(values["github_owner_login"])
+	githubSecret := strings.TrimSpace(values["github_webhook_secret"])
+	if githubOwner == "" && githubSecret != "" {
+		return fmt.Errorf("github owner login is required when github webhook secret is set")
+	}
+	if githubOwner != "" && githubSecret == "" {
+		return fmt.Errorf("github webhook secret is required when github owner login is set")
+	}
 	return nil
 }
 
@@ -273,6 +318,31 @@ func preferredOwnerID(chatID, userID int64) string {
 	default:
 		return ""
 	}
+}
+
+func parseCSV(raw string) []string {
+	if strings.TrimSpace(raw) == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	seen := map[string]struct{}{}
+	for _, part := range parts {
+		item := strings.TrimSpace(part)
+		if item == "" {
+			continue
+		}
+		key := strings.ToLower(item)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, item)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 var (

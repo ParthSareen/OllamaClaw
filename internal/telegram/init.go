@@ -79,6 +79,7 @@ func botCommandDefinitions() []map[string]string {
 		{"command": "show", "description": "Show/toggle tools, thinking, or dreaming"},
 		{"command": "verbose", "description": "Show or set tool/thinking traces"},
 		{"command": "think", "description": "Show or set think value"},
+		{"command": "dream", "description": "Trigger a core-memory refresh now"},
 		{"command": "status", "description": "Show status and token usage"},
 		{"command": "fullsystem", "description": "Show full system context"},
 		{"command": "stop", "description": "Stop the active turn"},

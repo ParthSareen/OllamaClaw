@@ -14,6 +14,7 @@ const (
 	defaultConfigFile    = "config.json"
 	defaultStateDBFile   = "state.db"
 	defaultLogFile       = "ollamaclaw.log"
+	defaultGitHubWebhook = "127.0.0.1:8787"
 	defaultPromptFile    = "system_prompt.txt"
 	defaultPromptOverlay = "system_prompt.overlay.md"
 	defaultPromptHistory = "system_prompt.overlay.history.jsonl"
@@ -32,12 +33,21 @@ type Config struct {
 	ToolOutputMaxBytes  int            `json:"tool_output_max_bytes"`
 	BashTimeoutSeconds  int            `json:"bash_timeout_seconds"`
 	Telegram            TelegramConfig `json:"telegram"`
+	GitHubWebhook       GitHubWebhook  `json:"github_webhook"`
 }
 
 type TelegramConfig struct {
 	BotToken    string `json:"bot_token"`
 	OwnerChatID int64  `json:"owner_chat_id"`
 	OwnerUserID int64  `json:"owner_user_id"`
+}
+
+type GitHubWebhook struct {
+	Enabled       bool     `json:"enabled"`
+	ListenAddr    string   `json:"listen_addr"`
+	Secret        string   `json:"secret"`
+	OwnerLogin    string   `json:"owner_login"`
+	RepoAllowlist []string `json:"repo_allowlist"`
 }
 
 func Default() Config {
@@ -54,6 +64,13 @@ func Default() Config {
 		ToolOutputMaxBytes:  16 * 1024,
 		BashTimeoutSeconds:  120,
 		Telegram:            TelegramConfig{},
+		GitHubWebhook: GitHubWebhook{
+			Enabled:       false,
+			ListenAddr:    defaultGitHubWebhook,
+			Secret:        "",
+			OwnerLogin:    "",
+			RepoAllowlist: nil,
+		},
 	}
 }
 
@@ -156,6 +173,16 @@ func sanitize(cfg *Config) {
 	if cfg.BashTimeoutSeconds <= 0 {
 		cfg.BashTimeoutSeconds = defaults.BashTimeoutSeconds
 	}
+	cfg.GitHubWebhook.ListenAddr = strings.TrimSpace(cfg.GitHubWebhook.ListenAddr)
+	if cfg.GitHubWebhook.ListenAddr == "" {
+		cfg.GitHubWebhook.ListenAddr = defaults.GitHubWebhook.ListenAddr
+	}
+	cfg.GitHubWebhook.Secret = strings.TrimSpace(cfg.GitHubWebhook.Secret)
+	cfg.GitHubWebhook.OwnerLogin = strings.TrimSpace(cfg.GitHubWebhook.OwnerLogin)
+	cfg.GitHubWebhook.RepoAllowlist = normalizeRepoAllowlist(cfg.GitHubWebhook.RepoAllowlist)
+	if cfg.GitHubWebhook.Secret == "" || cfg.GitHubWebhook.OwnerLogin == "" {
+		cfg.GitHubWebhook.Enabled = false
+	}
 }
 
 func Load() (Config, error) {
@@ -218,6 +245,33 @@ func Redacted(cfg Config) Config {
 	out := cfg
 	if out.Telegram.BotToken != "" {
 		out.Telegram.BotToken = "***"
+	}
+	if out.GitHubWebhook.Secret != "" {
+		out.GitHubWebhook.Secret = "***"
+	}
+	return out
+}
+
+func normalizeRepoAllowlist(items []string) []string {
+	if len(items) == 0 {
+		return nil
+	}
+	seen := map[string]struct{}{}
+	out := make([]string, 0, len(items))
+	for _, item := range items {
+		repo := strings.TrimSpace(item)
+		if repo == "" {
+			continue
+		}
+		repoKey := strings.ToLower(repo)
+		if _, ok := seen[repoKey]; ok {
+			continue
+		}
+		seen[repoKey] = struct{}{}
+		out = append(out, repo)
+	}
+	if len(out) == 0 {
+		return nil
 	}
 	return out
 }

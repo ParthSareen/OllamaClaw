@@ -156,8 +156,12 @@ func TestClassifyTelegramBashCommand(t *testing.T) {
 		{cmd: "git status", want: telegramBashPolicyAllow},
 		{cmd: "ollama list", want: telegramBashPolicyAllow},
 		{cmd: "curl https://example.com", want: telegramBashPolicyRequireApproval, reasonIn: "network/data"},
+		{cmd: "gh issue list --limit 5", want: telegramBashPolicyAllow},
+		{cmd: "gh issue view 1 > /tmp/gh.txt", want: telegramBashPolicyAllow},
 		{cmd: "touch /tmp/x", want: telegramBashPolicyRequireApproval, reasonIn: "filesystem mutation"},
 		{cmd: "curl -X POST https://example.com", want: telegramBashPolicyRequireApproval, reasonIn: "network/data"},
+		{cmd: "curl -d '{\"x\":1}' https://example.com", want: telegramBashPolicyRequireApproval, reasonIn: "network/data"},
+		{cmd: "curl -o /tmp/out https://example.com", want: telegramBashPolicyRequireApproval, reasonIn: "network/data"},
 		{cmd: "git commit -m 'x'", want: telegramBashPolicyRequireApproval, reasonIn: "mutating git"},
 		{cmd: "echo hi > /tmp/out.txt", want: telegramBashPolicyRequireApproval, reasonIn: "output redirection"},
 		{cmd: "tail -100 ~/.codex/history.jsonl 2>/dev/null | head -30", want: telegramBashPolicyAllow},
@@ -180,6 +184,13 @@ func TestGuardTelegramBashCommandCurlAlwaysNeedsApproval(t *testing.T) {
 	err := guardTelegramBashCommand(ctx, "curl https://example.com")
 	if err == nil || !strings.Contains(strings.ToLower(err.Error()), "requires approval") {
 		t.Fatalf("expected curl command to require approval, got %v", err)
+	}
+}
+
+func TestGuardTelegramBashCommandGhPrefixBypassesApproval(t *testing.T) {
+	ctx := WithSessionInfo(context.Background(), "telegram", "8750063231")
+	if err := guardTelegramBashCommand(ctx, "gh issue view 1 > /tmp/gh.txt"); err != nil {
+		t.Fatalf("expected gh-prefixed command to bypass approval, got %v", err)
 	}
 }
 

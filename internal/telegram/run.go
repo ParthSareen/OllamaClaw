@@ -51,6 +51,7 @@ type Runner struct {
 	nextApproval atomic.Uint64
 	approvalMu   sync.Mutex
 	approvals    map[string]*pendingApproval
+	webhookMu    sync.Mutex
 	unauthMu     sync.Mutex
 	unauthAt     map[string]time.Time
 	turnExecutor func(ctx context.Context, turnCtx context.Context, b *bot.Bot, chatID, userID int64, sessionKey, text string, imageFileIDs []string)
@@ -71,9 +72,11 @@ const (
 	maxApprovalCommandPreview         = 300
 	approvalCallbackPrefix            = "appr"
 	unauthorizedReplyCooldown         = time.Minute
+	startupFlushBatchLimit            = 100
 )
 
 var ErrRestartRequested = errors.New("telegram restart requested")
+var telegramAPICall = call
 
 type inFlightTurn struct {
 	id     uint64
@@ -152,6 +155,16 @@ func (r *Runner) Run(ctx context.Context) error {
 		return err
 	}
 	r.logf("telegram polling preflight passed")
+	flushedOffset, flushedCount, flushErr := r.flushQueuedUpdates(ctx, offset)
+	if flushErr != nil {
+		r.logf("startup backlog flush skipped: %v", r.redactError(flushErr))
+	} else if flushedOffset > offset {
+		offset = flushedOffset
+		r.setOffset(ctx, int64(offset))
+		r.logf("startup backlog flush complete: dropped_updates=%d new_offset=%d", flushedCount, offset)
+	} else {
+		r.logf("startup backlog flush complete: no queued updates")
+	}
 
 	runCtx, cancel := context.WithCancel(ctx)
 	r.restarting.Store(false)
@@ -217,6 +230,12 @@ func (r *Runner) Run(ctx context.Context) error {
 		}
 	})
 	defer r.Engine.SetCoreMemoryEventSink(nil)
+	stopWebhook, webhookErr := r.startGitHubWebhookServer(runCtx, b)
+	if webhookErr != nil {
+		r.logf("github webhook server start failed: %v", r.redactError(webhookErr))
+		return webhookErr
+	}
+	defer stopWebhook()
 	r.logf("telegram client initialized (long polling, private chats)")
 	if err := SyncCommands(runCtx, r.Cfg.Telegram.BotToken); err != nil {
 		r.logf("telegram command sync warning: %v", r.redactError(err))
@@ -262,7 +281,7 @@ func (r *Runner) Run(ctx context.Context) error {
 }
 
 func (r *Runner) ensurePollingOwnership(ctx context.Context, offset int) error {
-	_, err := call(ctx, r.Cfg.Telegram.BotToken, "getUpdates", map[string]interface{}{
+	_, err := telegramAPICall(ctx, r.Cfg.Telegram.BotToken, "getUpdates", map[string]interface{}{
 		"offset":          int64(offset + 1),
 		"limit":           1,
 		"timeout":         0,
@@ -275,6 +294,40 @@ func (r *Runner) ensurePollingOwnership(ctx context.Context, offset int) error {
 		return fmt.Errorf("another bot instance is currently polling this token")
 	}
 	return fmt.Errorf("telegram getUpdates preflight failed: %w", r.redactError(err))
+}
+
+func (r *Runner) flushQueuedUpdates(ctx context.Context, offset int) (latestOffset int, dropped int, err error) {
+	latestOffset = offset
+	for {
+		raw, callErr := telegramAPICall(ctx, r.Cfg.Telegram.BotToken, "getUpdates", map[string]interface{}{
+			"offset":          int64(latestOffset + 1),
+			"limit":           startupFlushBatchLimit,
+			"timeout":         0,
+			"allowed_updates": []string{"message", "callback_query"},
+		})
+		if callErr != nil {
+			return latestOffset, dropped, fmt.Errorf("telegram getUpdates backlog flush failed: %w", r.redactError(callErr))
+		}
+
+		var updates []struct {
+			ID int64 `json:"update_id"`
+		}
+		if err := json.Unmarshal(raw, &updates); err != nil {
+			return latestOffset, dropped, fmt.Errorf("decode getUpdates backlog flush payload: %w", err)
+		}
+		if len(updates) == 0 {
+			return latestOffset, dropped, nil
+		}
+		for _, update := range updates {
+			if update.ID > int64(latestOffset) {
+				latestOffset = int(update.ID)
+				dropped++
+			}
+		}
+		if len(updates) < startupFlushBatchLimit {
+			return latestOffset, dropped, nil
+		}
+	}
 }
 
 func (r *Runner) readOffset(ctx context.Context) int {
@@ -681,10 +734,10 @@ func (r *Runner) handleCommand(ctx context.Context, b *bot.Bot, chatID int64, ra
 	case "start":
 		r.logf("command start: chat=%d", chatID)
 		r.resyncCommandsBestEffort("start")
-		send("OllamaClaw is ready.\nCommands:\n/start\n/help\n/model [name]\n/tools\n/reminder list [active|all]\n/reminder safe <id>\n/reminder unsafe <id>\n/reminder prefetch list <id>\n/show tools [on|off]\n/show thinking [on|off]\n/show dreaming [on|off]\n/verbose [on|off]\n/think [on|off|low|medium|high|default]\n/status\n/fullsystem\n/reset\n/stop\n/restart")
+		send("OllamaClaw is ready.\nCommands:\n/start\n/help\n/model [name]\n/tools\n/reminder list [active|all]\n/reminder safe <id>\n/reminder unsafe <id>\n/reminder prefetch list <id>\n/show tools [on|off]\n/show thinking [on|off]\n/show dreaming [on|off]\n/verbose [on|off]\n/think [on|off|low|medium|high|default]\n/dream\n/status\n/fullsystem\n/reset\n/stop\n/restart")
 	case "help":
 		r.logf("command help: chat=%d", chatID)
-		send("Commands:\n/start\n/help\n/model [name]\n/tools\n/reminder list [active|all]\n/reminder safe <id>\n/reminder unsafe <id>\n/reminder prefetch list <id>\n/show tools [on|off]\n/show thinking [on|off]\n/show dreaming [on|off]\n/verbose [on|off]\n/think [on|off|low|medium|high|default]\n/status\n/fullsystem\n/reset\n/stop\n/restart\n\nSend any text to chat with OllamaClaw.")
+		send("Commands:\n/start\n/help\n/model [name]\n/tools\n/reminder list [active|all]\n/reminder safe <id>\n/reminder unsafe <id>\n/reminder prefetch list <id>\n/show tools [on|off]\n/show thinking [on|off]\n/show dreaming [on|off]\n/verbose [on|off]\n/think [on|off|low|medium|high|default]\n/dream\n/status\n/fullsystem\n/reset\n/stop\n/restart\n\nSend any text to chat with OllamaClaw.")
 	case "reset":
 		r.logf("command reset: chat=%d", chatID)
 		newSess, err := r.Engine.ResetSession(ctx, "telegram", sessionKey)
@@ -851,6 +904,19 @@ func (r *Runner) handleCommand(ctx context.Context, b *bot.Bot, chatID int64, ra
 		}
 		r.logf("command think set: chat=%d value=%s", chatID, value)
 		send(fmt.Sprintf("think: %s", value))
+	case "dream":
+		r.logf("command dream: chat=%d args=%q", chatID, r.previewForLog(strings.Join(parts[1:], " ")))
+		started, err := r.Engine.TriggerCoreMemoriesRefresh(ctx, "telegram", sessionKey)
+		if err != nil {
+			r.logf("command dream failed: chat=%d error=%v", chatID, r.redactError(err))
+			sendErr(err)
+			return
+		}
+		if !started {
+			send("dreaming is already in progress for this session")
+			return
+		}
+		send("dreaming refresh triggered")
 	case "reminder":
 		r.logf("command reminder: chat=%d args=%q", chatID, r.previewForLog(strings.Join(parts[1:], " ")))
 		if r.Scheduler == nil {
@@ -976,7 +1042,11 @@ func (r *Runner) handleCommand(ctx context.Context, b *bot.Bot, chatID int64, ra
 		}
 		thresholdTokens := int(float64(r.Cfg.ContextWindowTokens) * r.Cfg.CompactionThreshold)
 		compaction := r.readCompactionSnapshot(ctx, sessionKey, sess)
-		text := fmt.Sprintf("status:\nversion: %s\nmodel: %s\nverbose: %t\nshow_tools: %t\nthink: %s\ndreaming_notifications: %t\ntimezone: %s\nnext_prompt_tokens_est: %d\nnext_prompt_chars_est: %d\nnext_prompt_messages: %d\nnext_prompt_tools: %d\nprompt_estimator: %s\nlifetime_prompt_tokens: %d\nlifetime_completion_tokens: %d\ncompactions: %d\ncontext_window_tokens: %d\ncompaction_threshold: %.2f\ncompaction_trigger_tokens: %d\nkeep_recent_turns: %d\nlast_compaction_at: %s\nlast_compaction_summary_chars: %d\nlast_compaction_archived_before_seq: %d\ndb: %s\nlog: %s", version, redactTelegramToken(r.Cfg.Telegram.BotToken, sess.ModelOverride), verbose, showTools, thinkValue, dreamingNotifications, util.PacificTimezoneName, estimate.EstimatedTokens, estimate.RequestChars, estimate.MessageCount, estimate.ToolCount, estimate.EstimatorFormula, sess.TotalPromptToken, sess.TotalEvalToken, compaction.TotalCount, r.Cfg.ContextWindowTokens, r.Cfg.CompactionThreshold, thresholdTokens, r.Cfg.KeepRecentTurns, compaction.LastAt, compaction.SummaryChars, compaction.ArchivedBeforeSeq, r.Cfg.DBPath, strings.TrimSpace(r.Cfg.LogPath))
+		webhookRepos := "-"
+		if len(r.Cfg.GitHubWebhook.RepoAllowlist) > 0 {
+			webhookRepos = strings.Join(r.Cfg.GitHubWebhook.RepoAllowlist, ", ")
+		}
+		text := fmt.Sprintf("status:\nversion: %s\nmodel: %s\nverbose: %t\nshow_tools: %t\nthink: %s\ndreaming_notifications: %t\ntimezone: %s\nnext_prompt_tokens_est: %d\nnext_prompt_chars_est: %d\nnext_prompt_messages: %d\nnext_prompt_tools: %d\nprompt_estimator: %s\nlifetime_prompt_tokens: %d\nlifetime_completion_tokens: %d\ncompactions: %d\ncontext_window_tokens: %d\ncompaction_threshold: %.2f\ncompaction_trigger_tokens: %d\nkeep_recent_turns: %d\nlast_compaction_at: %s\nlast_compaction_summary_chars: %d\nlast_compaction_archived_before_seq: %d\ngithub_webhook_enabled: %t\ngithub_webhook_listen_addr: %s\ngithub_webhook_owner_login: %s\ngithub_webhook_repo_allowlist: %s\ndb: %s\nlog: %s", version, redactTelegramToken(r.Cfg.Telegram.BotToken, sess.ModelOverride), verbose, showTools, thinkValue, dreamingNotifications, util.PacificTimezoneName, estimate.EstimatedTokens, estimate.RequestChars, estimate.MessageCount, estimate.ToolCount, estimate.EstimatorFormula, sess.TotalPromptToken, sess.TotalEvalToken, compaction.TotalCount, r.Cfg.ContextWindowTokens, r.Cfg.CompactionThreshold, thresholdTokens, r.Cfg.KeepRecentTurns, compaction.LastAt, compaction.SummaryChars, compaction.ArchivedBeforeSeq, githubWebhookEnabled(r.Cfg), strings.TrimSpace(r.Cfg.GitHubWebhook.ListenAddr), strings.TrimSpace(r.Cfg.GitHubWebhook.OwnerLogin), webhookRepos, r.Cfg.DBPath, strings.TrimSpace(r.Cfg.LogPath))
 		send(text)
 	case "fullsystem":
 		r.logf("command fullsystem: chat=%d", chatID)

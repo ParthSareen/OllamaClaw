@@ -18,6 +18,9 @@ func TestLoadCreatesDefaultConfig(t *testing.T) {
 	if cfg.DefaultModel != "kimi-k2.5:cloud" {
 		t.Fatalf("unexpected model: %s", cfg.DefaultModel)
 	}
+	if strings.TrimSpace(cfg.GitHubWebhook.ListenAddr) != "127.0.0.1:8787" {
+		t.Fatalf("unexpected github webhook listen addr: %q", cfg.GitHubWebhook.ListenAddr)
+	}
 	path, _ := ConfigPath()
 	if _, err := os.Stat(path); err != nil {
 		t.Fatalf("expected config file to exist: %v", err)
@@ -27,9 +30,13 @@ func TestLoadCreatesDefaultConfig(t *testing.T) {
 func TestRedactedMasksToken(t *testing.T) {
 	cfg := Default()
 	cfg.Telegram.BotToken = "secret"
+	cfg.GitHubWebhook.Secret = "webhook-secret"
 	red := Redacted(cfg)
 	if red.Telegram.BotToken != "***" {
 		t.Fatalf("expected redacted token, got %q", red.Telegram.BotToken)
+	}
+	if red.GitHubWebhook.Secret != "***" {
+		t.Fatalf("expected redacted github webhook secret, got %q", red.GitHubWebhook.Secret)
 	}
 }
 
@@ -72,5 +79,28 @@ func TestSystemPromptOverlayPaths(t *testing.T) {
 	}
 	if !strings.HasSuffix(historyPath, filepath.Join(".ollamaclaw", "system_prompt.overlay.history.jsonl")) {
 		t.Fatalf("unexpected history path: %s", historyPath)
+	}
+}
+
+func TestLoadNormalizesGitHubWebhookAllowlist(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	cfg := Default()
+	cfg.GitHubWebhook.Secret = "secret"
+	cfg.GitHubWebhook.OwnerLogin = "parth"
+	cfg.GitHubWebhook.Enabled = true
+	cfg.GitHubWebhook.RepoAllowlist = []string{"ollama/ollama", " ollama/ollama ", "Ollama/Ollama", "", "openai/openai"}
+	if err := Save(cfg); err != nil {
+		t.Fatalf("Save() error: %v", err)
+	}
+	loaded, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if !loaded.GitHubWebhook.Enabled {
+		t.Fatalf("expected github webhook to stay enabled with valid creds")
+	}
+	if got := loaded.GitHubWebhook.RepoAllowlist; len(got) != 2 {
+		t.Fatalf("expected deduped allowlist length 2, got %d (%v)", len(got), got)
 	}
 }

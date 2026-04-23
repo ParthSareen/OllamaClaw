@@ -461,6 +461,76 @@ func TestSessionDreamingNotificationsRoundTrip(t *testing.T) {
 	}
 }
 
+func TestTriggerCoreMemoriesRefreshRunsAndPreventsDuplicate(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	ctx := context.Background()
+
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-release
+		resp := ollama.ChatResponse{
+			Message:         ollama.ChatMessage{Role: "assistant", Content: "- prefers concise updates"},
+			PromptEvalCount: 11,
+			EvalCount:       3,
+			Done:            true,
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer srv.Close()
+
+	engine, store := newTestEngine(t, srv.URL)
+	defer store.Close()
+
+	sess, err := engine.GetOrCreateSession(ctx, "telegram", "123")
+	if err != nil {
+		t.Fatalf("GetOrCreateSession error: %v", err)
+	}
+	if err := store.InsertMessage(ctx, &db.Message{SessionID: sess.ID, Role: "user", Content: "I like short answers"}); err != nil {
+		t.Fatalf("InsertMessage error: %v", err)
+	}
+
+	events := make(chan CoreMemoryEvent, 4)
+	engine.SetCoreMemoryEventSink(func(ev CoreMemoryEvent) {
+		events <- ev
+	})
+	defer engine.SetCoreMemoryEventSink(nil)
+
+	started, err := engine.TriggerCoreMemoriesRefresh(ctx, "telegram", "123")
+	if err != nil {
+		t.Fatalf("TriggerCoreMemoriesRefresh error: %v", err)
+	}
+	if !started {
+		t.Fatalf("expected first trigger to start refresh")
+	}
+
+	started, err = engine.TriggerCoreMemoriesRefresh(ctx, "telegram", "123")
+	if err != nil {
+		t.Fatalf("TriggerCoreMemoriesRefresh second call error: %v", err)
+	}
+	if started {
+		t.Fatalf("expected second trigger while in-flight to be skipped")
+	}
+
+	close(release)
+
+	var seenStart, seenDone bool
+	timeout := time.After(2 * time.Second)
+	for !(seenStart && seenDone) {
+		select {
+		case ev := <-events:
+			if ev.Phase == CoreMemoryEventStart {
+				seenStart = true
+			}
+			if ev.Phase == CoreMemoryEventDone {
+				seenDone = true
+			}
+		case <-timeout:
+			t.Fatalf("timed out waiting for start+done core memory events")
+		}
+	}
+}
+
 func TestSessionThinkValueRoundTrip(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	ctx := context.Background()

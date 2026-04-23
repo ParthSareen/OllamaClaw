@@ -3,6 +3,7 @@ package telegram
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/ParthSareen/OllamaClaw/internal/agent"
+	"github.com/ParthSareen/OllamaClaw/internal/config"
 	"github.com/go-telegram/bot"
 	"github.com/go-telegram/bot/models"
 )
@@ -64,6 +66,7 @@ func TestParseCommand(t *testing.T) {
 		{in: "/ show thinking on", want: "show"},
 		{in: "/show thinking off", want: "show"},
 		{in: "/reminder list", want: "reminder"},
+		{in: "/dream", want: "dream"},
 		{in: "/stop", want: "stop"},
 		{in: "/restart", want: "restart"},
 		{in: "plain text", want: ""},
@@ -277,6 +280,121 @@ func TestIsPollingConflictErr(t *testing.T) {
 	if isPollingConflictErr(nonConflict) {
 		t.Fatalf("did not expect non-conflict error to be detected")
 	}
+}
+
+func TestFlushQueuedUpdatesAdvancesOffsetAndDropsQueuedMessages(t *testing.T) {
+	oldCall := telegramAPICall
+	t.Cleanup(func() { telegramAPICall = oldCall })
+
+	fullBatch := make([]map[string]int64, 0, startupFlushBatchLimit)
+	for i := 0; i < startupFlushBatchLimit; i++ {
+		fullBatch = append(fullBatch, map[string]int64{"update_id": int64(101 + i)})
+	}
+	fullBatchJSON, err := json.Marshal(fullBatch)
+	if err != nil {
+		t.Fatalf("marshal full batch: %v", err)
+	}
+
+	type step struct {
+		wantOffset int64
+		result     string
+	}
+	steps := []step{
+		{wantOffset: 51, result: string(fullBatchJSON)},
+		{wantOffset: 201, result: `[{"update_id":201}]`},
+	}
+	callIdx := 0
+	telegramAPICall = func(ctx context.Context, token, method string, payload interface{}) (json.RawMessage, error) {
+		_ = ctx
+		if token != "token" {
+			t.Fatalf("unexpected token: %q", token)
+		}
+		if method != "getUpdates" {
+			t.Fatalf("unexpected method: %q", method)
+		}
+		if callIdx >= len(steps) {
+			t.Fatalf("unexpected extra getUpdates call #%d", callIdx+1)
+		}
+		args, ok := payload.(map[string]interface{})
+		if !ok {
+			t.Fatalf("unexpected payload type: %T", payload)
+		}
+		gotOffset, ok := args["offset"].(int64)
+		if !ok {
+			t.Fatalf("offset not int64: %#v", args["offset"])
+		}
+		if gotOffset != steps[callIdx].wantOffset {
+			t.Fatalf("call %d offset=%d want=%d", callIdx+1, gotOffset, steps[callIdx].wantOffset)
+		}
+		callIdx++
+		return json.RawMessage(steps[callIdx-1].result), nil
+	}
+
+	r := &Runner{Cfg: configForTestToken("token")}
+	next, dropped, err := r.flushQueuedUpdates(context.Background(), 50)
+	if err != nil {
+		t.Fatalf("flushQueuedUpdates() error: %v", err)
+	}
+	if next != 201 {
+		t.Fatalf("expected next offset 201, got %d", next)
+	}
+	if dropped != 101 {
+		t.Fatalf("expected dropped updates count 101, got %d", dropped)
+	}
+	if callIdx != len(steps) {
+		t.Fatalf("expected %d calls, got %d", len(steps), callIdx)
+	}
+}
+
+func TestFlushQueuedUpdatesEmptyBacklog(t *testing.T) {
+	oldCall := telegramAPICall
+	t.Cleanup(func() { telegramAPICall = oldCall })
+
+	telegramAPICall = func(ctx context.Context, token, method string, payload interface{}) (json.RawMessage, error) {
+		_ = ctx
+		_ = token
+		_ = method
+		_ = payload
+		return json.RawMessage(`[]`), nil
+	}
+	r := &Runner{Cfg: configForTestToken("token")}
+	next, dropped, err := r.flushQueuedUpdates(context.Background(), 777)
+	if err != nil {
+		t.Fatalf("flushQueuedUpdates() error: %v", err)
+	}
+	if next != 777 {
+		t.Fatalf("expected unchanged offset 777, got %d", next)
+	}
+	if dropped != 0 {
+		t.Fatalf("expected dropped=0, got %d", dropped)
+	}
+}
+
+func TestFlushQueuedUpdatesDecodeError(t *testing.T) {
+	oldCall := telegramAPICall
+	t.Cleanup(func() { telegramAPICall = oldCall })
+
+	telegramAPICall = func(ctx context.Context, token, method string, payload interface{}) (json.RawMessage, error) {
+		_ = ctx
+		_ = token
+		_ = method
+		_ = payload
+		return json.RawMessage(`{not-json`), nil
+	}
+	r := &Runner{Cfg: configForTestToken("token")}
+	_, _, err := r.flushQueuedUpdates(context.Background(), 1)
+	if err == nil {
+		t.Fatalf("expected decode error")
+	}
+	if !strings.Contains(strings.ToLower(err.Error()), "decode") {
+		t.Fatalf("expected decode error context, got %v", err)
+	}
+}
+
+func configForTestToken(token string) config.Config {
+	cfg := config.Config{}
+	cfg.Telegram.BotToken = token
+	return cfg
 }
 
 func TestParsePollerCandidates(t *testing.T) {
