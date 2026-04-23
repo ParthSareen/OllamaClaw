@@ -85,6 +85,26 @@ func TestCompileReminderSpecPacificIntervalModes(t *testing.T) {
 	}
 }
 
+func TestCompileReminderSpecPacificDaily(t *testing.T) {
+	now := time.Now()
+	out, err := CompileReminderSpecPacific(tools.ReminderSpec{
+		Mode: "daily",
+		Time: "09:00",
+	}, now)
+	if err != nil {
+		t.Fatalf("daily compile error: %v", err)
+	}
+	if out.Mode != "daily" {
+		t.Fatalf("expected mode daily, got %q", out.Mode)
+	}
+	if out.CompiledSchedule != "0 9 * * *" {
+		t.Fatalf("unexpected daily schedule %q", out.CompiledSchedule)
+	}
+	if !strings.Contains(out.NormalizedSpecJSON, `"mode":"daily"`) {
+		t.Fatalf("expected normalized JSON to include daily mode, got %q", out.NormalizedSpecJSON)
+	}
+}
+
 func TestCompileReminderSpecPacificWeekdaysAndMonthly(t *testing.T) {
 	now := time.Now()
 	weekdays, err := CompileReminderSpecPacific(tools.ReminderSpec{

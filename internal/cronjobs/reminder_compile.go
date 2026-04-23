@@ -25,6 +25,8 @@ func CompileReminderSpecPacific(spec tools.ReminderSpec, now time.Time) (Compile
 	switch mode {
 	case "once":
 		return compileOnceReminder(spec, nowPacific)
+	case "daily":
+		return compileDailyReminder(spec)
 	case "interval":
 		return compileIntervalReminder(spec)
 	case "weekdays":
@@ -34,6 +36,26 @@ func CompileReminderSpecPacific(spec tools.ReminderSpec, now time.Time) (Compile
 	default:
 		return CompiledReminder{}, fmt.Errorf("unsupported reminder mode %q", spec.Mode)
 	}
+}
+
+func compileDailyReminder(spec tools.ReminderSpec) (CompiledReminder, error) {
+	hour, minute, err := parseTimeHHMM(spec.Time)
+	if err != nil {
+		return CompiledReminder{}, fmt.Errorf("daily mode requires valid time HH:MM in %s: %w", util.PacificTimezoneName, err)
+	}
+	normalized := map[string]interface{}{
+		"mode": "daily",
+		"time": fmt.Sprintf("%02d:%02d", hour, minute),
+	}
+	specJSON, err := mustMarshalJSON(normalized)
+	if err != nil {
+		return CompiledReminder{}, err
+	}
+	return CompiledReminder{
+		Mode:               "daily",
+		CompiledSchedule:   fmt.Sprintf("%d %d * * *", minute, hour),
+		NormalizedSpecJSON: specJSON,
+	}, nil
 }
 
 func compileOnceReminder(spec tools.ReminderSpec, nowPacific time.Time) (CompiledReminder, error) {
