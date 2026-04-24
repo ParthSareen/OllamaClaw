@@ -1204,6 +1204,87 @@ func TestEstimateNextPromptUsesJSONHeuristic(t *testing.T) {
 	}
 }
 
+func TestHandleTextRejectsOversizedPromptBeforeChat(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	ctx := context.Background()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatalf("oversized prompt should not call /api/chat")
+	}))
+	defer srv.Close()
+
+	engine, store := newTestEngine(t, srv.URL)
+	defer store.Close()
+	engine.cfg.ContextWindowTokens = 20
+
+	_, err := engine.HandleText(ctx, "telegram", "8750063231", strings.Repeat("large prompt ", 100))
+	if err == nil {
+		t.Fatalf("expected oversized prompt error")
+	}
+	if !strings.Contains(err.Error(), "prompt is too large") {
+		t.Fatalf("expected prompt size error, got %v", err)
+	}
+}
+
+func TestCompactionSummaryOmitsThinking(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	ctx := context.Background()
+
+	callCount := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req ollama.ChatRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		callCount++
+		resp := ollama.ChatResponse{
+			Message:         ollama.ChatMessage{Role: "assistant", Content: "final"},
+			PromptEvalCount: 20,
+			EvalCount:       1,
+			Done:            true,
+		}
+		if callCount == 2 {
+			if len(req.Messages) < 2 {
+				t.Fatalf("expected summary request to include user payload")
+			}
+			if strings.Contains(req.Messages[1].Content, "secret chain of thought") {
+				t.Fatalf("compaction summary payload leaked thinking: %s", req.Messages[1].Content)
+			}
+			resp.Message.Content = "summary without thinking"
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer srv.Close()
+
+	engine, store := newTestEngine(t, srv.URL)
+	defer store.Close()
+	engine.cfg.CompactionThreshold = 0.001
+	engine.cfg.KeepRecentTurns = 1
+
+	sess, err := engine.GetOrCreateSession(ctx, "telegram", "8750063231")
+	if err != nil {
+		t.Fatalf("GetOrCreateSession error: %v", err)
+	}
+	if err := store.InsertMessage(ctx, &db.Message{SessionID: sess.ID, Role: "user", Content: "old request"}); err != nil {
+		t.Fatalf("InsertMessage user error: %v", err)
+	}
+	if err := store.InsertMessage(ctx, &db.Message{SessionID: sess.ID, Role: "assistant", Content: "old answer", Thinking: "secret chain of thought"}); err != nil {
+		t.Fatalf("InsertMessage assistant error: %v", err)
+	}
+
+	res, err := engine.HandleText(ctx, "telegram", "8750063231", "new request")
+	if err != nil {
+		t.Fatalf("HandleText error: %v", err)
+	}
+	if !res.Compacted {
+		t.Fatalf("expected compaction to run")
+	}
+	if callCount != 2 {
+		t.Fatalf("expected chat + summary calls, got %d", callCount)
+	}
+}
+
 func TestSummarizeCoreMemoryDelta(t *testing.T) {
 	before := "- prefers concise replies\n- runs cron checks in morning\n- tone: founder copilot"
 	after := "- prefers concise replies\n- tone: founder copilot\n- asks for PST timestamps\n- likes command previews"

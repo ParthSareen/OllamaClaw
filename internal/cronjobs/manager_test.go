@@ -4,6 +4,7 @@ import (
 	"context"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -146,6 +147,54 @@ func TestSetReminderSafeAndApproverInjection(t *testing.T) {
 	if lastHadApprover {
 		t.Fatalf("expected approver absent after safe=false")
 	}
+}
+
+func TestRunJobSkipsOverlappingRun(t *testing.T) {
+	store, err := db.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer store.Close()
+
+	mgr := NewManager(store)
+	started := make(chan struct{}, 2)
+	release := make(chan struct{})
+	var runCount atomic.Int32
+	mgr.SetRunner(func(ctx context.Context, transport, sessionKey, prompt string) (RunResult, error) {
+		_ = ctx
+		_ = transport
+		_ = sessionKey
+		_ = prompt
+		runCount.Add(1)
+		started <- struct{}{}
+		<-release
+		return RunResult{Output: "ok"}, nil
+	})
+
+	job, err := mgr.AddReminder(context.Background(), tools.ReminderSpec{
+		ID:           "overlap-test",
+		Mode:         "interval",
+		IntervalUnit: "minute",
+		Interval:     5,
+		Prompt:       "ping",
+		Transport:    "telegram",
+		SessionKey:   "8750063231",
+	})
+	if err != nil {
+		t.Fatalf("add reminder: %v", err)
+	}
+
+	go mgr.runJob(job.ID)
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatalf("first run did not start")
+	}
+	mgr.runJob(job.ID)
+	if got := runCount.Load(); got != 1 {
+		t.Fatalf("expected overlapping run to be skipped, got runCount=%d", got)
+	}
+	close(release)
 }
 
 func TestSetReminderSafeMissingReminder(t *testing.T) {

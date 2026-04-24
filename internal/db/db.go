@@ -353,20 +353,34 @@ func (s *Store) CountMessagesByRole(ctx context.Context, sessionID, role string)
 }
 
 func (s *Store) InsertMessage(ctx context.Context, m *Message) error {
-	if m.Seq == 0 {
-		seq, err := s.NextMessageSeq(ctx, m.SessionID)
-		if err != nil {
-			return err
-		}
-		m.Seq = seq
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin insert message: %w", err)
 	}
-	res, err := s.db.ExecContext(ctx, `
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+
+	if m.Seq == 0 {
+		row := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(seq), 0) + 1 FROM messages WHERE session_id = ?`, m.SessionID)
+		if err := row.Scan(&m.Seq); err != nil {
+			return fmt.Errorf("next message seq: %w", err)
+		}
+	}
+	res, err := tx.ExecContext(ctx, `
 INSERT INTO messages(session_id, seq, role, content, thinking, tool_name, tool_call_id, tool_args_json, tool_calls_json, prompt_eval_count, eval_count, archived, created_at)
 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 `, m.SessionID, m.Seq, m.Role, m.Content, m.Thinking, m.ToolName, m.ToolCallID, m.ToolArgsJSON, m.ToolCallsJSON, m.PromptEvalCount, m.EvalCount, boolToInt(m.Archived), time.Now().UTC().Format(time.RFC3339Nano))
 	if err != nil {
 		return fmt.Errorf("insert message: %w", err)
 	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit insert message: %w", err)
+	}
+	committed = true
 	id, _ := res.LastInsertId()
 	m.ID = id
 	return nil

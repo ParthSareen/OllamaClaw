@@ -197,20 +197,22 @@ func (r *Runner) shouldAcceptGitHubWebhookPayload(eventType string, payload gith
 	if !shouldHandleGitHubAction(eventType, action) {
 		return false, "unsupported event/action"
 	}
-	sender := strings.TrimSpace(payload.Sender.Login)
-	if sender == "" {
-		return false, "missing sender login"
-	}
-	owner := strings.TrimSpace(r.Cfg.GitHubWebhook.OwnerLogin)
-	if owner != "" && !strings.EqualFold(owner, sender) {
-		return false, "sender not configured owner login"
-	}
 	repo := strings.TrimSpace(payload.Repository.FullName)
 	if repo == "" {
 		return false, "missing repository full_name"
 	}
 	if !repoAllowed(repo, r.Cfg.GitHubWebhook.RepoAllowlist) {
 		return false, "repository not in allowlist"
+	}
+	if !isGitHubCIEvent(eventType) {
+		sender := strings.TrimSpace(payload.Sender.Login)
+		if sender == "" {
+			return false, "missing sender login"
+		}
+		owner := strings.TrimSpace(r.Cfg.GitHubWebhook.OwnerLogin)
+		if owner != "" && !strings.EqualFold(owner, sender) {
+			return false, "sender not configured owner login"
+		}
 	}
 	return true, ""
 }
@@ -321,6 +323,15 @@ func shouldHandleGitHubAction(eventType, action string) bool {
 		}
 	case "check_run", "check_suite":
 		return action == "completed"
+	default:
+		return false
+	}
+}
+
+func isGitHubCIEvent(eventType string) bool {
+	switch strings.TrimSpace(strings.ToLower(eventType)) {
+	case "check_run", "check_suite":
+		return true
 	default:
 		return false
 	}

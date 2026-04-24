@@ -39,6 +39,7 @@ type Manager struct {
 
 	mu      sync.Mutex
 	entries map[string]cron.EntryID
+	running map[string]struct{}
 	parser  cron.Parser
 	c       *cron.Cron
 	started bool
@@ -71,6 +72,7 @@ func NewManager(store *db.Store) *Manager {
 	return &Manager{
 		store:   store,
 		entries: map[string]cron.EntryID{},
+		running: map[string]struct{}{},
 		parser:  parser,
 		c:       c,
 	}
@@ -286,6 +288,10 @@ func (m *Manager) runJob(jobID string) {
 	if err != nil || !ok || !job.Active {
 		return
 	}
+	if !m.beginJobRun(job.ID) {
+		return
+	}
+	defer m.endJobRun(job.ID)
 
 	m.mu.Lock()
 	runner := m.runner
@@ -372,6 +378,33 @@ func (m *Manager) unschedule(id string) {
 		m.c.Remove(eid)
 		delete(m.entries, id)
 	}
+}
+
+func (m *Manager) beginJobRun(id string) bool {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.running == nil {
+		m.running = map[string]struct{}{}
+	}
+	if _, exists := m.running[id]; exists {
+		return false
+	}
+	m.running[id] = struct{}{}
+	return true
+}
+
+func (m *Manager) endJobRun(id string) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.running, id)
 }
 
 func parseSchedulePacific(parser cron.Parser, schedule string) (cron.Schedule, error) {

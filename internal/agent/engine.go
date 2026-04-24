@@ -251,7 +251,11 @@ func (e *Engine) HandleTextWithOptions(ctx context.Context, transport, sessionKe
 			return HandleResult{}, err
 		}
 		msgList = attachImagesToLatestUserMessage(msgList, inputImages)
-		resp, err := e.client.Chat(ctx, ollama.ChatRequest{Model: model, Messages: msgList, Tools: toolDefs, Stream: false, Think: thinkParam})
+		req := ollama.ChatRequest{Model: model, Messages: msgList, Tools: toolDefs, Stream: false, Think: thinkParam}
+		if err := ensureChatRequestWithinContextWindow(req, e.cfg.ContextWindowTokens); err != nil {
+			return HandleResult{}, err
+		}
+		resp, err := e.client.Chat(ctx, req)
 		if err != nil {
 			if cerr := ctx.Err(); cerr != nil {
 				return HandleResult{}, cerr
@@ -646,14 +650,9 @@ func (e *Engine) EstimateNextPrompt(ctx context.Context, transport, sessionKey s
 		Stream:   false,
 		Think:    thinkParam,
 	}
-	payload, err := json.Marshal(req)
+	estTokens, chars, err := estimateChatRequestTokens(req)
 	if err != nil {
 		return PromptEstimate{}, err
-	}
-	chars := len(payload)
-	estTokens := chars / 4
-	if chars > 0 && estTokens == 0 {
-		estTokens = 1
 	}
 	return PromptEstimate{
 		RequestChars:     chars,
@@ -957,7 +956,7 @@ func (e *Engine) refreshCoreMemories(ctx context.Context, sess db.Session, model
 		existing = string(b)
 	}
 	existingCore := clampToMaxChars(extractManagedCoreMemories(existing), coreMemoriesMaxChars)
-	req := []ollama.ChatMessage{
+	memoryMessages := []ollama.ChatMessage{
 		{
 			Role:    "system",
 			Content: "Update the assistant's durable core memories from conversation logs. Keep only stable preferences, communication style, workflows, constraints, and long-term context. Exclude ephemeral details. Output concise Markdown bullets only. Keep total output at or below 4000 characters.",
@@ -967,12 +966,16 @@ func (e *Engine) refreshCoreMemories(ctx context.Context, sess db.Session, model
 			Content: fmt.Sprintf("Existing core memories:\n%s\n\nRecent conversation:\n%s\n\nReturn only updated core memories as Markdown bullets (max 20 bullets, max 4000 characters).", existingCore, conversation),
 		},
 	}
-	resp, err := e.client.Chat(ctx, ollama.ChatRequest{
+	req := ollama.ChatRequest{
 		Model:    model,
-		Messages: req,
+		Messages: memoryMessages,
 		Stream:   false,
 		Think:    false,
-	})
+	}
+	if err := ensureChatRequestWithinContextWindow(req, e.cfg.ContextWindowTokens); err != nil {
+		return coreMemoryRefreshResult{}, err
+	}
+	resp, err := e.client.Chat(ctx, req)
 	if err != nil {
 		return coreMemoryRefreshResult{}, err
 	}
@@ -1189,13 +1192,12 @@ func (e *Engine) maybeCompact(ctx context.Context, sess db.Session, model string
 		Role      string `json:"role"`
 		Content   string `json:"content"`
 		ToolName  string `json:"tool_name,omitempty"`
-		Thinking  string `json:"thinking,omitempty"`
 		ToolCalls string `json:"tool_calls,omitempty"`
 	}
 	payload := make([]compactMessage, 0, len(toSummarize))
 	ids := make([]int64, 0, len(toSummarize))
 	for _, row := range toSummarize {
-		payload = append(payload, compactMessage{Role: row.Role, Content: row.Content, ToolName: row.ToolName, Thinking: row.Thinking, ToolCalls: row.ToolCallsJSON})
+		payload = append(payload, compactMessage{Role: row.Role, Content: row.Content, ToolName: row.ToolName, ToolCalls: row.ToolCallsJSON})
 		ids = append(ids, row.ID)
 	}
 	b, _ := json.Marshal(payload)
@@ -1203,7 +1205,11 @@ func (e *Engine) maybeCompact(ctx context.Context, sess db.Session, model string
 		{Role: "system", Content: "Summarize the archived conversation for future continuation. Include decisions, constraints, file/task state, and unresolved items."},
 		{Role: "user", Content: "Previous summary:\n" + latestSummary + "\n\nMessages to summarize:\n" + string(b)},
 	}
-	summaryResp, err := e.client.Chat(ctx, ollama.ChatRequest{Model: model, Messages: summaryPrompt, Stream: false, Think: thinkParam})
+	summaryReq := ollama.ChatRequest{Model: model, Messages: summaryPrompt, Stream: false, Think: thinkParam}
+	if err := ensureChatRequestWithinContextWindow(summaryReq, e.cfg.ContextWindowTokens); err != nil {
+		return false, err
+	}
+	summaryResp, err := e.client.Chat(ctx, summaryReq)
 	if err != nil {
 		return false, err
 	}
@@ -1226,6 +1232,33 @@ func (e *Engine) maybeCompact(ctx context.Context, sess db.Session, model string
 		return false, err
 	}
 	return true, nil
+}
+
+func ensureChatRequestWithinContextWindow(req ollama.ChatRequest, contextWindowTokens int) error {
+	if contextWindowTokens <= 0 {
+		return nil
+	}
+	estimatedTokens, requestChars, err := estimateChatRequestTokens(req)
+	if err != nil {
+		return err
+	}
+	if estimatedTokens <= contextWindowTokens {
+		return nil
+	}
+	return fmt.Errorf("prompt is too large for configured context window: estimated_tokens=%d request_chars=%d limit_tokens=%d estimator=len(request_json)/4", estimatedTokens, requestChars, contextWindowTokens)
+}
+
+func estimateChatRequestTokens(req ollama.ChatRequest) (estimatedTokens int, requestChars int, err error) {
+	payload, err := json.Marshal(req)
+	if err != nil {
+		return 0, 0, fmt.Errorf("marshal chat request for prompt size check: %w", err)
+	}
+	requestChars = len(payload)
+	estimatedTokens = requestChars / 4
+	if requestChars > 0 && estimatedTokens == 0 {
+		estimatedTokens = 1
+	}
+	return estimatedTokens, requestChars, nil
 }
 
 func toOllamaTools(in []tools.Tool) []ollama.ToolDefinition {

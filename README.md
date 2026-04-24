@@ -1,13 +1,16 @@
 # OllamaClaw
 
-OllamaClaw is a Telegram-first Go coding agent which uses Ollama. Hacking on this to use as a playground for different ideas and experiements. Currently using it to run reminders and small tasks.
-Current app version: `0.1.7`.
+OllamaClaw is a private Telegram-first local agent for your laptop, powered by Ollama. It is built for remote coding/ops work from a trusted DM: ask it questions, let it inspect files/logs, run safe shell commands, follow up on GitHub/CI, and run reminder-triggered tasks while keeping state locally.
+Current app version: `0.1.8`.
 
 It supports:
-- Shared agent core for `repl` and `telegram` modes
-- Built-in tools: `bash`, `read_file`, `write_file`, `web_search`, `web_fetch`, `system_prompt_get`, `system_prompt_update`, `system_prompt_history`, `system_prompt_rollback`
-- Local SQLite persistence with per-chat sessions
-- Context compaction (summary + recent turns)
+- Private Telegram DM gateway with owner allowlist, image input, `/stop`, `/restart`, `/status`, `/fullsystem`, live tool visibility, and thinking controls
+- Shared local agent core for `repl`, Telegram, reminders, and GitHub webhook-triggered turns
+- Built-in tools only: `bash`, `read_file`, `write_file`, `web_search`, `web_fetch`, `read_logs`, reminder tools, and managed system prompt tools
+- Reminder-first scheduling in `America/Los_Angeles`, backed by cron internally, with safe-mode and fresh prefetch context
+- Local SQLite persistence with per-chat sessions, message history, compaction summaries, reminders, and learned prefetch commands
+- Dynamic system prompt files plus background core memories (“dreaming”) injected into prompt context
+- Context compaction plus a prompt-size safety guard before Ollama calls
 - Optional GitHub webhook trigger path for proactive Telegram updates
 
 ## Install
@@ -178,6 +181,9 @@ Lists reminders with normalized spec and compiled cron schedule.
 ### `reminder_remove`
 Removes a reminder by `id`.
 
+### `read_logs`
+Reads recent OllamaClaw runtime logs for self-debugging.
+
 ### `system_prompt_get`
 Reads managed system prompt details (base/overlay paths, overlay content, optional revision history).
 
@@ -253,6 +259,7 @@ Compaction archives old rows (`archived=1`) and keeps raw history in SQLite.
 - Result: save summary in `compactions`, archive old messages, keep recent turns active
 - Active prompt: `system + latest summary + unarchived recent messages`
 - Telegram sends a compaction notice message when compaction happens during a turn (including background reminder-triggered turns sent to Telegram sessions)
+- Safety guard: before every Ollama chat request, OllamaClaw estimates prompt size with `len(request_json)/4` and refuses requests over `context_window_tokens`
 
 ## Core memories behavior
 

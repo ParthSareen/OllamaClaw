@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -110,6 +111,59 @@ func TestMessageArchiveAndCompactionSummary(t *testing.T) {
 	}
 	if countTool != 0 {
 		t.Fatalf("expected 0 tool messages, got %d", countTool)
+	}
+}
+
+func TestInsertMessageAssignsUniqueSeqConcurrently(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	store, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open() error: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+	sess, err := store.CreateSession(ctx, "telegram", "8750063231", "model")
+	if err != nil {
+		t.Fatalf("CreateSession() error: %v", err)
+	}
+
+	const count = 40
+	var wg sync.WaitGroup
+	errCh := make(chan error, count)
+	for i := 0; i < count; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			errCh <- store.InsertMessage(ctx, &Message{SessionID: sess.ID, Role: "user", Content: fmt.Sprintf("message %d", i)})
+		}(i)
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		if err != nil {
+			t.Fatalf("InsertMessage concurrent error: %v", err)
+		}
+	}
+
+	rows, err := store.ListMessages(ctx, sess.ID, false)
+	if err != nil {
+		t.Fatalf("ListMessages() error: %v", err)
+	}
+	if len(rows) != count {
+		t.Fatalf("expected %d messages, got %d", count, len(rows))
+	}
+	seen := map[int]bool{}
+	for _, row := range rows {
+		if seen[row.Seq] {
+			t.Fatalf("duplicate seq detected: %d", row.Seq)
+		}
+		seen[row.Seq] = true
+	}
+	for seq := 1; seq <= count; seq++ {
+		if !seen[seq] {
+			t.Fatalf("missing seq %d in %v", seq, seen)
+		}
 	}
 }
 

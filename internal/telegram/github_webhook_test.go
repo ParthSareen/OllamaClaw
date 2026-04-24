@@ -94,6 +94,20 @@ func TestShouldAcceptGitHubWebhookPayload(t *testing.T) {
 	if ok {
 		t.Fatalf("expected repo mismatch to be rejected")
 	}
+
+	payload.Action = "completed"
+	payload.Sender.Login = "github-actions[bot]"
+	payload.Repository.FullName = "ollama/ollama"
+	ok, reason = r.shouldAcceptGitHubWebhookPayload("check_run", payload)
+	if !ok {
+		t.Fatalf("expected allowlisted CI event to be accepted regardless of sender, reason=%s", reason)
+	}
+
+	payload.Repository.FullName = "openai/openai"
+	ok, _ = r.shouldAcceptGitHubWebhookPayload("check_run", payload)
+	if ok {
+		t.Fatalf("expected non-allowlisted CI event to be rejected")
+	}
 }
 
 func TestBuildGitHubWebhookTurnText(t *testing.T) {
