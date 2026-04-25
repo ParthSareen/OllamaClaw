@@ -37,6 +37,7 @@ type Service struct {
 
 type VoiceFile struct {
 	Path            string
+	WAVPath         string
 	DurationSeconds int
 	SpeechText      string
 	Cleanup         func()
@@ -69,7 +70,22 @@ func (s *Service) Transcribe(ctx context.Context, audioPath string) (string, err
 	}
 	defer cleanup()
 
-	prompt := "Transcribe the speech in this audio. Output only the transcript."
+	prompt := strings.Join([]string{
+		"Transcribe the speech in this audio. Output only the transcript.",
+		"",
+		"Context:",
+		"- This is a short user message for OllamaClaw, a private agent named Edith.",
+		"- The audio may come from a local Mac push-to-talk hotkey harness or a Telegram voice note.",
+		"- The speaker often talks about technical work: coding, terminals, logs, repos, GitHub, Go, Python, TypeScript, Ollama, Gemma, Kokoro, ffmpeg, Hammerspoon, Telegram, models, prompts, tests, builds, and local automation.",
+		"- Prefer plausible technical terms over unrelated everyday words when the audio is ambiguous.",
+		"",
+		"Rules:",
+		"- Output only what the speaker said.",
+		"- Do not answer, summarize, add labels, use JSON, include timestamps, or add commentary.",
+		"- Do not include thinking or tool output.",
+		"- Do not append the word false or any boolean value unless the speaker clearly said it.",
+		"- If speech is unclear, make the best concise transcription rather than inventing extra words.",
+	}, "\n")
 	cmdCtx, cancel := context.WithTimeout(ctx, time.Duration(defaultTranscribeTimeoutSec)*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(cmdCtx, ollamaBin, "run", model, "--think", "false", "--hidethinking", wavPath, prompt)
@@ -139,10 +155,33 @@ func (s *Service) Synthesize(ctx context.Context, text string) (VoiceFile, error
 	}
 	return VoiceFile{
 		Path:            oggPath,
+		WAVPath:         wavPath,
 		DurationSeconds: int(math.Ceil(duration)),
 		SpeechText:      speechText,
 		Cleanup:         cleanup,
 	}, nil
+}
+
+func (s *Service) Speak(ctx context.Context, text string) error {
+	voice, err := s.Synthesize(ctx, text)
+	if err != nil {
+		return err
+	}
+	defer voice.Cleanup()
+	return s.PlayWAV(ctx, voice.WAVPath)
+}
+
+func (s *Service) PlayWAV(ctx context.Context, wavPath string) error {
+	wavPath = strings.TrimSpace(wavPath)
+	if wavPath == "" {
+		return errors.New("wav path is required")
+	}
+	cmd := exec.CommandContext(ctx, "afplay", wavPath)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("play generated voice: %w: %s", err, strings.TrimSpace(cleanTerminalOutput(string(out))))
+	}
+	return nil
 }
 
 func (s *Service) convertToWAV(ctx context.Context, inputPath string) (string, func(), error) {

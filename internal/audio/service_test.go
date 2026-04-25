@@ -70,6 +70,9 @@ func TestSynthesizeLiveWhenEnabled(t *testing.T) {
 	if _, err := os.Stat(out.Path); err != nil {
 		t.Fatalf("expected generated voice file: %v", err)
 	}
+	if _, err := os.Stat(out.WAVPath); err != nil {
+		t.Fatalf("expected generated wav file: %v", err)
+	}
 }
 
 func TestTranscribeLiveWhenEnabled(t *testing.T) {

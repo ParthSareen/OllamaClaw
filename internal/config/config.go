@@ -15,6 +15,8 @@ const (
 	defaultStateDBFile   = "state.db"
 	defaultLogFile       = "ollamaclaw.log"
 	defaultGitHubWebhook = "127.0.0.1:8787"
+	defaultLocalControl  = "127.0.0.1:8790"
+	defaultLocalToken    = "local_control.token"
 	defaultPromptFile    = "system_prompt.txt"
 	defaultPromptOverlay = "system_prompt.overlay.md"
 	defaultPromptHistory = "system_prompt.overlay.history.jsonl"
@@ -35,6 +37,7 @@ type Config struct {
 	Telegram            TelegramConfig `json:"telegram"`
 	Voice               VoiceConfig    `json:"voice"`
 	GitHubWebhook       GitHubWebhook  `json:"github_webhook"`
+	LocalControl        LocalControl   `json:"local_control"`
 }
 
 type TelegramConfig struct {
@@ -60,6 +63,12 @@ type GitHubWebhook struct {
 	Secret        string   `json:"secret"`
 	OwnerLogin    string   `json:"owner_login"`
 	RepoAllowlist []string `json:"repo_allowlist"`
+}
+
+type LocalControl struct {
+	Enabled    bool   `json:"enabled"`
+	ListenAddr string `json:"listen_addr"`
+	TokenPath  string `json:"token_path"`
 }
 
 func Default() Config {
@@ -92,6 +101,11 @@ func Default() Config {
 			Secret:        "",
 			OwnerLogin:    "",
 			RepoAllowlist: nil,
+		},
+		LocalControl: LocalControl{
+			Enabled:    true,
+			ListenAddr: defaultLocalControl,
+			TokenPath:  filepath.Join(base, defaultLocalToken),
 		},
 	}
 }
@@ -235,6 +249,14 @@ func sanitize(cfg *Config) {
 	if cfg.GitHubWebhook.Secret == "" || cfg.GitHubWebhook.OwnerLogin == "" {
 		cfg.GitHubWebhook.Enabled = false
 	}
+	cfg.LocalControl.ListenAddr = strings.TrimSpace(cfg.LocalControl.ListenAddr)
+	if cfg.LocalControl.ListenAddr == "" {
+		cfg.LocalControl.ListenAddr = defaults.LocalControl.ListenAddr
+	}
+	cfg.LocalControl.TokenPath = strings.TrimSpace(cfg.LocalControl.TokenPath)
+	if cfg.LocalControl.TokenPath == "" {
+		cfg.LocalControl.TokenPath = defaults.LocalControl.TokenPath
+	}
 }
 
 func Load() (Config, error) {
@@ -273,6 +295,10 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, fmt.Errorf("expand kokoro python path: %w", err)
 	}
+	cfg.LocalControl.TokenPath, err = expandPath(cfg.LocalControl.TokenPath)
+	if err != nil {
+		return Config{}, fmt.Errorf("expand local control token path: %w", err)
+	}
 	return cfg, nil
 }
 
@@ -284,6 +310,7 @@ func Save(cfg Config) error {
 	cfg.DBPath, _ = expandPath(cfg.DBPath)
 	cfg.LogPath, _ = expandPath(cfg.LogPath)
 	cfg.Voice.KokoroPython, _ = expandPath(cfg.Voice.KokoroPython)
+	cfg.LocalControl.TokenPath, _ = expandPath(cfg.LocalControl.TokenPath)
 	path, err := ConfigPath()
 	if err != nil {
 		return err

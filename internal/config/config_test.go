@@ -24,6 +24,15 @@ func TestLoadCreatesDefaultConfig(t *testing.T) {
 	if cfg.Voice.TranscriptionModel != "gemma4:e2b" {
 		t.Fatalf("unexpected voice transcription model: %q", cfg.Voice.TranscriptionModel)
 	}
+	if !cfg.LocalControl.Enabled {
+		t.Fatalf("expected local control to default enabled")
+	}
+	if strings.TrimSpace(cfg.LocalControl.ListenAddr) != "127.0.0.1:8790" {
+		t.Fatalf("unexpected local control listen addr: %q", cfg.LocalControl.ListenAddr)
+	}
+	if !strings.HasSuffix(cfg.LocalControl.TokenPath, filepath.Join(".ollamaclaw", "local_control.token")) {
+		t.Fatalf("unexpected local control token path: %q", cfg.LocalControl.TokenPath)
+	}
 	if !strings.HasSuffix(cfg.Voice.KokoroPython, filepath.Join(".ollamaclaw", "kokoro-test", "venv", "bin", "python")) {
 		t.Fatalf("unexpected kokoro python path: %q", cfg.Voice.KokoroPython)
 	}
@@ -53,6 +62,7 @@ func TestSaveExpandsDBPath(t *testing.T) {
 	cfg.DBPath = "~/custom/state.db"
 	cfg.LogPath = "~/custom/ollamaclaw.log"
 	cfg.Voice.KokoroPython = "~/custom/kokoro/bin/python"
+	cfg.LocalControl.TokenPath = "~/custom/local.token"
 	if err := Save(cfg); err != nil {
 		t.Fatalf("Save() error: %v", err)
 	}
@@ -71,6 +81,10 @@ func TestSaveExpandsDBPath(t *testing.T) {
 	expectedKokoro := filepath.Join(home, "custom", "kokoro", "bin", "python")
 	if loaded.Voice.KokoroPython != expectedKokoro {
 		t.Fatalf("expected %s, got %s", expectedKokoro, loaded.Voice.KokoroPython)
+	}
+	expectedToken := filepath.Join(home, "custom", "local.token")
+	if loaded.LocalControl.TokenPath != expectedToken {
+		t.Fatalf("expected %s, got %s", expectedToken, loaded.LocalControl.TokenPath)
 	}
 }
 

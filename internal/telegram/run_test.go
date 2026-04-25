@@ -298,6 +298,23 @@ func TestNormalizeVoiceReplyMode(t *testing.T) {
 	}
 }
 
+func TestStripLocalTranscriptArtifact(t *testing.T) {
+	tests := []struct {
+		in   string
+		want string
+	}{
+		{in: "testing one two three false", want: "testing one two three"},
+		{in: "testing one two three false.", want: "testing one two three"},
+		{in: "false", want: ""},
+		{in: "this should stay true", want: "this should stay true"},
+	}
+	for _, tc := range tests {
+		if got := stripLocalTranscriptArtifact(tc.in); got != tc.want {
+			t.Fatalf("stripLocalTranscriptArtifact(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
 func TestApprovalCallbackRoundTrip(t *testing.T) {
 	data := formatApprovalCallback("allow", "abc123")
 	action, id, ok := parseApprovalCallback(data)

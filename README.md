@@ -12,6 +12,7 @@ It supports:
 - Dynamic system prompt files plus background core memories (“dreaming”) injected into prompt context
 - Context compaction plus a prompt-size safety guard before Ollama calls
 - Optional GitHub webhook trigger path for proactive Telegram updates
+- Optional localhost-only Hammerspoon hotkeys for text prompts and hold-to-talk voice input
 
 ## Install
 
@@ -65,6 +66,116 @@ Optional:
 ./ollamaclaw repl --model kimi-k2.5:cloud
 ```
 
+## Voice prerequisites
+
+Telegram voice notes and local hold-to-talk use local Gemma 4 audio transcription plus Kokoro speech synthesis. The default config expects:
+
+- Ollama running at `http://localhost:11434`
+- `gemma4:e2b` available locally for speech-to-text
+- `ffmpeg` available on `PATH`
+- Kokoro installed at `~/.ollamaclaw/kokoro-test/venv/bin/python`
+
+### 1) Install ffmpeg
+
+```bash
+brew install ffmpeg
+```
+
+### 2) Pull the local audio transcription model
+
+```bash
+ollama pull gemma4:e2b
+ollama show gemma4:e2b
+```
+
+Confirm the `Capabilities` output includes `audio`.
+
+Optional smoke test:
+
+```bash
+say -o /tmp/ollamaclaw_voice_test.aiff "OllamaClaw voice test."
+afconvert -f WAVE -d LEI16@16000 /tmp/ollamaclaw_voice_test.aiff /tmp/ollamaclaw_voice_test.wav
+ollama run gemma4:e2b --think false --hidethinking /tmp/ollamaclaw_voice_test.wav "Transcribe the speech in this audio. Output only the transcript."
+```
+
+### 3) Set up Kokoro
+
+```bash
+mkdir -p ~/.ollamaclaw/kokoro-test
+python3 -m venv ~/.ollamaclaw/kokoro-test/venv
+~/.ollamaclaw/kokoro-test/venv/bin/python -m pip install --upgrade pip setuptools wheel
+~/.ollamaclaw/kokoro-test/venv/bin/python -m pip install 'kokoro>=0.9.4' soundfile
+```
+
+Optional smoke test:
+
+```bash
+~/.ollamaclaw/kokoro-test/venv/bin/python - <<'PY'
+from kokoro import KPipeline
+import numpy as np
+import soundfile as sf
+
+pipeline = KPipeline(lang_code="a", repo_id="hexgrad/Kokoro-82M")
+chunks = []
+for _, _, audio in pipeline("Kokoro is ready for OllamaClaw voice replies.", voice="af_heart", speed=1.0):
+    chunks.append(np.asarray(audio, dtype=np.float32))
+sf.write("/tmp/ollamaclaw_kokoro_test.wav", np.concatenate(chunks), 24000)
+PY
+afplay /tmp/ollamaclaw_kokoro_test.wav
+```
+
+If you install Kokoro somewhere else, update `voice.kokoro_python` in `~/.ollamaclaw/config.json`. If Python package imports fail on Apple Silicon with an architecture mismatch, recreate the venv with an arm64 Python, or run the setup commands through `arch -arm64`.
+
+### 4) Verify OllamaClaw's live audio path
+
+```bash
+OLLAMACLAW_LIVE_KOKORO_TEST=1 go test ./internal/audio -run TestSynthesizeLiveWhenEnabled -count=1
+OLLAMACLAW_LIVE_OLLAMA_AUDIO_TEST=1 go test ./internal/audio -run TestTranscribeLiveWhenEnabled -count=1
+```
+
+## Local hotkeys
+
+`ollamaclaw launch` starts a localhost-only control server by default at `127.0.0.1:8790`. It creates a local auth token at `~/.ollamaclaw/local_control.token`.
+
+The MVP Hammerspoon script lives at `contrib/hammerspoon/ollamaclaw.lua` and defaults to:
+
+- `Ctrl+Space`: local text prompt; echoes `local input:` to Telegram and replies in Telegram text.
+- `Ctrl+Shift+Space`: hold-to-talk; records while held, sends the transcript to Telegram, replies in Telegram text, and speaks the final answer on the Mac.
+
+Mac playback is only used for local hold-to-talk final assistant answers. Telegram text messages do not trigger voice synthesis; `/voice` controls replies to Telegram voice-note turns separately.
+
+### Hammerspoon setup
+
+Install Hammerspoon, then add this to `~/.hammerspoon/init.lua`:
+
+```lua
+dofile("/path/to/OllamaClaw/contrib/hammerspoon/ollamaclaw.lua")
+```
+
+Reload Hammerspoon after `ollamaclaw launch` has generated the token.
+
+macOS permissions:
+
+- Allow Hammerspoon in System Settings -> Privacy & Security -> Accessibility.
+- Allow Hammerspoon microphone access when prompted.
+- If `Ctrl+Space` is already used for input source switching, disable that shortcut in System Settings or edit the script bindings.
+
+List ffmpeg microphone devices:
+
+```bash
+ffmpeg -f avfoundation -list_devices true -i ""
+```
+
+Then edit `audioInput` in the Hammerspoon script if needed. The bundled script defaults to `":1"` for audio device 1 and no video device; on this Mac, that is the built-in MacBook Pro microphone.
+
+Hotkey voice output:
+
+```text
+/voice output mac
+/voice output telegram
+/voice output both
+```
+
 ## CLI
 
 ```bash
@@ -94,7 +205,8 @@ ollamaclaw telegram run   # legacy alias for launch
 - `/show dreaming [on|off]` toggles background long-term-memory (“dreaming”) event notifications for this chat (default: on)
 - `/verbose [on|off]` enables/disables tool + thinking traces for this chat session
 - `/think [on|off|low|medium|high|default]` shows/sets think value
-- `/voice [off|text|audio|both]` shows/sets Telegram voice replies (default: `both`)
+- `/voice [off|text|audio|both]` shows/sets replies for Telegram voice-note turns (default: `both`)
+- `/voice output [mac|telegram|both]` shows/sets local hotkey voice output (default: `mac`)
 - `/dream` manually triggers a core-memory refresh for the current chat session
 - `/status` shows model, estimated next prompt size (`len(request_json)/4`), dreaming notification state, lifetime token counters, compaction thresholds, last compaction snapshot, DB path
 - `/fullsystem` shows the exact system context currently injected (system prompt + core memories + latest conversation summary)
@@ -220,6 +332,7 @@ Defaults:
   "ollama_host": "http://localhost:11434",
   "default_model": "kimi-k2.5:cloud",
   "db_path": "~/.ollamaclaw/state.db",
+  "log_path": "~/.ollamaclaw/ollamaclaw.log",
   "compaction_threshold": 0.8,
   "keep_recent_turns": 8,
   "context_window_tokens": 252000,
@@ -246,6 +359,11 @@ Defaults:
     "secret": "",
     "owner_login": "",
     "repo_allowlist": []
+  },
+  "local_control": {
+    "enabled": true,
+    "listen_addr": "127.0.0.1:8790",
+    "token_path": "~/.ollamaclaw/local_control.token"
   }
 }
 ```
