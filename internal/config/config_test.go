@@ -21,6 +21,12 @@ func TestLoadCreatesDefaultConfig(t *testing.T) {
 	if strings.TrimSpace(cfg.GitHubWebhook.ListenAddr) != "127.0.0.1:8787" {
 		t.Fatalf("unexpected github webhook listen addr: %q", cfg.GitHubWebhook.ListenAddr)
 	}
+	if cfg.Voice.TranscriptionModel != "gemma4:e2b" {
+		t.Fatalf("unexpected voice transcription model: %q", cfg.Voice.TranscriptionModel)
+	}
+	if !strings.HasSuffix(cfg.Voice.KokoroPython, filepath.Join(".ollamaclaw", "kokoro-test", "venv", "bin", "python")) {
+		t.Fatalf("unexpected kokoro python path: %q", cfg.Voice.KokoroPython)
+	}
 	path, _ := ConfigPath()
 	if _, err := os.Stat(path); err != nil {
 		t.Fatalf("expected config file to exist: %v", err)
@@ -46,6 +52,7 @@ func TestSaveExpandsDBPath(t *testing.T) {
 	cfg := Default()
 	cfg.DBPath = "~/custom/state.db"
 	cfg.LogPath = "~/custom/ollamaclaw.log"
+	cfg.Voice.KokoroPython = "~/custom/kokoro/bin/python"
 	if err := Save(cfg); err != nil {
 		t.Fatalf("Save() error: %v", err)
 	}
@@ -60,6 +67,10 @@ func TestSaveExpandsDBPath(t *testing.T) {
 	expectedLog := filepath.Join(home, "custom", "ollamaclaw.log")
 	if loaded.LogPath != expectedLog {
 		t.Fatalf("expected %s, got %s", expectedLog, loaded.LogPath)
+	}
+	expectedKokoro := filepath.Join(home, "custom", "kokoro", "bin", "python")
+	if loaded.Voice.KokoroPython != expectedKokoro {
+		t.Fatalf("expected %s, got %s", expectedKokoro, loaded.Voice.KokoroPython)
 	}
 }
 

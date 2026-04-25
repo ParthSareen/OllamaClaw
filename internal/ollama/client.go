@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math/rand"
 	"net/http"
 	"os"
 	"strings"
@@ -13,19 +14,25 @@ import (
 )
 
 type Client struct {
-	http      *http.Client
-	baseURL   string
-	apiKey    string
-	webAPIURL string
+	http               *http.Client
+	baseURL            string
+	apiKey             string
+	webAPIURL          string
+	chatMaxRetries     int
+	chatRetryBaseDelay time.Duration
+	chatRetryMaxDelay  time.Duration
 }
 
 func NewClient(baseURL string) *Client {
 	base := strings.TrimRight(baseURL, "/")
 	return &Client{
-		http:      &http.Client{Timeout: 180 * time.Second},
-		baseURL:   base,
-		apiKey:    os.Getenv("OLLAMA_API_KEY"),
-		webAPIURL: "https://ollama.com",
+		http:               &http.Client{Timeout: 180 * time.Second},
+		baseURL:            base,
+		apiKey:             os.Getenv("OLLAMA_API_KEY"),
+		webAPIURL:          "https://ollama.com",
+		chatMaxRetries:     2,
+		chatRetryBaseDelay: 500 * time.Millisecond,
+		chatRetryMaxDelay:  1500 * time.Millisecond,
 	}
 }
 
@@ -38,28 +45,104 @@ func (c *Client) Chat(ctx context.Context, req ChatRequest) (ChatResponse, error
 	if err != nil {
 		return ChatResponse{}, fmt.Errorf("marshal chat request: %w", err)
 	}
-	hreq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(b))
+	maxAttempts := c.chatMaxRetries + 1
+	if maxAttempts < 1 {
+		maxAttempts = 1
+	}
+	var lastErr error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return ChatResponse{}, err
+		}
+		out, retryable, err := c.chatOnce(ctx, url, b)
+		if err == nil {
+			return out, nil
+		}
+		lastErr = err
+		if !retryable || attempt == maxAttempts {
+			return ChatResponse{}, err
+		}
+		if err := sleepWithContext(ctx, c.chatRetryDelay(attempt)); err != nil {
+			return ChatResponse{}, err
+		}
+	}
+	return ChatResponse{}, lastErr
+}
+
+func (c *Client) chatOnce(ctx context.Context, url string, body []byte) (ChatResponse, bool, error) {
+	hreq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
-		return ChatResponse{}, err
+		return ChatResponse{}, false, err
 	}
 	hreq.Header.Set("Content-Type", "application/json")
 	res, err := c.http.Do(hreq)
 	if err != nil {
-		return ChatResponse{}, fmt.Errorf("chat request failed: %w", err)
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ChatResponse{}, false, ctxErr
+		}
+		return ChatResponse{}, true, fmt.Errorf("chat request failed: %w", err)
 	}
 	defer res.Body.Close()
 	respBody, err := io.ReadAll(res.Body)
 	if err != nil {
-		return ChatResponse{}, err
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ChatResponse{}, false, ctxErr
+		}
+		return ChatResponse{}, true, err
 	}
 	if res.StatusCode >= 300 {
-		return ChatResponse{}, fmt.Errorf("chat request status %d: %s", res.StatusCode, strings.TrimSpace(string(respBody)))
+		err := fmt.Errorf("chat request status %d: %s", res.StatusCode, strings.TrimSpace(string(respBody)))
+		return ChatResponse{}, retryableChatStatus(res.StatusCode), err
 	}
 	var out ChatResponse
 	if err := json.Unmarshal(respBody, &out); err != nil {
-		return ChatResponse{}, fmt.Errorf("decode chat response: %w", err)
+		return ChatResponse{}, false, fmt.Errorf("decode chat response: %w", err)
 	}
-	return out, nil
+	return out, false, nil
+}
+
+func retryableChatStatus(status int) bool {
+	return status == http.StatusRequestTimeout || status == http.StatusTooManyRequests || status >= 500
+}
+
+func (c *Client) chatRetryDelay(attempt int) time.Duration {
+	base := c.chatRetryBaseDelay
+	if base <= 0 {
+		return 0
+	}
+	if attempt < 1 {
+		attempt = 1
+	}
+	delay := base
+	for i := 1; i < attempt; i++ {
+		delay *= 2
+		if c.chatRetryMaxDelay > 0 && delay >= c.chatRetryMaxDelay {
+			delay = c.chatRetryMaxDelay
+			break
+		}
+	}
+	if c.chatRetryMaxDelay > 0 && delay > c.chatRetryMaxDelay {
+		delay = c.chatRetryMaxDelay
+	}
+	jitterMax := delay / 2
+	if jitterMax <= 0 {
+		return delay
+	}
+	return delay + time.Duration(rand.Int63n(int64(jitterMax)+1))
+}
+
+func sleepWithContext(ctx context.Context, delay time.Duration) error {
+	if delay <= 0 {
+		return ctx.Err()
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 func (c *Client) WebSearch(ctx context.Context, query string, maxResults int) (WebSearchResponse, error) {

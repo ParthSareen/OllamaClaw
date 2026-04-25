@@ -1,7 +1,7 @@
 # OllamaClaw
 
 OllamaClaw is a private Telegram-first local agent for your laptop, powered by Ollama. It is built for remote coding/ops work from a trusted DM: ask it questions, let it inspect files/logs, run safe shell commands, follow up on GitHub/CI, and run reminder-triggered tasks while keeping state locally.
-Current app version: `0.1.8`.
+Current app version: `0.2.0`.
 
 It supports:
 - Private Telegram DM gateway with owner allowlist, image input, `/stop`, `/restart`, `/status`, `/fullsystem`, live tool visibility, and thinking controls
@@ -94,6 +94,7 @@ ollamaclaw telegram run   # legacy alias for launch
 - `/show dreaming [on|off]` toggles background long-term-memory (“dreaming”) event notifications for this chat (default: on)
 - `/verbose [on|off]` enables/disables tool + thinking traces for this chat session
 - `/think [on|off|low|medium|high|default]` shows/sets think value
+- `/voice [off|text|audio|both]` shows/sets Telegram voice replies (default: `both`)
 - `/dream` manually triggers a core-memory refresh for the current chat session
 - `/status` shows model, estimated next prompt size (`len(request_json)/4`), dreaming notification state, lifetime token counters, compaction thresholds, last compaction snapshot, DB path
 - `/fullsystem` shows the exact system context currently injected (system prompt + core memories + latest conversation summary)
@@ -101,6 +102,7 @@ ollamaclaw telegram run   # legacy alias for launch
 - `/stop` interrupts the active turn
 - `/restart` restarts the launch loop from Telegram
 - Send photos (or image documents) with an optional caption; image bytes are fetched from Telegram and forwarded to Ollama chat `images`
+- Send voice notes to transcribe locally with Gemma 4 and receive a text reply plus a Kokoro-generated Telegram voice note
 - If messages arrive in quick succession, OllamaClaw waits for a 1.5s quiet window, coalesces them with newlines, then runs one turn
 
 ## GitHub webhook triggers
@@ -227,6 +229,16 @@ Defaults:
     "bot_token": "",
     "owner_chat_id": 0,
     "owner_user_id": 0
+  },
+  "voice": {
+    "transcription_model": "gemma4:e2b",
+    "ollama_binary": "ollama",
+    "ffmpeg_binary": "ffmpeg",
+    "kokoro_python": "~/.ollamaclaw/kokoro-test/venv/bin/python",
+    "kokoro_voice": "af_heart",
+    "kokoro_lang_code": "a",
+    "kokoro_speed": 1,
+    "max_speech_chars": 1200
   },
   "github_webhook": {
     "enabled": false,

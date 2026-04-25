@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -67,6 +68,7 @@ func TestParseCommand(t *testing.T) {
 		{in: "/show thinking off", want: "show"},
 		{in: "/reminder list", want: "reminder"},
 		{in: "/dream", want: "dream"},
+		{in: "/voice both", want: "voice"},
 		{in: "/stop", want: "stop"},
 		{in: "/restart", want: "restart"},
 		{in: "plain text", want: ""},
@@ -128,6 +130,16 @@ func TestExtractMessageInputIncludesImageDocument(t *testing.T) {
 	}
 }
 
+func TestCollectVoiceFileID(t *testing.T) {
+	if got := collectVoiceFileID(&models.Message{}); got != "" {
+		t.Fatalf("expected empty voice id, got %q", got)
+	}
+	got := collectVoiceFileID(&models.Message{Voice: &models.Voice{FileID: " voice-file "}})
+	if got != "voice-file" {
+		t.Fatalf("expected trimmed voice file id, got %q", got)
+	}
+}
+
 func TestFetchTelegramImagesSuccess(t *testing.T) {
 	body := []byte("fake-image-bytes")
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -158,6 +170,42 @@ func TestFetchTelegramImagesSuccess(t *testing.T) {
 	}
 	if string(decoded) != string(body) {
 		t.Fatalf("decoded payload mismatch: got %q want %q", string(decoded), string(body))
+	}
+}
+
+func TestFetchTelegramVoiceSuccess(t *testing.T) {
+	body := []byte("fake-ogg-bytes")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/voice.ogg" {
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = w.Write(body)
+	}))
+	defer srv.Close()
+
+	api := fakeTelegramFileClient{
+		base: srv.URL,
+		files: map[string]*models.File{
+			"voice-1": {FileID: "voice-1", FilePath: "voice.ogg"},
+		},
+	}
+	path, cleanup, err := fetchTelegramVoice(context.Background(), api, "voice-1")
+	if cleanup != nil {
+		defer cleanup()
+	}
+	if err != nil {
+		t.Fatalf("fetchTelegramVoice() error: %v", err)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read fetched voice: %v", err)
+	}
+	if string(got) != string(body) {
+		t.Fatalf("voice payload mismatch: got %q want %q", string(got), string(body))
+	}
+	if !strings.HasSuffix(path, ".ogg") {
+		t.Fatalf("expected .ogg extension, got %s", path)
 	}
 }
 
@@ -224,6 +272,28 @@ func TestParseThinkValue(t *testing.T) {
 		got, ok := parseThinkValue(tc.in)
 		if ok != tc.ok || got != tc.want {
 			t.Fatalf("parseThinkValue(%q) = (%q,%t), want (%q,%t)", tc.in, got, ok, tc.want, tc.ok)
+		}
+	}
+}
+
+func TestNormalizeVoiceReplyMode(t *testing.T) {
+	tests := []struct {
+		in   string
+		want string
+		ok   bool
+	}{
+		{in: "on", want: "both", ok: true},
+		{in: "both", want: "both", ok: true},
+		{in: "off", want: "off", ok: true},
+		{in: "text", want: "text", ok: true},
+		{in: "audio", want: "audio", ok: true},
+		{in: "voice", want: "audio", ok: true},
+		{in: "maybe", want: "", ok: false},
+	}
+	for _, tc := range tests {
+		got, ok := normalizeVoiceReplyMode(tc.in)
+		if got != tc.want || ok != tc.ok {
+			t.Fatalf("normalizeVoiceReplyMode(%q) = (%q,%t), want (%q,%t)", tc.in, got, ok, tc.want, tc.ok)
 		}
 	}
 }

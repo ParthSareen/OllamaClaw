@@ -33,6 +33,7 @@ type Config struct {
 	ToolOutputMaxBytes  int            `json:"tool_output_max_bytes"`
 	BashTimeoutSeconds  int            `json:"bash_timeout_seconds"`
 	Telegram            TelegramConfig `json:"telegram"`
+	Voice               VoiceConfig    `json:"voice"`
 	GitHubWebhook       GitHubWebhook  `json:"github_webhook"`
 }
 
@@ -40,6 +41,17 @@ type TelegramConfig struct {
 	BotToken    string `json:"bot_token"`
 	OwnerChatID int64  `json:"owner_chat_id"`
 	OwnerUserID int64  `json:"owner_user_id"`
+}
+
+type VoiceConfig struct {
+	TranscriptionModel string  `json:"transcription_model"`
+	OllamaBinary       string  `json:"ollama_binary"`
+	FFmpegBinary       string  `json:"ffmpeg_binary"`
+	KokoroPython       string  `json:"kokoro_python"`
+	KokoroVoice        string  `json:"kokoro_voice"`
+	KokoroLangCode     string  `json:"kokoro_lang_code"`
+	KokoroSpeed        float64 `json:"kokoro_speed"`
+	MaxSpeechChars     int     `json:"max_speech_chars"`
 }
 
 type GitHubWebhook struct {
@@ -64,6 +76,16 @@ func Default() Config {
 		ToolOutputMaxBytes:  16 * 1024,
 		BashTimeoutSeconds:  120,
 		Telegram:            TelegramConfig{},
+		Voice: VoiceConfig{
+			TranscriptionModel: "gemma4:e2b",
+			OllamaBinary:       "ollama",
+			FFmpegBinary:       "ffmpeg",
+			KokoroPython:       filepath.Join(base, "kokoro-test", "venv", "bin", "python"),
+			KokoroVoice:        "af_heart",
+			KokoroLangCode:     "a",
+			KokoroSpeed:        1.0,
+			MaxSpeechChars:     1200,
+		},
 		GitHubWebhook: GitHubWebhook{
 			Enabled:       false,
 			ListenAddr:    defaultGitHubWebhook,
@@ -173,6 +195,36 @@ func sanitize(cfg *Config) {
 	if cfg.BashTimeoutSeconds <= 0 {
 		cfg.BashTimeoutSeconds = defaults.BashTimeoutSeconds
 	}
+	cfg.Voice.TranscriptionModel = strings.TrimSpace(cfg.Voice.TranscriptionModel)
+	if cfg.Voice.TranscriptionModel == "" {
+		cfg.Voice.TranscriptionModel = defaults.Voice.TranscriptionModel
+	}
+	cfg.Voice.OllamaBinary = strings.TrimSpace(cfg.Voice.OllamaBinary)
+	if cfg.Voice.OllamaBinary == "" {
+		cfg.Voice.OllamaBinary = defaults.Voice.OllamaBinary
+	}
+	cfg.Voice.FFmpegBinary = strings.TrimSpace(cfg.Voice.FFmpegBinary)
+	if cfg.Voice.FFmpegBinary == "" {
+		cfg.Voice.FFmpegBinary = defaults.Voice.FFmpegBinary
+	}
+	cfg.Voice.KokoroPython = strings.TrimSpace(cfg.Voice.KokoroPython)
+	if cfg.Voice.KokoroPython == "" {
+		cfg.Voice.KokoroPython = defaults.Voice.KokoroPython
+	}
+	cfg.Voice.KokoroVoice = strings.TrimSpace(cfg.Voice.KokoroVoice)
+	if cfg.Voice.KokoroVoice == "" {
+		cfg.Voice.KokoroVoice = defaults.Voice.KokoroVoice
+	}
+	cfg.Voice.KokoroLangCode = strings.TrimSpace(cfg.Voice.KokoroLangCode)
+	if cfg.Voice.KokoroLangCode == "" {
+		cfg.Voice.KokoroLangCode = defaults.Voice.KokoroLangCode
+	}
+	if cfg.Voice.KokoroSpeed <= 0 {
+		cfg.Voice.KokoroSpeed = defaults.Voice.KokoroSpeed
+	}
+	if cfg.Voice.MaxSpeechChars <= 0 {
+		cfg.Voice.MaxSpeechChars = defaults.Voice.MaxSpeechChars
+	}
 	cfg.GitHubWebhook.ListenAddr = strings.TrimSpace(cfg.GitHubWebhook.ListenAddr)
 	if cfg.GitHubWebhook.ListenAddr == "" {
 		cfg.GitHubWebhook.ListenAddr = defaults.GitHubWebhook.ListenAddr
@@ -217,6 +269,10 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, fmt.Errorf("expand log path: %w", err)
 	}
+	cfg.Voice.KokoroPython, err = expandPath(cfg.Voice.KokoroPython)
+	if err != nil {
+		return Config{}, fmt.Errorf("expand kokoro python path: %w", err)
+	}
 	return cfg, nil
 }
 
@@ -227,6 +283,7 @@ func Save(cfg Config) error {
 	sanitize(&cfg)
 	cfg.DBPath, _ = expandPath(cfg.DBPath)
 	cfg.LogPath, _ = expandPath(cfg.LogPath)
+	cfg.Voice.KokoroPython, _ = expandPath(cfg.Voice.KokoroPython)
 	path, err := ConfigPath()
 	if err != nil {
 		return err

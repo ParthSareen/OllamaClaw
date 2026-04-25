@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/ParthSareen/OllamaClaw/internal/agent"
+	"github.com/ParthSareen/OllamaClaw/internal/audio"
 	"github.com/ParthSareen/OllamaClaw/internal/config"
 	"github.com/ParthSareen/OllamaClaw/internal/cronjobs"
 	"github.com/ParthSareen/OllamaClaw/internal/db"
@@ -54,17 +55,22 @@ type Runner struct {
 	webhookMu    sync.Mutex
 	unauthMu     sync.Mutex
 	unauthAt     map[string]time.Time
+	voiceMu      sync.Mutex
+	voice        *audio.Service
 	turnExecutor func(ctx context.Context, turnCtx context.Context, b *bot.Bot, chatID, userID int64, sessionKey, text string, imageFileIDs []string)
 }
 
 const (
 	settingOffsetKey                  = "telegram_last_update_id"
 	settingTelegramBashAlwaysAllowKey = "telegram_bash_always_allow"
+	settingTelegramVoiceReplyModeKey  = "telegram_voice_reply_mode"
 	maxLogPreview                     = 280
 	maxToolPreview                    = 700
 	maxTelegramInputImages            = 4
 	telegramImageMaxBytes             = 8 * 1024 * 1024
+	telegramVoiceMaxBytes             = 20 * 1024 * 1024
 	telegramImageFetchTimeout         = 20 * time.Second
+	telegramVoiceFetchTimeout         = 60 * time.Second
 	pendingTurnDebounce               = 1500 * time.Millisecond
 	pendingTurnRetry                  = 100 * time.Millisecond
 	updateWorkers                     = 8
@@ -91,6 +97,7 @@ type pendingTurn struct {
 	sessionKey   string
 	text         string
 	imageFileIDs []string
+	voiceFileID  string
 	messageCount int
 	readyAt      time.Time
 	bot          *bot.Bot
@@ -385,7 +392,8 @@ func (r *Runner) handleUpdate(ctx context.Context, b *bot.Bot, update *models.Up
 		userID = update.Message.From.ID
 	}
 	text, imageFileIDs := extractMessageInput(update.Message)
-	if text == "" {
+	voiceFileID := collectVoiceFileID(update.Message)
+	if text == "" && voiceFileID == "" {
 		r.logf("message ignored: empty text/media chat=%d user=%d", chatID, userID)
 		return
 	}
@@ -394,7 +402,7 @@ func (r *Runner) handleUpdate(ctx context.Context, b *bot.Bot, update *models.Up
 		return
 	}
 	r.logf("authorization accepted: chat=%d user=%d command=%q", chatID, userID, cmd)
-	r.logf("message received: chat=%d user=%d chars=%d images=%d preview=%q", chatID, userID, len(text), len(imageFileIDs), r.previewForLog(text))
+	r.logf("message received: chat=%d user=%d chars=%d images=%d voice=%t preview=%q", chatID, userID, len(text), len(imageFileIDs), voiceFileID != "", r.previewForLog(text))
 	if cmd != "" {
 		r.logf("command dispatch: chat=%d cmd=%s raw=%q", chatID, cmd, r.previewForLog(text))
 		r.handleCommand(ctx, b, chatID, text)
@@ -408,21 +416,26 @@ func (r *Runner) handleUpdate(ctx context.Context, b *bot.Bot, update *models.Up
 		sessionKey:   sessionKey,
 		text:         text,
 		imageFileIDs: append([]string(nil), imageFileIDs...),
+		voiceFileID:  voiceFileID,
 		bot:          b,
 	})
 	r.logf("agent turn queued: chat=%d session_key=%s generation=%d messages=%d ready_at=%s", chatID, sessionKey, queued.generation, queued.messageCount, queued.readyAt.UTC().Format(time.RFC3339Nano))
 	r.schedulePendingTurnDrain(sessionKey, queued.generation)
 }
 
-func (r *Runner) executeTurn(ctx context.Context, turnCtx context.Context, b *bot.Bot, chatID, userID int64, sessionKey, text string, imageFileIDs []string) {
+func (r *Runner) executeTurn(ctx context.Context, turnCtx context.Context, b *bot.Bot, chatID, userID int64, sessionKey, text string, imageFileIDs []string, voiceFileID string) {
 	if r.turnExecutor != nil {
 		r.turnExecutor(ctx, turnCtx, b, chatID, userID, sessionKey, text, imageFileIDs)
 		return
 	}
-	thinkValue, _ := r.Engine.SessionThinkValue(ctx, "telegram", sessionKey)
 	progressText := "Working..."
-	if thinkValue != "off" {
-		progressText = "Thinking..."
+	if strings.TrimSpace(voiceFileID) != "" {
+		progressText = "Transcribing..."
+	} else {
+		thinkValue, _ := r.Engine.SessionThinkValue(ctx, "telegram", sessionKey)
+		if thinkValue != "off" {
+			progressText = "Thinking..."
+		}
 	}
 	progress, _ := b.SendMessage(ctx, &bot.SendMessageParams{ChatID: chatID, Text: progressText})
 	if progress != nil {
@@ -435,6 +448,35 @@ func (r *Runner) executeTurn(ctx context.Context, turnCtx context.Context, b *bo
 		r.logf("live tool stream enabled: chat=%d session_key=%s", chatID, sessionKey)
 	}
 	inputImages := []string{}
+	if strings.TrimSpace(voiceFileID) != "" {
+		voicePath, cleanup, voiceErr := fetchTelegramVoice(turnCtx, b, voiceFileID)
+		if cleanup != nil {
+			defer cleanup()
+		}
+		if voiceErr != nil {
+			r.logf("voice fetch failed: chat=%d session_key=%s error=%v", chatID, sessionKey, r.redactError(voiceErr))
+			r.replyError(ctx, b, chatID, progress, fmt.Errorf("failed to fetch voice attachment: %w", voiceErr))
+			return
+		}
+		r.logf("voice fetch success: chat=%d session_key=%s path=%s", chatID, sessionKey, voicePath)
+		transcript, transcribeErr := r.voiceService().Transcribe(turnCtx, voicePath)
+		if transcribeErr != nil {
+			r.logf("voice transcription failed: chat=%d session_key=%s error=%v", chatID, sessionKey, r.redactError(transcribeErr))
+			r.replyError(ctx, b, chatID, progress, fmt.Errorf("failed to transcribe voice note: %w", transcribeErr))
+			return
+		}
+		transcript = strings.TrimSpace(transcript)
+		if transcript == "" {
+			r.replyError(ctx, b, chatID, progress, errors.New("voice note transcription was empty"))
+			return
+		}
+		if strings.TrimSpace(text) != "" {
+			text = strings.TrimSpace(transcript) + "\n\nTelegram caption:\n" + strings.TrimSpace(text)
+		} else {
+			text = transcript
+		}
+		r.logf("voice transcription success: chat=%d session_key=%s chars=%d preview=%q", chatID, sessionKey, len(transcript), r.previewForLog(transcript))
+	}
 	if len(imageFileIDs) > 0 {
 		images, imgErr := fetchTelegramImages(turnCtx, b, imageFileIDs)
 		if imgErr != nil {
@@ -519,19 +561,7 @@ func (r *Runner) executeTurn(ctx context.Context, turnCtx context.Context, b *bo
 		res.AssistantContent = "(empty response)"
 	}
 	r.logf("response send: chat=%d chars=%d", chatID, len(res.AssistantContent))
-	if showTools {
-		if progress != nil {
-			deleted, err := b.DeleteMessage(ctx, &bot.DeleteMessageParams{ChatID: chatID, MessageID: progress.ID})
-			if err != nil || !deleted {
-				r.logf("delete progress failed: chat=%d message_id=%d deleted=%t error=%v", chatID, progress.ID, deleted, r.redactError(err))
-			} else {
-				r.logf("progress message deleted: chat=%d message_id=%d", chatID, progress.ID)
-			}
-		}
-		r.sendChunked(ctx, b, chatID, nil, res.AssistantContent)
-		return
-	}
-	r.sendChunked(ctx, b, chatID, progress, res.AssistantContent)
+	r.sendAssistantResponse(ctx, turnCtx, b, chatID, sessionKey, progress, res.AssistantContent, showTools)
 }
 
 func (r *Runner) authorize(ctx context.Context, b *bot.Bot, chatID, userID int64, cmd string) bool {
@@ -639,49 +669,26 @@ func collectImageFileIDs(msg *models.Message) []string {
 	return out
 }
 
+func collectVoiceFileID(msg *models.Message) string {
+	if msg == nil || msg.Voice == nil {
+		return ""
+	}
+	return strings.TrimSpace(msg.Voice.FileID)
+}
+
 func fetchTelegramImages(ctx context.Context, api telegramFileClient, fileIDs []string) ([]string, error) {
 	if len(fileIDs) == 0 {
 		return nil, nil
 	}
-	httpClient := &http.Client{Timeout: telegramImageFetchTimeout}
 	out := make([]string, 0, len(fileIDs))
 	for _, fileID := range fileIDs {
 		fileID = strings.TrimSpace(fileID)
 		if fileID == "" {
 			continue
 		}
-		file, err := api.GetFile(ctx, &bot.GetFileParams{FileID: fileID})
+		body, _, err := downloadTelegramFile(ctx, api, fileID, telegramImageMaxBytes, telegramImageFetchTimeout)
 		if err != nil {
-			return nil, fmt.Errorf("getFile(%s): %w", fileID, err)
-		}
-		if file == nil || strings.TrimSpace(file.FilePath) == "" {
-			return nil, fmt.Errorf("getFile(%s): empty file path", fileID)
-		}
-		link := strings.TrimSpace(api.FileDownloadLink(file))
-		if link == "" {
-			return nil, fmt.Errorf("getFile(%s): empty download link", fileID)
-		}
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, link, nil)
-		if err != nil {
-			return nil, fmt.Errorf("build download request for %s: %w", fileID, err)
-		}
-		res, err := httpClient.Do(req)
-		if err != nil {
-			return nil, fmt.Errorf("download file %s: %w", fileID, err)
-		}
-		body, readErr := io.ReadAll(io.LimitReader(res.Body, telegramImageMaxBytes+1))
-		_ = res.Body.Close()
-		if readErr != nil {
-			return nil, fmt.Errorf("read file %s: %w", fileID, readErr)
-		}
-		if res.StatusCode >= 300 {
-			return nil, fmt.Errorf("download file %s status %d", fileID, res.StatusCode)
-		}
-		if len(body) == 0 {
-			return nil, fmt.Errorf("download file %s: empty body", fileID)
-		}
-		if len(body) > telegramImageMaxBytes {
-			return nil, fmt.Errorf("download file %s too large (%d bytes > %d)", fileID, len(body), telegramImageMaxBytes)
+			return nil, err
 		}
 		out = append(out, base64.StdEncoding.EncodeToString(body))
 	}
@@ -689,6 +696,70 @@ func fetchTelegramImages(ctx context.Context, api telegramFileClient, fileIDs []
 		return nil, errors.New("no images fetched")
 	}
 	return out, nil
+}
+
+func fetchTelegramVoice(ctx context.Context, api telegramFileClient, fileID string) (string, func(), error) {
+	body, file, err := downloadTelegramFile(ctx, api, fileID, telegramVoiceMaxBytes, telegramVoiceFetchTimeout)
+	if err != nil {
+		return "", nil, err
+	}
+	dir, err := os.MkdirTemp("", "ollamaclaw-telegram-voice-*")
+	if err != nil {
+		return "", nil, fmt.Errorf("create voice temp dir: %w", err)
+	}
+	cleanup := func() { _ = os.RemoveAll(dir) }
+	ext := strings.ToLower(filepath.Ext(strings.TrimSpace(file.FilePath)))
+	if ext == "" || len(ext) > 8 {
+		ext = ".ogg"
+	}
+	path := filepath.Join(dir, "voice"+ext)
+	if err := os.WriteFile(path, body, 0o600); err != nil {
+		cleanup()
+		return "", nil, fmt.Errorf("write voice file: %w", err)
+	}
+	return path, cleanup, nil
+}
+
+func downloadTelegramFile(ctx context.Context, api telegramFileClient, fileID string, maxBytes int64, timeout time.Duration) ([]byte, *models.File, error) {
+	fileID = strings.TrimSpace(fileID)
+	if fileID == "" {
+		return nil, nil, errors.New("empty telegram file id")
+	}
+	file, err := api.GetFile(ctx, &bot.GetFileParams{FileID: fileID})
+	if err != nil {
+		return nil, nil, fmt.Errorf("getFile(%s): %w", fileID, err)
+	}
+	if file == nil || strings.TrimSpace(file.FilePath) == "" {
+		return nil, nil, fmt.Errorf("getFile(%s): empty file path", fileID)
+	}
+	link := strings.TrimSpace(api.FileDownloadLink(file))
+	if link == "" {
+		return nil, nil, fmt.Errorf("getFile(%s): empty download link", fileID)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, link, nil)
+	if err != nil {
+		return nil, nil, fmt.Errorf("build download request for %s: %w", fileID, err)
+	}
+	httpClient := &http.Client{Timeout: timeout}
+	res, err := httpClient.Do(req)
+	if err != nil {
+		return nil, nil, fmt.Errorf("download file %s: %w", fileID, err)
+	}
+	body, readErr := io.ReadAll(io.LimitReader(res.Body, maxBytes+1))
+	_ = res.Body.Close()
+	if readErr != nil {
+		return nil, nil, fmt.Errorf("read file %s: %w", fileID, readErr)
+	}
+	if res.StatusCode >= 300 {
+		return nil, nil, fmt.Errorf("download file %s status %d", fileID, res.StatusCode)
+	}
+	if len(body) == 0 {
+		return nil, nil, fmt.Errorf("download file %s: empty body", fileID)
+	}
+	if int64(len(body)) > maxBytes {
+		return nil, nil, fmt.Errorf("download file %s too large (%d bytes > %d)", fileID, len(body), maxBytes)
+	}
+	return body, file, nil
 }
 
 func (r *Runner) replyError(ctx context.Context, b *bot.Bot, chatID int64, progress *models.Message, err error) {
@@ -734,10 +805,10 @@ func (r *Runner) handleCommand(ctx context.Context, b *bot.Bot, chatID int64, ra
 	case "start":
 		r.logf("command start: chat=%d", chatID)
 		r.resyncCommandsBestEffort("start")
-		send("OllamaClaw is ready.\nCommands:\n/start\n/help\n/model [name]\n/tools\n/reminder list [active|all]\n/reminder safe <id>\n/reminder unsafe <id>\n/reminder prefetch list <id>\n/show tools [on|off]\n/show thinking [on|off]\n/show dreaming [on|off]\n/verbose [on|off]\n/think [on|off|low|medium|high|default]\n/dream\n/status\n/fullsystem\n/reset\n/stop\n/restart")
+		send("OllamaClaw is ready.\nCommands:\n/start\n/help\n/model [name]\n/tools\n/reminder list [active|all]\n/reminder safe <id>\n/reminder unsafe <id>\n/reminder prefetch list <id>\n/show tools [on|off]\n/show thinking [on|off]\n/show dreaming [on|off]\n/verbose [on|off]\n/think [on|off|low|medium|high|default]\n/voice [off|text|audio|both]\n/dream\n/status\n/fullsystem\n/reset\n/stop\n/restart")
 	case "help":
 		r.logf("command help: chat=%d", chatID)
-		send("Commands:\n/start\n/help\n/model [name]\n/tools\n/reminder list [active|all]\n/reminder safe <id>\n/reminder unsafe <id>\n/reminder prefetch list <id>\n/show tools [on|off]\n/show thinking [on|off]\n/show dreaming [on|off]\n/verbose [on|off]\n/think [on|off|low|medium|high|default]\n/dream\n/status\n/fullsystem\n/reset\n/stop\n/restart\n\nSend any text to chat with OllamaClaw.")
+		send("Commands:\n/start\n/help\n/model [name]\n/tools\n/reminder list [active|all]\n/reminder safe <id>\n/reminder unsafe <id>\n/reminder prefetch list <id>\n/show tools [on|off]\n/show thinking [on|off]\n/show dreaming [on|off]\n/verbose [on|off]\n/think [on|off|low|medium|high|default]\n/voice [off|text|audio|both]\n/dream\n/status\n/fullsystem\n/reset\n/stop\n/restart\n\nSend text, photos, or voice notes to chat with OllamaClaw.")
 	case "reset":
 		r.logf("command reset: chat=%d", chatID)
 		newSess, err := r.Engine.ResetSession(ctx, "telegram", sessionKey)
@@ -904,6 +975,34 @@ func (r *Runner) handleCommand(ctx context.Context, b *bot.Bot, chatID int64, ra
 		}
 		r.logf("command think set: chat=%d value=%s", chatID, value)
 		send(fmt.Sprintf("think: %s", value))
+	case "voice":
+		r.logf("command voice: chat=%d args=%q", chatID, r.previewForLog(strings.Join(parts[1:], " ")))
+		if len(parts) == 1 || strings.EqualFold(strings.TrimSpace(parts[1]), "status") {
+			mode, err := r.sessionVoiceReplyMode(ctx, sessionKey)
+			if err != nil {
+				r.logf("command voice read failed: chat=%d error=%v", chatID, r.redactError(err))
+				sendErr(err)
+				return
+			}
+			send(fmt.Sprintf("voice reply: %s\nstt_model: %s\nkokoro_voice: %s", mode, r.Cfg.Voice.TranscriptionModel, r.Cfg.Voice.KokoroVoice))
+			return
+		}
+		valueArg := strings.TrimSpace(parts[1])
+		if strings.EqualFold(valueArg, "reply") && len(parts) >= 3 {
+			valueArg = strings.TrimSpace(parts[2])
+		}
+		mode, ok := normalizeVoiceReplyMode(valueArg)
+		if !ok {
+			send("usage: /voice [off|text|audio|both]")
+			return
+		}
+		if err := r.setSessionVoiceReplyMode(ctx, sessionKey, mode); err != nil {
+			r.logf("command voice set failed: chat=%d error=%v", chatID, r.redactError(err))
+			sendErr(err)
+			return
+		}
+		r.logf("command voice set: chat=%d mode=%s", chatID, mode)
+		send("voice reply: " + mode)
 	case "dream":
 		r.logf("command dream: chat=%d args=%q", chatID, r.previewForLog(strings.Join(parts[1:], " ")))
 		started, err := r.Engine.TriggerCoreMemoriesRefresh(ctx, "telegram", sessionKey)
@@ -1031,6 +1130,7 @@ func (r *Runner) handleCommand(ctx context.Context, b *bot.Bot, chatID int64, ra
 		verbose, _ := r.Engine.IsSessionVerbose(ctx, "telegram", sessionKey)
 		showTools, _ := r.Engine.IsSessionShowTools(ctx, "telegram", sessionKey)
 		thinkValue, _ := r.Engine.SessionThinkValue(ctx, "telegram", sessionKey)
+		voiceMode, _ := r.sessionVoiceReplyMode(ctx, sessionKey)
 		dreamingNotifications, _ := r.Engine.IsSessionDreamingNotifications(ctx, "telegram", sessionKey)
 		estimate, estErr := r.Engine.EstimateNextPrompt(ctx, "telegram", sessionKey)
 		if estErr != nil {
@@ -1046,7 +1146,7 @@ func (r *Runner) handleCommand(ctx context.Context, b *bot.Bot, chatID int64, ra
 		if len(r.Cfg.GitHubWebhook.RepoAllowlist) > 0 {
 			webhookRepos = strings.Join(r.Cfg.GitHubWebhook.RepoAllowlist, ", ")
 		}
-		text := fmt.Sprintf("status:\nversion: %s\nmodel: %s\nverbose: %t\nshow_tools: %t\nthink: %s\ndreaming_notifications: %t\ntimezone: %s\nnext_prompt_tokens_est: %d\nnext_prompt_chars_est: %d\nnext_prompt_messages: %d\nnext_prompt_tools: %d\nprompt_estimator: %s\nlifetime_prompt_tokens: %d\nlifetime_completion_tokens: %d\ncompactions: %d\ncontext_window_tokens: %d\ncompaction_threshold: %.2f\ncompaction_trigger_tokens: %d\nkeep_recent_turns: %d\nlast_compaction_at: %s\nlast_compaction_summary_chars: %d\nlast_compaction_archived_before_seq: %d\ngithub_webhook_enabled: %t\ngithub_webhook_listen_addr: %s\ngithub_webhook_owner_login: %s\ngithub_webhook_repo_allowlist: %s\ndb: %s\nlog: %s", version, redactTelegramToken(r.Cfg.Telegram.BotToken, sess.ModelOverride), verbose, showTools, thinkValue, dreamingNotifications, util.PacificTimezoneName, estimate.EstimatedTokens, estimate.RequestChars, estimate.MessageCount, estimate.ToolCount, estimate.EstimatorFormula, sess.TotalPromptToken, sess.TotalEvalToken, compaction.TotalCount, r.Cfg.ContextWindowTokens, r.Cfg.CompactionThreshold, thresholdTokens, r.Cfg.KeepRecentTurns, compaction.LastAt, compaction.SummaryChars, compaction.ArchivedBeforeSeq, githubWebhookEnabled(r.Cfg), strings.TrimSpace(r.Cfg.GitHubWebhook.ListenAddr), strings.TrimSpace(r.Cfg.GitHubWebhook.OwnerLogin), webhookRepos, r.Cfg.DBPath, strings.TrimSpace(r.Cfg.LogPath))
+		text := fmt.Sprintf("status:\nversion: %s\nmodel: %s\nverbose: %t\nshow_tools: %t\nthink: %s\nvoice_reply: %s\ndreaming_notifications: %t\ntimezone: %s\nnext_prompt_tokens_est: %d\nnext_prompt_chars_est: %d\nnext_prompt_messages: %d\nnext_prompt_tools: %d\nprompt_estimator: %s\nlifetime_prompt_tokens: %d\nlifetime_completion_tokens: %d\ncompactions: %d\ncontext_window_tokens: %d\ncompaction_threshold: %.2f\ncompaction_trigger_tokens: %d\nkeep_recent_turns: %d\nlast_compaction_at: %s\nlast_compaction_summary_chars: %d\nlast_compaction_archived_before_seq: %d\ngithub_webhook_enabled: %t\ngithub_webhook_listen_addr: %s\ngithub_webhook_owner_login: %s\ngithub_webhook_repo_allowlist: %s\ndb: %s\nlog: %s", version, redactTelegramToken(r.Cfg.Telegram.BotToken, sess.ModelOverride), verbose, showTools, thinkValue, voiceMode, dreamingNotifications, util.PacificTimezoneName, estimate.EstimatedTokens, estimate.RequestChars, estimate.MessageCount, estimate.ToolCount, estimate.EstimatorFormula, sess.TotalPromptToken, sess.TotalEvalToken, compaction.TotalCount, r.Cfg.ContextWindowTokens, r.Cfg.CompactionThreshold, thresholdTokens, r.Cfg.KeepRecentTurns, compaction.LastAt, compaction.SummaryChars, compaction.ArchivedBeforeSeq, githubWebhookEnabled(r.Cfg), strings.TrimSpace(r.Cfg.GitHubWebhook.ListenAddr), strings.TrimSpace(r.Cfg.GitHubWebhook.OwnerLogin), webhookRepos, r.Cfg.DBPath, strings.TrimSpace(r.Cfg.LogPath))
 		send(text)
 	case "fullsystem":
 		r.logf("command fullsystem: chat=%d", chatID)
@@ -1167,6 +1267,7 @@ func (r *Runner) enqueuePendingTurn(sessionKey string, turn pendingTurn) pending
 	turn.sessionKey = sessionKey
 	turn.text = strings.TrimSpace(turn.text)
 	turn.imageFileIDs = append([]string(nil), turn.imageFileIDs...)
+	turn.voiceFileID = strings.TrimSpace(turn.voiceFileID)
 	if turn.messageCount <= 0 {
 		turn.messageCount = 1
 	}
@@ -1178,6 +1279,9 @@ func (r *Runner) enqueuePendingTurn(sessionKey string, turn pendingTurn) pending
 	if existing, ok := r.pendingTurns[sessionKey]; ok {
 		existing.text = joinPendingText(existing.text, turn.text)
 		existing.imageFileIDs = mergePendingImageIDs(existing.imageFileIDs, turn.imageFileIDs)
+		if turn.voiceFileID != "" {
+			existing.voiceFileID = turn.voiceFileID
+		}
 		if turn.chatID != 0 {
 			existing.chatID = turn.chatID
 		}
@@ -1286,7 +1390,7 @@ func (r *Runner) drainPendingTurn(sessionKey string, generation uint64) {
 		func() {
 			defer turnCancel()
 			defer r.endTurn(turn.sessionKey, turnID)
-			r.executeTurn(context.Background(), turnCtx, turn.bot, turn.chatID, turn.userID, turn.sessionKey, turn.text, turn.imageFileIDs)
+			r.executeTurn(context.Background(), turnCtx, turn.bot, turn.chatID, turn.userID, turn.sessionKey, turn.text, turn.imageFileIDs, turn.voiceFileID)
 		}()
 		return
 	}
@@ -1421,6 +1525,98 @@ func (r *Runner) sendChunked(ctx context.Context, b *bot.Bot, chatID int64, prog
 	}
 }
 
+func (r *Runner) sendAssistantResponse(ctx context.Context, turnCtx context.Context, b *bot.Bot, chatID int64, sessionKey string, progress *models.Message, text string, showTools bool) {
+	mode, err := r.sessionVoiceReplyMode(ctx, sessionKey)
+	if err != nil {
+		r.logf("voice mode read failed: chat=%d session_key=%s error=%v", chatID, sessionKey, r.redactError(err))
+		mode = "both"
+	}
+	sendText := mode != "audio"
+	sendVoice := mode == "audio" || mode == "both"
+
+	if showTools && progress != nil {
+		deleted, delErr := b.DeleteMessage(ctx, &bot.DeleteMessageParams{ChatID: chatID, MessageID: progress.ID})
+		if delErr != nil || !deleted {
+			r.logf("delete progress failed: chat=%d message_id=%d deleted=%t error=%v", chatID, progress.ID, deleted, r.redactError(delErr))
+		} else {
+			r.logf("progress message deleted: chat=%d message_id=%d", chatID, progress.ID)
+		}
+		progress = nil
+	}
+
+	textSent := false
+	if sendText {
+		r.sendChunked(ctx, b, chatID, progress, text)
+		textSent = true
+		progress = nil
+	} else if progress != nil {
+		deleted, delErr := b.DeleteMessage(ctx, &bot.DeleteMessageParams{ChatID: chatID, MessageID: progress.ID})
+		if delErr != nil || !deleted {
+			r.logf("delete progress before voice-only reply failed: chat=%d message_id=%d deleted=%t error=%v", chatID, progress.ID, deleted, r.redactError(delErr))
+		}
+		progress = nil
+	}
+
+	if !sendVoice {
+		return
+	}
+	if err := r.sendVoiceReply(turnCtx, b, chatID, text); err != nil {
+		r.logf("voice reply failed: chat=%d session_key=%s error=%v", chatID, sessionKey, r.redactError(err))
+		if !textSent {
+			r.sendChunked(ctx, b, chatID, nil, text)
+		} else {
+			sendCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_, _ = b.SendMessage(sendCtx, &bot.SendMessageParams{ChatID: chatID, Text: "voice reply error: " + r.redactError(err).Error()})
+		}
+	}
+}
+
+func (r *Runner) sendVoiceReply(ctx context.Context, b *bot.Bot, chatID int64, text string) error {
+	if b == nil {
+		return errors.New("telegram bot is unavailable")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	sendCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	_, _ = b.SendChatAction(sendCtx, &bot.SendChatActionParams{ChatID: chatID, Action: models.ChatActionUploadVoice})
+	cancel()
+
+	voice, err := r.voiceService().Synthesize(ctx, text)
+	if err != nil {
+		return err
+	}
+	defer voice.Cleanup()
+	f, err := os.Open(voice.Path)
+	if err != nil {
+		return fmt.Errorf("open generated voice: %w", err)
+	}
+	defer f.Close()
+
+	sendCtx, cancel = context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	_, err = b.SendVoice(sendCtx, &bot.SendVoiceParams{
+		ChatID:   chatID,
+		Voice:    &models.InputFileUpload{Filename: "ollamaclaw.ogg", Data: f},
+		Duration: voice.DurationSeconds,
+	})
+	if err != nil {
+		return fmt.Errorf("send telegram voice: %w", err)
+	}
+	r.logf("voice reply sent: chat=%d duration=%d chars=%d", chatID, voice.DurationSeconds, len(voice.SpeechText))
+	return nil
+}
+
+func (r *Runner) voiceService() *audio.Service {
+	r.voiceMu.Lock()
+	defer r.voiceMu.Unlock()
+	if r.voice == nil {
+		r.voice = audio.NewServiceFromConfig(r.Cfg)
+	}
+	return r.voice
+}
+
 func splitText(text string, max int) []string {
 	if max <= 0 || len(text) <= max {
 		if strings.TrimSpace(text) == "" {
@@ -1467,6 +1663,54 @@ func parseThinkValue(raw string) (string, bool) {
 	default:
 		return "", false
 	}
+}
+
+func normalizeVoiceReplyMode(raw string) (string, bool) {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "1", "true", "on", "yes", "both":
+		return "both", true
+	case "0", "false", "off", "no", "none":
+		return "off", true
+	case "text":
+		return "text", true
+	case "audio", "voice":
+		return "audio", true
+	default:
+		return "", false
+	}
+}
+
+func (r *Runner) sessionVoiceReplyMode(ctx context.Context, sessionKey string) (string, error) {
+	if r.Store == nil {
+		return "both", nil
+	}
+	v, ok, err := r.Store.GetSetting(ctx, telegramVoiceReplyModeSettingKey(sessionKey))
+	if err != nil {
+		return "", err
+	}
+	if !ok {
+		return "both", nil
+	}
+	mode, valid := normalizeVoiceReplyMode(v)
+	if !valid {
+		return "both", nil
+	}
+	return mode, nil
+}
+
+func (r *Runner) setSessionVoiceReplyMode(ctx context.Context, sessionKey, mode string) error {
+	normalized, ok := normalizeVoiceReplyMode(mode)
+	if !ok {
+		return fmt.Errorf("invalid voice reply mode: %q", mode)
+	}
+	if r.Store == nil {
+		return errors.New("settings store is unavailable")
+	}
+	return r.Store.SetSetting(ctx, telegramVoiceReplyModeSettingKey(sessionKey), normalized)
+}
+
+func telegramVoiceReplyModeSettingKey(sessionKey string) string {
+	return settingTelegramVoiceReplyModeKey + ":" + strings.TrimSpace(sessionKey)
 }
 
 func formatLiveToolEvent(ev agent.ToolEvent) string {

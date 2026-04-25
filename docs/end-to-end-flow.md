@@ -82,7 +82,7 @@ flowchart TD
 
     H11 --> OUT{"Output path"}
     H8 --> OUT
-    OUT -->|Telegram turn| OT["Send chunked Telegram reply\nOptional live tool/thinking trace"]
+    OUT -->|Telegram turn| OT["Send chunked Telegram reply\nOptional Kokoro voice note\nOptional live tool/thinking trace"]
     OUT -->|REPL turn| OR["Print response in terminal"]
     OUT -->|Cron run| OC["Scheduler sink pushes output to Telegram session"]
 ```
