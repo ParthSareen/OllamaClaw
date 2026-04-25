@@ -1,7 +1,7 @@
 # OllamaClaw
 
 OllamaClaw is a private Telegram-first local agent for your laptop, powered by Ollama. It is built for remote coding/ops work from a trusted DM: ask it questions, let it inspect files/logs, run safe shell commands, follow up on GitHub/CI, and run reminder-triggered tasks while keeping state locally.
-Current app version: `0.2.0`.
+Current app version: `0.2.1`.
 
 It supports:
 - Private Telegram DM gateway with owner allowlist, image input, `/stop`, `/restart`, `/status`, `/fullsystem`, live tool visibility, and thinking controls
@@ -75,6 +75,8 @@ Telegram voice notes and local hold-to-talk use local Gemma 4 audio transcriptio
 - `ffmpeg` available on `PATH`
 - Kokoro installed at `~/.ollamaclaw/kokoro-test/venv/bin/python`
 
+OllamaClaw prompts Gemma for a clean, punctuated transcript and gives it Edith-specific technical context so ambiguous speech is biased toward coding, logs, models, repos, terminals, and local automation.
+
 ### 1) Install ffmpeg
 
 ```bash
@@ -95,7 +97,7 @@ Optional smoke test:
 ```bash
 say -o /tmp/ollamaclaw_voice_test.aiff "OllamaClaw voice test."
 afconvert -f WAVE -d LEI16@16000 /tmp/ollamaclaw_voice_test.aiff /tmp/ollamaclaw_voice_test.wav
-ollama run gemma4:e2b --think false --hidethinking /tmp/ollamaclaw_voice_test.wav "Transcribe the speech in this audio. Output only the transcript."
+ollama run gemma4:e2b --think false --hidethinking /tmp/ollamaclaw_voice_test.wav "Transcribe the speech in this audio. Output only a clean, punctuated transcript."
 ```
 
 ### 3) Set up Kokoro
@@ -127,7 +129,6 @@ afplay /tmp/ollamaclaw_kokoro_test.wav
 If you install Kokoro somewhere else, update `voice.kokoro_python` in `~/.ollamaclaw/config.json`. If Python package imports fail on Apple Silicon with an architecture mismatch, recreate the venv with an arm64 Python, or run the setup commands through `arch -arm64`.
 
 ### 4) Verify OllamaClaw's live audio path
-
 ```bash
 OLLAMACLAW_LIVE_KOKORO_TEST=1 go test ./internal/audio -run TestSynthesizeLiveWhenEnabled -count=1
 OLLAMACLAW_LIVE_OLLAMA_AUDIO_TEST=1 go test ./internal/audio -run TestTranscribeLiveWhenEnabled -count=1
@@ -214,7 +215,7 @@ ollamaclaw telegram run   # legacy alias for launch
 - `/stop` interrupts the active turn
 - `/restart` restarts the launch loop from Telegram
 - Send photos (or image documents) with an optional caption; image bytes are fetched from Telegram and forwarded to Ollama chat `images`
-- Send voice notes to transcribe locally with Gemma 4 and receive a text reply plus a Kokoro-generated Telegram voice note
+- Send voice notes to transcribe locally with Gemma 4; `/voice [off|text|audio|both]` controls whether replies include Telegram voice notes
 - If messages arrive in quick succession, OllamaClaw waits for a 1.5s quiet window, coalesces them with newlines, then runs one turn
 
 ## GitHub webhook triggers

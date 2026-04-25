@@ -71,7 +71,7 @@ func (s *Service) Transcribe(ctx context.Context, audioPath string) (string, err
 	defer cleanup()
 
 	prompt := strings.Join([]string{
-		"Transcribe the speech in this audio. Output only the transcript.",
+		"Transcribe the speech in this audio. Output only a clean, punctuated transcript.",
 		"",
 		"Context:",
 		"- This is a short user message for OllamaClaw, a private agent named Edith.",
@@ -81,6 +81,8 @@ func (s *Service) Transcribe(ctx context.Context, audioPath string) (string, err
 		"",
 		"Rules:",
 		"- Output only what the speaker said.",
+		"- Use normal sentence capitalization and punctuation: periods, commas, question marks, apostrophes, and short line breaks where they make the transcript easier to read.",
+		"- Add punctuation from the speaker's phrasing and pauses, but do not change the words or make the message more formal.",
 		"- Do not answer, summarize, add labels, use JSON, include timestamps, or add commentary.",
 		"- Do not include thinking or tool output.",
 		"- Do not append the word false or any boolean value unless the speaker clearly said it.",
