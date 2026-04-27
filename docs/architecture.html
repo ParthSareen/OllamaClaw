@@ -1,0 +1,477 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>OllamaClaw — Architecture</title>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<style>
+  :root {
+    --bg: #0e0e0e;
+    --fg: #e6e6e6;
+    --dim: #888;
+    --rule: #222;
+    --accent: #ff7a45;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--fg);
+    font-family: var(--sans);
+    font-size: 15px;
+    line-height: 1.55;
+    -webkit-font-smoothing: antialiased;
+  }
+  main {
+    max-width: 880px;
+    margin: 0 auto;
+    padding: 64px 24px 96px;
+  }
+  h1 {
+    font-size: 22px;
+    font-weight: 600;
+    margin: 0 0 4px;
+    letter-spacing: -0.01em;
+  }
+  h1 .ver { color: var(--dim); font-weight: 400; font-family: var(--mono); font-size: 14px; }
+  .lede {
+    color: var(--dim);
+    margin: 0 0 48px;
+    max-width: 640px;
+  }
+  h2 {
+    font-size: 15px;
+    font-weight: 600;
+    margin: 56px 0 4px;
+    letter-spacing: 0;
+  }
+  h2 .n {
+    color: var(--dim);
+    font-family: var(--mono);
+    font-weight: 400;
+    margin-right: 10px;
+  }
+  section > p {
+    color: var(--dim);
+    margin: 0 0 18px;
+    max-width: 640px;
+  }
+  code {
+    font-family: var(--mono);
+    font-size: 13px;
+    color: var(--fg);
+  }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+
+  .diagram {
+    border: 1px solid var(--rule);
+    border-radius: 4px;
+    padding: 24px;
+    overflow-x: auto;
+    background: #0e0e0e;
+  }
+  .mermaid { font-family: var(--sans) !important; }
+  .mermaid svg { max-width: 100%; height: auto; display: block; margin: 0 auto; }
+
+  .tools {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 28px 32px;
+    border: 1px solid var(--rule);
+    border-radius: 4px;
+    padding: 24px;
+  }
+  .tools h4 {
+    font-size: 12px;
+    font-family: var(--mono);
+    font-weight: 500;
+    color: var(--dim);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    margin: 0 0 10px;
+  }
+  .tools ul { list-style: none; margin: 0; padding: 0; }
+  .tools li {
+    font-family: var(--mono);
+    font-size: 13px;
+    padding: 3px 0;
+  }
+  .tools li small {
+    color: var(--dim);
+    font-family: var(--sans);
+    font-size: 12px;
+    margin-left: 4px;
+  }
+
+  .files {
+    border: 1px solid var(--rule);
+    border-radius: 4px;
+    overflow: hidden;
+  }
+  .files .row {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    gap: 16px;
+    padding: 8px 16px;
+    border-top: 1px solid var(--rule);
+    font-family: var(--mono);
+    font-size: 13px;
+  }
+  .files .row:first-child { border-top: none; }
+  .files .row .lines { color: var(--dim); }
+
+  hr {
+    border: none;
+    border-top: 1px solid var(--rule);
+    margin: 64px 0 16px;
+  }
+  footer {
+    color: var(--dim);
+    font-family: var(--mono);
+    font-size: 12px;
+  }
+</style>
+</head>
+<body>
+<main>
+  <h1>OllamaClaw architecture <span class="ver">v0.3.0</span></h1>
+  <p class="lede">
+    A Go agent that runs against an Ollama host. Several ingress channels — REPL, Telegram,
+    cron, GitHub webhooks, a local hotkey server — all funnel into one shared engine backed
+    by SQLite.
+  </p>
+
+  <section>
+    <h2><span class="n">01</span>System overview</h2>
+    <p>
+      Five ingress channels feed the same <code>agent.Engine</code>. The engine reads/writes
+      <code>~/.ollamaclaw/*.db</code>, calls Ollama for chat plus transcription and synthesis,
+      and dispatches to the builtin tool table.
+    </p>
+    <div class="diagram">
+<pre class="mermaid">
+flowchart LR
+  REPL["REPL<br/><span style='font-family:monospace;font-size:11px;color:#888'>cli/repl.go</span>"]
+  TG["Telegram bot<br/><span style='font-family:monospace;font-size:11px;color:#888'>telegram/run.go</span>"]
+  CRON["Cron / reminders<br/><span style='font-family:monospace;font-size:11px;color:#888'>cronjobs/manager.go</span>"]
+  GH["GitHub webhook<br/><span style='font-family:monospace;font-size:11px;color:#888'>POST /webhooks/github</span>"]
+  HK["Local hotkey HTTP<br/><span style='font-family:monospace;font-size:11px;color:#888'>127.0.0.1:8790</span>"]
+
+  ENG(("agent.Engine"))
+
+  DB[("SQLite<br/>sessions · messages<br/>compactions · jobs")]
+  CONF[/"~/.ollamaclaw/<br/>system_prompt.* · core_memories.md"/]
+
+  OLL["Ollama host<br/>chat · think · tools"]
+  WHISP["Gemma transcription"]
+  KOK["Kokoro TTS"]
+
+  TOOLS["Builtin tools<br/>tools/tools.go"]
+  SUB["Subagent worker pool<br/>codex exec"]
+
+  REPL --> ENG
+  TG --> ENG
+  CRON --> ENG
+  GH --> ENG
+  HK --> ENG
+
+  ENG <--> DB
+  ENG <--> CONF
+  ENG -->|chat / tools| OLL
+  ENG -->|tool dispatch| TOOLS
+  TOOLS -->|enqueue| SUB
+  SUB -->|completion event| ENG
+
+  TG -.audio.-> WHISP
+  TG -.reply.-> KOK
+  HK -.audio.-> WHISP
+  HK -.reply.-> KOK
+</pre>
+    </div>
+  </section>
+
+  <section>
+    <h2><span class="n">02</span>One turn through the agent loop</h2>
+    <p>
+      Every channel ends up here. The loop is a bounded tool-use cycle (max 12 iterations)
+      with persistence on every step and two background side-effects: compaction once a
+      session crosses the context threshold, and a core-memory refresh every 10 user turns.
+    </p>
+    <div class="diagram">
+<pre class="mermaid">
+sequenceDiagram
+  autonumber
+  participant U as Ingress<br/>(Telegram / REPL / Cron)
+  participant E as agent.Engine
+  participant DB as SQLite
+  participant SP as Prompt assembly<br/>(system + overlay + core mem<br/>+ compaction summary)
+  participant O as Ollama /api/chat
+  participant T as Tool dispatcher
+  participant BG as Background<br/>(compaction + dream)
+
+  U->>E: HandleTextWithOptions(text, images, opts)
+  E->>DB: GetOrCreateActiveSession(transport, key)
+  E->>DB: InsertMessage(role=user)
+  E->>SP: build active prompt
+  loop up to 12 iterations
+    E->>O: chat(messages, tools, think?)
+    O-->>E: assistant reply<br/>(content + tool_calls)
+    E->>DB: InsertMessage(role=assistant)
+    alt tool_calls present
+      E->>T: dispatch each call
+      T-->>E: result (or timeout / error)
+      E->>DB: InsertMessage(role=tool, per call)
+      E-->>U: emit ToolEventStart / Finish
+    else final reply
+      Note over E: break loop
+    end
+  end
+  E-->>U: assistant text<br/>(chunked, optional voice)
+  E->>DB: IncrementSessionTokens
+  par if tokens > threshold
+    E->>BG: maybeCompact()<br/>summarize + archive
+  and every 10 user turns
+    E->>BG: refreshCoreMemories()<br/>(non-blocking)
+  end
+</pre>
+    </div>
+  </section>
+
+  <section>
+    <h2><span class="n">03</span>Tools catalog &amp; dispatch</h2>
+    <p>
+      Tools are constructed once in <code>tools.BuiltinTools()</code> and handed to the engine.
+      Each turn, the combined list is converted to Ollama's tool schema; results route back
+      as <code>role=tool</code> messages and re-enter the loop.
+    </p>
+
+    <div class="tools">
+      <div>
+        <h4>Filesystem &amp; shell</h4>
+        <ul>
+          <li>bash <small>timeout, captures stdout/stderr/exit</small></li>
+          <li>read_file</li>
+          <li>write_file</li>
+          <li>read_logs <small>self-debug runtime logs</small></li>
+        </ul>
+      </div>
+      <div>
+        <h4>Web</h4>
+        <ul>
+          <li>web_search</li>
+          <li>web_fetch</li>
+        </ul>
+      </div>
+      <div>
+        <h4>System prompt overlay</h4>
+        <ul>
+          <li>system_prompt_get</li>
+          <li>system_prompt_update</li>
+          <li>system_prompt_history</li>
+          <li>system_prompt_rollback</li>
+        </ul>
+      </div>
+      <div>
+        <h4>Reminders</h4>
+        <ul>
+          <li>reminder_add <small>once · daily · interval · weekdays · monthly</small></li>
+          <li>reminder_list</li>
+          <li>reminder_remove</li>
+        </ul>
+      </div>
+      <div>
+        <h4>Subagents</h4>
+        <ul>
+          <li>subagent_start</li>
+          <li>subagent_pr_review</li>
+          <li>subagent_list / status / result / cancel</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="diagram" style="margin-top: 16px;">
+<pre class="mermaid">
+flowchart LR
+  A["assistant reply<br/>tool_calls = [call_1, call_2, ...]"]
+  B{"per call:<br/>lookup name in registry"}
+  C["execute(args, ctx with timeout)"]
+  D["emit ToolEventStart"]
+  E["emit ToolEventFinish"]
+  F["InsertMessage(role=tool,<br/>tool_call_id, content)"]
+  G["timeout / panic / error"]
+  H["next loop iteration<br/>→ Ollama /api/chat"]
+
+  A --> B --> D --> C
+  C --> E --> F --> H
+  C -.error.-> G --> F
+</pre>
+    </div>
+  </section>
+
+  <section>
+    <h2><span class="n">04</span>Background subagents</h2>
+    <p>
+      Two surfaces — generic <code>subagent_start</code> and batched <code>subagent_pr_review</code> —
+      drop tasks into a shared queue. A worker pool (default <code>MaxConcurrent=3</code>)
+      shells out to <code>codex exec</code>, captures stdout/stderr, caps results at 64&nbsp;KB,
+      and notifies the originating session on completion.
+    </p>
+    <div class="diagram">
+<pre class="mermaid">
+flowchart TB
+  T1["subagent_start<br/>(prompt, model?)"]
+  T2["subagent_pr_review<br/>(repo, [pr_numbers])"]
+
+  Q[("subagent_tasks table<br/>queued · running · succeeded · failed · canceled")]
+  SIG{{"signal chan"}}
+
+  W1["worker 1"]
+  W2["worker 2"]
+  W3["worker N"]
+
+  CX1["codex exec<br/>~/.ollamaclaw/subagents/tasks/&lt;id&gt;/"]
+  CX2["codex exec review<br/>git worktree (isolated)"]
+
+  R[("StdoutPath · StderrPath<br/>ResultPath (≤ 64 KB)")]
+  N["Telegram completion notice<br/>+ subagent_result tool"]
+
+  T1 --> Q
+  T2 --> Q
+  Q -. wakes .-> SIG
+  SIG --> W1
+  SIG --> W2
+  SIG --> W3
+  W1 --> CX1
+  W2 --> CX1
+  W3 --> CX2
+  CX1 --> R
+  CX2 --> R
+  R --> N
+</pre>
+    </div>
+  </section>
+
+  <section>
+    <h2><span class="n">05</span>Integration plug-in points</h2>
+    <p>
+      Telegram is the richest surface — voice, images, slash commands, owner allowlist —
+      but every ingress collapses to a single call into the engine. The hotkey path uses
+      a token-protected loopback HTTP server driven by Hammerspoon; webhooks proactively
+      queue a turn into the owner's Telegram session.
+    </p>
+    <div class="diagram">
+<pre class="mermaid">
+flowchart LR
+  subgraph TG[Telegram]
+    direction TB
+    TG_M["DM message"]
+    TG_V["voice note"]
+    TG_I["photo"]
+    TG_C["/commands<br/>/model · /voice · /think · /reset · /tools …"]
+  end
+
+  subgraph HK[Local hotkey – Hammerspoon]
+    direction TB
+    HK_T["Ctrl+Space<br/>text prompt"]
+    HK_V["Ctrl+Shift+Space<br/>hold-to-talk"]
+  end
+
+  subgraph CR[Cron + GitHub]
+    direction TB
+    CRJ["reminder fires"]
+    GHW["GitHub webhook<br/>(PR / check events,<br/>HMAC-SHA256 verified)"]
+  end
+
+  P_OWNER["owner allowlist +<br/>private-chat check"]
+  P_DEBOUNCE["1.5s coalesce"]
+  P_TX["Gemma transcription"]
+  P_TOK["X-OllamaClaw-Local-Token"]
+
+  ENG(("agent.Engine"))
+
+  OUT_TX["chunked text<br/>(4096-char Telegram limit)"]
+  OUT_TTS["Kokoro voice reply"]
+  OUT_TRACE["live tool / thinking trace<br/>(/show, /verbose)"]
+
+  TG_M --> P_OWNER --> P_DEBOUNCE --> ENG
+  TG_V --> P_OWNER --> P_TX --> ENG
+  TG_I --> P_OWNER --> P_DEBOUNCE
+  TG_C --> P_OWNER --> ENG
+
+  HK_T --> P_TOK --> ENG
+  HK_V --> P_TOK --> P_TX --> ENG
+
+  CRJ --> ENG
+  GHW --> ENG
+
+  ENG --> OUT_TX
+  ENG --> OUT_TTS
+  ENG --> OUT_TRACE
+</pre>
+    </div>
+  </section>
+
+  <section>
+    <h2><span class="n">06</span>Key files</h2>
+    <div class="files">
+      <div class="row"><span>main.go</span><span class="lines">1–26</span></div>
+      <div class="row"><span>internal/cli/app.go</span><span class="lines">command router</span></div>
+      <div class="row"><span>internal/cli/repl.go</span><span class="lines">13–59</span></div>
+      <div class="row"><span>internal/agent/engine.go</span><span class="lines">74–1359</span></div>
+      <div class="row"><span>internal/db/db.go</span><span class="lines">migrations + CRUD</span></div>
+      <div class="row"><span>internal/db/types.go</span><span class="lines">Session · Message · SubagentTask · …</span></div>
+      <div class="row"><span>internal/tools/tools.go</span><span class="lines">355–920+</span></div>
+      <div class="row"><span>internal/ollama/client.go</span><span class="lines">chat + audio</span></div>
+      <div class="row"><span>internal/audio/service.go</span><span class="lines">26–200+</span></div>
+      <div class="row"><span>internal/telegram/run.go</span><span class="lines">1–2682</span></div>
+      <div class="row"><span>internal/telegram/local_control.go</span><span class="lines">50–101</span></div>
+      <div class="row"><span>internal/cronjobs/manager.go</span><span class="lines">37–300+</span></div>
+      <div class="row"><span>internal/subagents/manager.go</span><span class="lines">29–600+</span></div>
+      <div class="row"><span>internal/config/config.go</span><span class="lines">26–150+</span></div>
+      <div class="row"><span>contrib/hammerspoon/ollamaclaw.lua</span><span class="lines">hotkey bindings</span></div>
+    </div>
+  </section>
+
+  <hr>
+  <footer>docs/architecture.html — open in a browser</footer>
+</main>
+
+<script>
+  mermaid.initialize({
+    startOnLoad: true,
+    theme: 'base',
+    fontFamily: "-apple-system, system-ui, sans-serif",
+    themeVariables: {
+      background: '#0e0e0e',
+      primaryColor: '#0e0e0e',
+      primaryTextColor: '#e6e6e6',
+      primaryBorderColor: '#444',
+      lineColor: '#666',
+      secondaryColor: '#0e0e0e',
+      tertiaryColor: '#0e0e0e',
+      noteBkgColor: '#181818',
+      noteTextColor: '#e6e6e6',
+      noteBorderColor: '#333',
+      actorBkg: '#0e0e0e',
+      actorBorder: '#666',
+      actorTextColor: '#e6e6e6',
+      actorLineColor: '#444',
+      signalColor: '#888',
+      signalTextColor: '#e6e6e6',
+      labelBoxBkgColor: '#181818',
+      labelBoxBorderColor: '#444',
+      labelTextColor: '#e6e6e6',
+      loopTextColor: '#888',
+      activationBkgColor: '#181818',
+      activationBorderColor: '#444'
+    },
+    flowchart: { curve: 'basis', nodeSpacing: 36, rankSpacing: 60, padding: 8 },
+    sequence:  { mirrorActors: false, boxMargin: 10, messageMargin: 36, noteMargin: 12 }
+  });
+</script>
+</body>
+</html>
