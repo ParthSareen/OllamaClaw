@@ -61,3 +61,39 @@ type ReminderJob struct {
 }
 
 type CronJob = ReminderJob
+
+type SubagentTask struct {
+	ID           string
+	Kind         string
+	Status       string
+	Title        string
+	Prompt       string
+	Transport    string
+	SessionKey   string
+	Repo         string
+	PRNumber     int
+	PRURL        string
+	BaseRef      string
+	HeadRef      string
+	WorktreePath string
+	ResultPath   string
+	StdoutPath   string
+	StderrPath   string
+	MetadataJSON string
+	PID          int
+	ExitCode     *int
+	Error        string
+	CreatedAt    time.Time
+	StartedAt    *time.Time
+	FinishedAt   *time.Time
+	UpdatedAt    time.Time
+}
+
+type SubagentTaskFilter struct {
+	Status     string
+	Kind       string
+	Repo       string
+	Transport  string
+	SessionKey string
+	Limit      int
+}

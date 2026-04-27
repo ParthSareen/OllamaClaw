@@ -46,6 +46,8 @@ Response format:
 Execution behavior:
 - Prefer solving over narrating.
 - Use tools whenever they reduce guesswork, improve speed, or increase correctness.
+- For long-running, parallel, or independent work, use subagent tools to launch background Codex tasks and return task IDs immediately.
+- For multiple PR reviews, prefer subagent_pr_review so each PR can run as an isolated report-only Codex task.
 - For prompt tuning, use managed system_prompt tools instead of directly editing prompt files.
 - Never fabricate tool results, file contents, command outcomes, or links.
 - If tool output is long, summarize key findings first, then include critical details.
@@ -166,12 +168,13 @@ type ThinkingTraceEntry struct {
 	ToolCallCount int
 }
 
-func New(cfg config.Config, store *db.Store, client *ollama.Client, reminderCtrl tools.ReminderController) *Engine {
+func New(cfg config.Config, store *db.Store, client *ollama.Client, reminderCtrl tools.ReminderController, subagentCtrl tools.SubagentController) *Engine {
 	builtin := tools.BuiltinTools(tools.BuiltinsConfig{
 		ToolOutputMaxBytes: cfg.ToolOutputMaxBytes,
 		BashTimeoutSec:     cfg.BashTimeoutSeconds,
 		LogPath:            cfg.LogPath,
 		Reminders:          reminderCtrl,
+		Subagents:          subagentCtrl,
 	}, client)
 	return &Engine{
 		cfg:            cfg,
@@ -537,7 +540,7 @@ func (e *Engine) IsSessionThink(ctx context.Context, transport, sessionKey strin
 		return false, err
 	}
 	switch value {
-	case "on", "low", "medium", "high":
+	case "on", "low", "medium", "high", "xhigh":
 		return true, nil
 	default:
 		return false, nil
@@ -557,11 +560,11 @@ func (e *Engine) SessionThinkValue(ctx context.Context, transport, sessionKey st
 		return "", err
 	}
 	if !ok {
-		return "off", nil
+		return "xhigh", nil
 	}
 	normalized, valid := normalizeThinkSetting(v)
 	if !valid {
-		return "off", nil
+		return "xhigh", nil
 	}
 	return normalized, nil
 }
@@ -1307,7 +1310,7 @@ func normalizeThinkSetting(raw string) (string, bool) {
 		return "on", true
 	case "0", "false", "off", "no":
 		return "off", true
-	case "low", "medium", "high":
+	case "low", "medium", "high", "xhigh":
 		return strings.ToLower(strings.TrimSpace(raw)), true
 	case "default", "auto":
 		return "default", true
@@ -1322,7 +1325,7 @@ func thinkSettingToAPIValue(value string) interface{} {
 		return true
 	case "off":
 		return false
-	case "low", "medium", "high":
+	case "low", "medium", "high", "xhigh":
 		return strings.ToLower(strings.TrimSpace(value))
 	case "default":
 		return nil

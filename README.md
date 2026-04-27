@@ -1,12 +1,13 @@
 # OllamaClaw
 
 OllamaClaw is a private Telegram-first local agent for your laptop, powered by Ollama. It is built for remote coding/ops work from a trusted DM: ask it questions, let it inspect files/logs, run safe shell commands, follow up on GitHub/CI, and run reminder-triggered tasks while keeping state locally.
-Current app version: `0.2.1`.
+Current app version: `0.3.0`.
 
 It supports:
 - Private Telegram DM gateway with owner allowlist, image input, `/stop`, `/restart`, `/status`, `/fullsystem`, live tool visibility, and thinking controls
 - Shared local agent core for `repl`, Telegram, reminders, and GitHub webhook-triggered turns
-- Built-in tools only: `bash`, `read_file`, `write_file`, `web_search`, `web_fetch`, `read_logs`, reminder tools, and managed system prompt tools
+- Built-in tools only: `bash`, `read_file`, `write_file`, `web_search`, `web_fetch`, `read_logs`, reminder tools, subagent tools, and managed system prompt tools
+- Background Codex subagents for durable, parallel tasks, including report-only GitHub PR review jobs via `gh`
 - Reminder-first scheduling in `America/Los_Angeles`, backed by cron internally, with safe-mode and fresh prefetch context
 - Local SQLite persistence with per-chat sessions, message history, compaction summaries, reminders, and learned prefetch commands
 - Dynamic system prompt files plus background core memories (“dreaming”) injected into prompt context
@@ -205,7 +206,7 @@ ollamaclaw telegram run   # legacy alias for launch
 - `/show thinking [on|off]` toggles thinking visibility mode
 - `/show dreaming [on|off]` toggles background long-term-memory (“dreaming”) event notifications for this chat (default: on)
 - `/verbose [on|off]` enables/disables tool + thinking traces for this chat session
-- `/think [on|off|low|medium|high|default]` shows/sets think value
+- `/think [on|off|low|medium|high|xhigh|default]` shows/sets think value
 - `/voice [off|text|audio|both]` shows/sets replies for Telegram voice-note turns (default: `both`)
 - `/voice output [mac|telegram|both]` shows/sets local hotkey voice output (default: `mac`)
 - `/dream` manually triggers a core-memory refresh for the current chat session
@@ -296,6 +297,24 @@ Lists reminders with normalized spec and compiled cron schedule.
 ### `reminder_remove`
 Removes a reminder by `id`.
 
+### `subagent_start`
+Starts a durable headless Codex task in the background and returns a task id. Supports optional model, profile, sandbox, and `reasoning_effort`.
+
+### `subagent_pr_review`
+Queues one or more report-only Codex PR review tasks using isolated worktrees. Results are stored locally and never posted to GitHub automatically. Supports optional model, profile, sandbox, and `reasoning_effort`.
+
+### `subagent_list`
+Lists background Codex tasks.
+
+### `subagent_status`
+Shows lifecycle state, timing, repo/PR metadata, and artifact paths for a task.
+
+### `subagent_result`
+Reads the final stored report for a task.
+
+### `subagent_cancel`
+Cancels a queued or running background task.
+
 ### `read_logs`
 Reads recent OllamaClaw runtime logs for self-debugging.
 
@@ -365,6 +384,17 @@ Defaults:
     "enabled": true,
     "listen_addr": "127.0.0.1:8790",
     "token_path": "~/.ollamaclaw/local_control.token"
+  },
+  "subagents": {
+    "enabled": true,
+    "codex_binary": "codex",
+    "root_dir": "~/.ollamaclaw/subagents",
+    "max_concurrent": 3,
+    "default_timeout_minutes": 45,
+    "default_model": "",
+    "default_profile": "",
+    "default_reasoning_effort": "xhigh",
+    "sandbox": "workspace-write"
   }
 }
 ```
@@ -380,6 +410,7 @@ Tables:
 - `compactions`
 - `cron_jobs`
 - `cron_prefetch_commands`
+- `subagent_tasks`
 
 Compaction archives old rows (`archived=1`) and keeps raw history in SQLite.
 
@@ -402,6 +433,14 @@ Compaction archives old rows (`archived=1`) and keeps raw history in SQLite.
 - Writes to `~/.ollamaclaw/core_memories.md` using managed markers
 - Enforces a hard cap of `4000` characters for stored/injected core memory content
 - Injects managed core memories into prompt context as a dedicated system message
+
+## Subagent behavior
+
+- Subagents run headless Codex CLI jobs in the background and store artifacts under `~/.ollamaclaw/subagents/tasks/<id>/`
+- Subagents default to Codex `model_reasoning_effort="xhigh"` unless the task supplies `reasoning_effort`
+- PR review jobs use `gh` for read-only PR metadata, create isolated git worktrees under `~/.ollamaclaw/subagents/worktrees/`, and run `codex exec review`
+- Telegram sends completion reports back to the originating chat; `/agents list`, `/agents show <id>`, and `/agents cancel <id>` provide manual control
+- V1 is report-only for GitHub: agents must not post comments, submit reviews, push branches, or mutate GitHub state
 
 ## Development
 

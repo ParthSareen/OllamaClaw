@@ -76,6 +76,7 @@ func botCommandDefinitions() []map[string]string {
 		{"command": "model", "description": "Show/set active model"},
 		{"command": "tools", "description": "List available tools"},
 		{"command": "reminder", "description": "List reminders, safety, and prefetch"},
+		{"command": "agents", "description": "List, show, or cancel background Codex tasks"},
 		{"command": "show", "description": "Show/toggle tools, thinking, or dreaming"},
 		{"command": "verbose", "description": "Show or set tool/thinking traces"},
 		{"command": "think", "description": "Show or set think value"},

@@ -541,8 +541,8 @@ func TestSessionThinkValueRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SessionThinkValue error: %v", err)
 	}
-	if value != "off" {
-		t.Fatalf("expected default think value off, got %q", value)
+	if value != "xhigh" {
+		t.Fatalf("expected default think value xhigh, got %q", value)
 	}
 
 	if err := engine.SetSessionThinkValue(ctx, "telegram", "123", "low"); err != nil {
@@ -562,6 +562,16 @@ func TestSessionThinkValueRoundTrip(t *testing.T) {
 	if !enabled {
 		t.Fatalf("expected low think value to be treated as enabled")
 	}
+	if err := engine.SetSessionThinkValue(ctx, "telegram", "123", "xhigh"); err != nil {
+		t.Fatalf("SetSessionThinkValue(xhigh) error: %v", err)
+	}
+	enabled, err = engine.IsSessionThink(ctx, "telegram", "123")
+	if err != nil {
+		t.Fatalf("IsSessionThink error: %v", err)
+	}
+	if !enabled {
+		t.Fatalf("expected xhigh think value to be treated as enabled")
+	}
 
 	if err := engine.SetSessionThinkValue(ctx, "telegram", "123", "default"); err != nil {
 		t.Fatalf("SetSessionThinkValue(default) error: %v", err)
@@ -579,7 +589,7 @@ func TestSessionThinkValueRoundTrip(t *testing.T) {
 	}
 }
 
-func TestHandleTextSendsExplicitThinkFalse(t *testing.T) {
+func TestHandleTextSendsDefaultXHigh(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	ctx := context.Background()
 
@@ -607,12 +617,12 @@ func TestHandleTextSendsExplicitThinkFalse(t *testing.T) {
 	if _, err := engine.HandleText(ctx, "repl", "default", "hello"); err != nil {
 		t.Fatalf("HandleText error: %v", err)
 	}
-	v, ok := seenThink.(bool)
+	v, ok := seenThink.(string)
 	if !ok {
-		t.Fatalf("expected think field to decode as bool, got %T", seenThink)
+		t.Fatalf("expected think field to decode as string, got %T", seenThink)
 	}
-	if v {
-		t.Fatalf("expected explicit think=false by default")
+	if v != "xhigh" {
+		t.Fatalf("expected think=xhigh by default, got %q", v)
 	}
 }
 
@@ -1332,5 +1342,5 @@ func newTestEngine(t *testing.T, ollamaHost string) (*Engine, *db.Store) {
 		t.Fatalf("open store: %v", err)
 	}
 	client := ollama.NewClient(cfg.OllamaHost)
-	return New(cfg, store, client, nil), store
+	return New(cfg, store, client, nil, nil), store
 }

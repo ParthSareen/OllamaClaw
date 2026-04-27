@@ -24,6 +24,7 @@ import (
 	"github.com/ParthSareen/OllamaClaw/internal/config"
 	"github.com/ParthSareen/OllamaClaw/internal/cronjobs"
 	"github.com/ParthSareen/OllamaClaw/internal/db"
+	"github.com/ParthSareen/OllamaClaw/internal/subagents"
 	"github.com/ParthSareen/OllamaClaw/internal/tools"
 	"github.com/ParthSareen/OllamaClaw/internal/util"
 	"github.com/go-telegram/bot"
@@ -35,6 +36,7 @@ type Runner struct {
 	Store      *db.Store
 	Engine     *agent.Engine
 	Scheduler  *cronjobs.Manager
+	Subagents  *subagents.Manager
 	AppVersion string
 
 	lastUpdateID atomic.Int64
@@ -313,6 +315,28 @@ func (r *Runner) Run(ctx context.Context) error {
 		r.logf("reminder scheduler started")
 		defer r.Scheduler.Stop()
 		defer r.logf("reminder scheduler stopped")
+	}
+	if r.Subagents != nil {
+		r.Subagents.SetOutputSink(func(ctx context.Context, transport, sessionKey, content string) error {
+			if transport != "telegram" {
+				return nil
+			}
+			chatID, err := strconv.ParseInt(sessionKey, 10, 64)
+			if err != nil {
+				r.logf("subagent output drop: invalid session_key=%q error=%v", sessionKey, r.redactError(err))
+				return err
+			}
+			r.logf("subagent output -> chat=%d bytes=%d preview=%q", chatID, len(content), r.previewForLog(content))
+			r.sendChunked(ctx, b, chatID, nil, content)
+			return nil
+		})
+		if err := r.Subagents.Start(runCtx); err != nil {
+			r.logf("subagent manager start failed: %v", r.redactError(err))
+			return err
+		}
+		r.logf("subagent manager started")
+		defer r.Subagents.Stop()
+		defer r.logf("subagent manager stopped")
 	}
 	r.logf("telegram bot running")
 	b.Start(runCtx)
@@ -870,10 +894,10 @@ func (r *Runner) handleCommand(ctx context.Context, b *bot.Bot, chatID int64, ra
 	case "start":
 		r.logf("command start: chat=%d", chatID)
 		r.resyncCommandsBestEffort("start")
-		send("OllamaClaw is ready.\nCommands:\n/start\n/help\n/model [name]\n/tools\n/reminder list [active|all]\n/reminder safe <id>\n/reminder unsafe <id>\n/reminder prefetch list <id>\n/show tools [on|off]\n/show thinking [on|off]\n/show dreaming [on|off]\n/verbose [on|off]\n/think [on|off|low|medium|high|default]\n/voice [off|text|audio|both]\n/voice output [mac|telegram|both]\n/dream\n/status\n/fullsystem\n/reset\n/stop\n/restart")
+		send("OllamaClaw is ready.\nCommands:\n/start\n/help\n/model [name]\n/tools\n/reminder list [active|all]\n/reminder safe <id>\n/reminder unsafe <id>\n/reminder prefetch list <id>\n/agents list [active|all]\n/agents show <id>\n/agents cancel <id>\n/show tools [on|off]\n/show thinking [on|off]\n/show dreaming [on|off]\n/verbose [on|off]\n/think [on|off|low|medium|high|xhigh|default]\n/voice [off|text|audio|both]\n/voice output [mac|telegram|both]\n/dream\n/status\n/fullsystem\n/reset\n/stop\n/restart")
 	case "help":
 		r.logf("command help: chat=%d", chatID)
-		send("Commands:\n/start\n/help\n/model [name]\n/tools\n/reminder list [active|all]\n/reminder safe <id>\n/reminder unsafe <id>\n/reminder prefetch list <id>\n/show tools [on|off]\n/show thinking [on|off]\n/show dreaming [on|off]\n/verbose [on|off]\n/think [on|off|low|medium|high|default]\n/voice [off|text|audio|both]\n/voice output [mac|telegram|both]\n/dream\n/status\n/fullsystem\n/reset\n/stop\n/restart\n\nSend text, photos, or voice notes to chat with OllamaClaw.")
+		send("Commands:\n/start\n/help\n/model [name]\n/tools\n/reminder list [active|all]\n/reminder safe <id>\n/reminder unsafe <id>\n/reminder prefetch list <id>\n/agents list [active|all]\n/agents show <id>\n/agents cancel <id>\n/show tools [on|off]\n/show thinking [on|off]\n/show dreaming [on|off]\n/verbose [on|off]\n/think [on|off|low|medium|high|xhigh|default]\n/voice [off|text|audio|both]\n/voice output [mac|telegram|both]\n/dream\n/status\n/fullsystem\n/reset\n/stop\n/restart\n\nSend text, photos, or voice notes to chat with OllamaClaw.")
 	case "reset":
 		r.logf("command reset: chat=%d", chatID)
 		newSess, err := r.Engine.ResetSession(ctx, "telegram", sessionKey)
@@ -1030,7 +1054,7 @@ func (r *Runner) handleCommand(ctx context.Context, b *bot.Bot, chatID int64, ra
 		}
 		value, ok := parseThinkValue(parts[1])
 		if !ok {
-			send("usage: /think [on|off|low|medium|high|default]")
+			send("usage: /think [on|off|low|medium|high|xhigh|default]")
 			return
 		}
 		if err := r.Engine.SetSessionThinkValue(ctx, "telegram", sessionKey, value); err != nil {
@@ -1220,6 +1244,75 @@ func (r *Runner) handleCommand(ctx context.Context, b *bot.Bot, chatID int64, ra
 			r.sendChunked(ctx, b, chatID, nil, strings.Join(lines, "\n"))
 		default:
 			send("usage: /reminder <list|safe|unsafe|prefetch>")
+		}
+	case "agents":
+		r.logf("command agents: chat=%d args=%q", chatID, r.previewForLog(strings.Join(parts[1:], " ")))
+		if r.Subagents == nil {
+			send("subagent manager is unavailable")
+			return
+		}
+		action := "list"
+		if len(parts) >= 2 {
+			action = strings.ToLower(strings.TrimSpace(parts[1]))
+		}
+		switch action {
+		case "list":
+			scope := "active"
+			if len(parts) >= 3 {
+				scope = strings.ToLower(strings.TrimSpace(parts[2]))
+			}
+			if scope != "active" && scope != "all" {
+				send("usage: /agents list [active|all]")
+				return
+			}
+			tasks, err := r.Subagents.ListSubagentTasks(ctx, tools.SubagentTaskFilter{Limit: 50})
+			if err != nil {
+				r.logf("command agents list failed: chat=%d error=%v", chatID, r.redactError(err))
+				sendErr(err)
+				return
+			}
+			if scope == "active" {
+				filtered := tasks[:0]
+				for _, task := range tasks {
+					if task.Status == "queued" || task.Status == "running" {
+						filtered = append(filtered, task)
+					}
+				}
+				tasks = filtered
+			}
+			r.sendChunked(ctx, b, chatID, nil, formatSubagentList(tasks, scope))
+		case "show", "status":
+			if len(parts) < 3 {
+				send("usage: /agents show <id>")
+				return
+			}
+			id := strings.TrimSpace(parts[2])
+			result, ok, err := r.Subagents.GetSubagentResult(ctx, id)
+			if err != nil {
+				r.logf("command agents show failed: chat=%d id=%s error=%v", chatID, id, r.redactError(err))
+				sendErr(err)
+				return
+			}
+			if !ok {
+				send("subagent task not found: " + id)
+				return
+			}
+			r.sendChunked(ctx, b, chatID, nil, formatSubagentResult(result))
+		case "cancel", "stop":
+			if len(parts) < 3 {
+				send("usage: /agents cancel <id>")
+				return
+			}
+			id := strings.TrimSpace(parts[2])
+			info, err := r.Subagents.CancelSubagentTask(ctx, id)
+			if err != nil {
+				r.logf("command agents cancel failed: chat=%d id=%s error=%v", chatID, id, r.redactError(err))
+				sendErr(err)
+				return
+			}
+			send(fmt.Sprintf("subagent canceled:\nid: %s\nstatus: %s", info.ID, info.Status))
+		default:
+			send("usage: /agents <list|show|cancel>")
 		}
 	case "status":
 		r.logf("command status: chat=%d", chatID)
@@ -1627,6 +1720,71 @@ func formatCoreMemoryEvent(ev agent.CoreMemoryEvent) string {
 	}
 }
 
+func formatSubagentList(tasks []tools.SubagentInfo, scope string) string {
+	scope = strings.TrimSpace(scope)
+	if scope == "" {
+		scope = "active"
+	}
+	if len(tasks) == 0 {
+		return fmt.Sprintf("subagents (%s): none", scope)
+	}
+	lines := make([]string, 0, len(tasks)+1)
+	lines = append(lines, fmt.Sprintf("subagents (%s):", scope))
+	for _, task := range tasks {
+		target := "-"
+		if strings.TrimSpace(task.Repo) != "" || task.PRNumber > 0 {
+			target = fmt.Sprintf("%s#%d", fallbackTelegramField(task.Repo, "-"), task.PRNumber)
+		}
+		when := fallbackTelegramField(task.UpdatedAt, task.CreatedAt)
+		errText := strings.TrimSpace(task.Error)
+		if errText != "" {
+			errText = " err=" + truncateForLive(errText)
+		}
+		lines = append(lines, fmt.Sprintf("- %s status=%s kind=%s target=%s updated=%s%s", task.ID, task.Status, task.Kind, target, fallbackTelegramField(when, "-"), errText))
+	}
+	return strings.Join(lines, "\n")
+}
+
+func formatSubagentResult(result tools.SubagentResult) string {
+	task := result.Info
+	lines := []string{
+		"subagent:",
+		"id: " + task.ID,
+		"status: " + task.Status,
+		"kind: " + task.Kind,
+	}
+	if strings.TrimSpace(task.Title) != "" {
+		lines = append(lines, "title: "+task.Title)
+	}
+	if strings.TrimSpace(task.Repo) != "" || task.PRNumber > 0 {
+		lines = append(lines, fmt.Sprintf("target: %s#%d", fallbackTelegramField(task.Repo, "-"), task.PRNumber))
+	}
+	if task.ExitCode != nil {
+		lines = append(lines, fmt.Sprintf("exit_code: %d", *task.ExitCode))
+	}
+	if strings.TrimSpace(task.Error) != "" {
+		lines = append(lines, "error: "+task.Error)
+	}
+	if strings.TrimSpace(result.ResultPath) != "" {
+		lines = append(lines, "result: "+result.ResultPath)
+	}
+	content := strings.TrimSpace(result.Content)
+	if content != "" {
+		lines = append(lines, "", content)
+		if result.Truncated {
+			lines = append(lines, "", "...[truncated]")
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+func fallbackTelegramField(v, fallback string) string {
+	if strings.TrimSpace(v) == "" {
+		return fallback
+	}
+	return strings.TrimSpace(v)
+}
+
 func (r *Runner) sendChunked(ctx context.Context, b *bot.Bot, chatID int64, progress *models.Message, text string) {
 	chunks := splitText(text, 3900)
 	if len(chunks) == 0 {
@@ -1876,7 +2034,7 @@ func parseThinkValue(raw string) (string, bool) {
 		return "on", true
 	case "off", "0", "false", "no":
 		return "off", true
-	case "low", "medium", "high":
+	case "low", "medium", "high", "xhigh":
 		return strings.ToLower(strings.TrimSpace(raw)), true
 	case "default", "auto":
 		return "default", true

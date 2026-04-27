@@ -47,6 +47,84 @@ type ReminderSpec struct {
 	DayOfMonth   int
 }
 
+type SubagentSpec struct {
+	ID              string
+	Kind            string
+	Title           string
+	Prompt          string
+	Transport       string
+	SessionKey      string
+	Workdir         string
+	Repo            string
+	PRNumber        int
+	PRURL           string
+	BaseRef         string
+	HeadRef         string
+	Model           string
+	Profile         string
+	ReasoningEffort string
+	Sandbox         string
+	TimeoutMinutes  int
+	Deliver         *bool
+}
+
+type SubagentPRReviewSpec struct {
+	Prompt          string
+	Transport       string
+	SessionKey      string
+	Repo            string
+	PRs             []string
+	BaseRef         string
+	Model           string
+	Profile         string
+	ReasoningEffort string
+	Sandbox         string
+	TimeoutMinutes  int
+	Deliver         *bool
+}
+
+type SubagentTaskFilter struct {
+	Status     string
+	Kind       string
+	Repo       string
+	Transport  string
+	SessionKey string
+	Limit      int
+}
+
+type SubagentInfo struct {
+	ID           string                 `json:"id"`
+	Kind         string                 `json:"kind"`
+	Status       string                 `json:"status"`
+	Title        string                 `json:"title,omitempty"`
+	Transport    string                 `json:"transport,omitempty"`
+	SessionKey   string                 `json:"session_key,omitempty"`
+	Repo         string                 `json:"repo,omitempty"`
+	PRNumber     int                    `json:"pr_number,omitempty"`
+	PRURL        string                 `json:"pr_url,omitempty"`
+	BaseRef      string                 `json:"base_ref,omitempty"`
+	HeadRef      string                 `json:"head_ref,omitempty"`
+	WorktreePath string                 `json:"worktree_path,omitempty"`
+	ResultPath   string                 `json:"result_path,omitempty"`
+	StdoutPath   string                 `json:"stdout_path,omitempty"`
+	StderrPath   string                 `json:"stderr_path,omitempty"`
+	Metadata     map[string]interface{} `json:"metadata,omitempty"`
+	PID          int                    `json:"pid,omitempty"`
+	ExitCode     *int                   `json:"exit_code,omitempty"`
+	Error        string                 `json:"error,omitempty"`
+	CreatedAt    string                 `json:"created_at,omitempty"`
+	StartedAt    string                 `json:"started_at,omitempty"`
+	FinishedAt   string                 `json:"finished_at,omitempty"`
+	UpdatedAt    string                 `json:"updated_at,omitempty"`
+}
+
+type SubagentResult struct {
+	Info       SubagentInfo `json:"info"`
+	Content    string       `json:"content"`
+	Truncated  bool         `json:"truncated"`
+	ResultPath string       `json:"result_path"`
+}
+
 type ReminderInfo struct {
 	ID               string                 `json:"id"`
 	Mode             string                 `json:"mode"`
@@ -70,11 +148,21 @@ type ReminderController interface {
 	RemoveReminder(ctx context.Context, id string) error
 }
 
+type SubagentController interface {
+	AddSubagentTask(ctx context.Context, spec SubagentSpec) (SubagentInfo, error)
+	AddPRReviewTasks(ctx context.Context, spec SubagentPRReviewSpec) ([]SubagentInfo, error)
+	ListSubagentTasks(ctx context.Context, filter SubagentTaskFilter) ([]SubagentInfo, error)
+	GetSubagentTask(ctx context.Context, id string) (SubagentInfo, bool, error)
+	GetSubagentResult(ctx context.Context, id string) (SubagentResult, bool, error)
+	CancelSubagentTask(ctx context.Context, id string) (SubagentInfo, error)
+}
+
 type BuiltinsConfig struct {
 	ToolOutputMaxBytes int
 	BashTimeoutSec     int
 	LogPath            string
 	Reminders          ReminderController
+	Subagents          SubagentController
 }
 
 const (
@@ -736,6 +824,9 @@ func BuiltinTools(cfg BuiltinsConfig, client *ollama.Client) []Tool {
 	if cfg.Reminders != nil {
 		out = append(out, reminderTools(cfg.Reminders)...)
 	}
+	if cfg.Subagents != nil {
+		out = append(out, subagentTools(cfg.Subagents)...)
+	}
 	return out
 }
 
@@ -909,6 +1000,268 @@ func reminderTools(ctrl ReminderController) []Tool {
 					return nil, err
 				}
 				return map[string]interface{}{"removed": true, "id": id}, nil
+			},
+			Source: "builtin",
+		},
+	}
+}
+
+func subagentTools(ctrl SubagentController) []Tool {
+	return []Tool{
+		{
+			Name:        "subagent_start",
+			Description: "Start a headless Codex task in the background. Use this for long-running, parallel, or independent work that should not block the current conversation. The task stores durable artifacts and reports back to the originating session unless delivery is disabled. Do not use for quick foreground checks.",
+			Schema: mustSchema(`{
+  "type": "object",
+  "properties": {
+    "id": {"type": "string", "description": "Optional caller-supplied task id"},
+    "prompt": {"type": "string", "description": "Instructions for the headless Codex task"},
+    "title": {"type": "string", "description": "Short human-readable task title"},
+    "workdir": {"type": "string", "description": "Optional existing local git repository path to run in"},
+    "repo": {"type": "string", "description": "Optional GitHub repository owner/name"},
+    "model": {"type": "string", "description": "Optional Codex model override"},
+    "profile": {"type": "string", "description": "Optional Codex config profile"},
+    "reasoning_effort": {"type": "string", "enum": ["low", "medium", "high", "xhigh"], "description": "Optional Codex reasoning effort override; defaults to the configured subagent default"},
+    "sandbox": {"type": "string", "description": "Optional Codex sandbox mode"},
+    "timeout_minutes": {"type": "integer", "minimum": 1, "maximum": 1440},
+    "deliver": {"type": "boolean", "description": "Send completion/result back to the originating session"}
+  },
+  "required": ["prompt"]
+}`),
+			Execute: func(ctx context.Context, args map[string]interface{}) (map[string]interface{}, error) {
+				prompt, ok := args["prompt"].(string)
+				if !ok || strings.TrimSpace(prompt) == "" {
+					return nil, errors.New("prompt is required")
+				}
+				spec := SubagentSpec{Kind: "generic", Prompt: prompt}
+				if v, ok := args["id"].(string); ok {
+					spec.ID = v
+				}
+				if v, ok := args["title"].(string); ok {
+					spec.Title = v
+				}
+				if v, ok := args["workdir"].(string); ok {
+					spec.Workdir = v
+				}
+				if v, ok := args["repo"].(string); ok {
+					spec.Repo = v
+				}
+				if v, ok := args["model"].(string); ok {
+					spec.Model = v
+				}
+				if v, ok := args["profile"].(string); ok {
+					spec.Profile = v
+				}
+				if v, ok := args["reasoning_effort"].(string); ok {
+					spec.ReasoningEffort = v
+				}
+				if v, ok := args["sandbox"].(string); ok {
+					spec.Sandbox = v
+				}
+				if v, ok := asInt(args["timeout_minutes"]); ok {
+					spec.TimeoutMinutes = v
+				}
+				if v, ok := args["deliver"].(bool); ok {
+					spec.Deliver = &v
+				}
+				if info, ok := SessionInfoFromContext(ctx); ok {
+					spec.Transport = info.Transport
+					spec.SessionKey = info.SessionKey
+				}
+				task, err := ctrl.AddSubagentTask(ctx, spec)
+				if err != nil {
+					return nil, err
+				}
+				return map[string]interface{}{"task": task}, nil
+			},
+			Source: "builtin",
+		},
+		{
+			Name:        "subagent_pr_review",
+			Description: "Queue one or more report-only Codex PR review tasks. Use when the user asks to review GitHub pull requests in the background, especially several PRs. Each PR is resolved with gh, checked out into an isolated worktree, reviewed with headless Codex, and stored as a task result. This tool never posts comments or reviews to GitHub.",
+			Schema: mustSchema(`{
+  "type": "object",
+  "properties": {
+    "prs": {"type": "array", "items": {"type": "string"}, "description": "PR numbers, PR URLs, or owner/repo#number values"},
+    "pr": {"type": "string", "description": "Single PR number, URL, or owner/repo#number"},
+    "repo": {"type": "string", "description": "Default GitHub repository owner/name for bare PR numbers"},
+    "base_ref": {"type": "string", "description": "Optional base ref override"},
+    "prompt": {"type": "string", "description": "Optional extra review instructions"},
+    "model": {"type": "string", "description": "Optional Codex model override"},
+    "profile": {"type": "string", "description": "Optional Codex config profile"},
+    "reasoning_effort": {"type": "string", "enum": ["low", "medium", "high", "xhigh"], "description": "Optional Codex reasoning effort override; defaults to the configured subagent default"},
+    "sandbox": {"type": "string", "description": "Optional Codex sandbox mode"},
+    "timeout_minutes": {"type": "integer", "minimum": 1, "maximum": 1440},
+    "deliver": {"type": "boolean", "description": "Send completion/result back to the originating session"}
+  }
+}`),
+			Execute: func(ctx context.Context, args map[string]interface{}) (map[string]interface{}, error) {
+				spec := SubagentPRReviewSpec{}
+				if raw, ok := args["prs"].([]interface{}); ok {
+					for _, item := range raw {
+						if s, ok := item.(string); ok && strings.TrimSpace(s) != "" {
+							spec.PRs = append(spec.PRs, strings.TrimSpace(s))
+						}
+					}
+				}
+				if v, ok := args["pr"].(string); ok && strings.TrimSpace(v) != "" {
+					spec.PRs = append(spec.PRs, strings.TrimSpace(v))
+				}
+				if len(spec.PRs) == 0 {
+					return nil, errors.New("at least one PR is required")
+				}
+				if v, ok := args["repo"].(string); ok {
+					spec.Repo = v
+				}
+				if v, ok := args["base_ref"].(string); ok {
+					spec.BaseRef = v
+				}
+				if v, ok := args["prompt"].(string); ok {
+					spec.Prompt = v
+				}
+				if v, ok := args["model"].(string); ok {
+					spec.Model = v
+				}
+				if v, ok := args["profile"].(string); ok {
+					spec.Profile = v
+				}
+				if v, ok := args["reasoning_effort"].(string); ok {
+					spec.ReasoningEffort = v
+				}
+				if v, ok := args["sandbox"].(string); ok {
+					spec.Sandbox = v
+				}
+				if v, ok := asInt(args["timeout_minutes"]); ok {
+					spec.TimeoutMinutes = v
+				}
+				if v, ok := args["deliver"].(bool); ok {
+					spec.Deliver = &v
+				}
+				if info, ok := SessionInfoFromContext(ctx); ok {
+					spec.Transport = info.Transport
+					spec.SessionKey = info.SessionKey
+				}
+				tasks, err := ctrl.AddPRReviewTasks(ctx, spec)
+				if err != nil {
+					return nil, err
+				}
+				return map[string]interface{}{"tasks": tasks, "count": len(tasks)}, nil
+			},
+			Source: "builtin",
+		},
+		{
+			Name:        "subagent_list",
+			Description: "List background Codex tasks, optionally filtered by status, type, repo, or recency.",
+			Schema: mustSchema(`{
+  "type": "object",
+  "properties": {
+    "status": {"type": "string", "description": "Optional status filter: queued, running, succeeded, failed, canceled"},
+    "kind": {"type": "string", "description": "Optional kind filter such as generic or pr_review"},
+    "repo": {"type": "string", "description": "Optional owner/name repo filter"},
+    "current_session_only": {"type": "boolean", "default": false},
+    "limit": {"type": "integer", "minimum": 1, "maximum": 200}
+  }
+}`),
+			Execute: func(ctx context.Context, args map[string]interface{}) (map[string]interface{}, error) {
+				filter := SubagentTaskFilter{}
+				if v, ok := args["status"].(string); ok {
+					filter.Status = v
+				}
+				if v, ok := args["kind"].(string); ok {
+					filter.Kind = v
+				}
+				if v, ok := args["repo"].(string); ok {
+					filter.Repo = v
+				}
+				if v, ok := asInt(args["limit"]); ok {
+					filter.Limit = v
+				}
+				if currentOnly, ok := args["current_session_only"].(bool); ok && currentOnly {
+					if info, ok := SessionInfoFromContext(ctx); ok {
+						filter.Transport = info.Transport
+						filter.SessionKey = info.SessionKey
+					}
+				}
+				tasks, err := ctrl.ListSubagentTasks(ctx, filter)
+				if err != nil {
+					return nil, err
+				}
+				return map[string]interface{}{"tasks": tasks, "count": len(tasks)}, nil
+			},
+			Source: "builtin",
+		},
+		{
+			Name:        "subagent_status",
+			Description: "Get lifecycle status for a background task, including queue/running/done state, timing, repo/PR metadata, exit code, and artifact paths.",
+			Schema: mustSchema(`{
+  "type": "object",
+  "properties": {
+    "id": {"type": "string"}
+  },
+  "required": ["id"]
+}`),
+			Execute: func(ctx context.Context, args map[string]interface{}) (map[string]interface{}, error) {
+				id, ok := args["id"].(string)
+				if !ok || strings.TrimSpace(id) == "" {
+					return nil, errors.New("id is required")
+				}
+				task, ok, err := ctrl.GetSubagentTask(ctx, id)
+				if err != nil {
+					return nil, err
+				}
+				if !ok {
+					return nil, fmt.Errorf("subagent task %s not found", strings.TrimSpace(id))
+				}
+				return map[string]interface{}{"task": task}, nil
+			},
+			Source: "builtin",
+		},
+		{
+			Name:        "subagent_result",
+			Description: "Read the final result for a background task. Use this when the user asks what a subagent found or wants the full report after a completion notification.",
+			Schema: mustSchema(`{
+  "type": "object",
+  "properties": {
+    "id": {"type": "string"}
+  },
+  "required": ["id"]
+}`),
+			Execute: func(ctx context.Context, args map[string]interface{}) (map[string]interface{}, error) {
+				id, ok := args["id"].(string)
+				if !ok || strings.TrimSpace(id) == "" {
+					return nil, errors.New("id is required")
+				}
+				result, ok, err := ctrl.GetSubagentResult(ctx, id)
+				if err != nil {
+					return nil, err
+				}
+				if !ok {
+					return nil, fmt.Errorf("subagent task %s not found", strings.TrimSpace(id))
+				}
+				return map[string]interface{}{"result": result}, nil
+			},
+			Source: "builtin",
+		},
+		{
+			Name:        "subagent_cancel",
+			Description: "Cancel a queued or running background task. If running, stop the Codex subprocess and mark the task canceled.",
+			Schema: mustSchema(`{
+  "type": "object",
+  "properties": {
+    "id": {"type": "string"}
+  },
+  "required": ["id"]
+}`),
+			Execute: func(ctx context.Context, args map[string]interface{}) (map[string]interface{}, error) {
+				id, ok := args["id"].(string)
+				if !ok || strings.TrimSpace(id) == "" {
+					return nil, errors.New("id is required")
+				}
+				task, err := ctrl.CancelSubagentTask(ctx, id)
+				if err != nil {
+					return nil, err
+				}
+				return map[string]interface{}{"task": task}, nil
 			},
 			Source: "builtin",
 		},

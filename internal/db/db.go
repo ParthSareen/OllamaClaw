@@ -145,6 +145,38 @@ ALTER TABLE cron_jobs ADD COLUMN reminder_spec_json TEXT NOT NULL DEFAULT '{}';
 ALTER TABLE cron_jobs ADD COLUMN once_fire_at TEXT NULL;
 UPDATE cron_jobs SET reminder_mode = 'legacy_cron' WHERE TRIM(COALESCE(reminder_mode, '')) = '';
 `,
+		`
+CREATE TABLE IF NOT EXISTS subagent_tasks (
+  id TEXT PRIMARY KEY,
+  kind TEXT NOT NULL,
+  status TEXT NOT NULL,
+  title TEXT NOT NULL DEFAULT '',
+  prompt TEXT NOT NULL,
+  transport TEXT NOT NULL,
+  session_key TEXT NOT NULL,
+  repo TEXT NOT NULL DEFAULT '',
+  pr_number INTEGER NOT NULL DEFAULT 0,
+  pr_url TEXT NOT NULL DEFAULT '',
+  base_ref TEXT NOT NULL DEFAULT '',
+  head_ref TEXT NOT NULL DEFAULT '',
+  worktree_path TEXT NOT NULL DEFAULT '',
+  result_path TEXT NOT NULL DEFAULT '',
+  stdout_path TEXT NOT NULL DEFAULT '',
+  stderr_path TEXT NOT NULL DEFAULT '',
+  metadata_json TEXT NOT NULL DEFAULT '{}',
+  pid INTEGER NOT NULL DEFAULT 0,
+  exit_code INTEGER NULL,
+  error TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  started_at TEXT NULL,
+  finished_at TEXT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_subagent_tasks_status ON subagent_tasks(status, created_at);
+CREATE INDEX IF NOT EXISTS idx_subagent_tasks_origin ON subagent_tasks(transport, session_key, created_at);
+CREATE INDEX IF NOT EXISTS idx_subagent_tasks_repo_pr ON subagent_tasks(repo, pr_number);
+`,
 	}
 
 	for i, sqlText := range migrations {
@@ -741,6 +773,246 @@ func (s *Store) UpsertCronPrefetchCommands(ctx context.Context, jobID string, co
 	return s.UpsertReminderPrefetchCommands(ctx, jobID, commands)
 }
 
+func (s *Store) UpsertSubagentTask(ctx context.Context, task SubagentTask) error {
+	if strings.TrimSpace(task.ID) == "" {
+		return fmt.Errorf("subagent task id is required")
+	}
+	if strings.TrimSpace(task.Kind) == "" {
+		task.Kind = "generic"
+	}
+	if strings.TrimSpace(task.Status) == "" {
+		task.Status = "queued"
+	}
+	if strings.TrimSpace(task.MetadataJSON) == "" {
+		task.MetadataJSON = "{}"
+	}
+	now := time.Now().UTC()
+	if task.CreatedAt.IsZero() {
+		task.CreatedAt = now
+	}
+	updatedAt := now.Format(time.RFC3339Nano)
+	_, err := s.db.ExecContext(ctx, `
+INSERT INTO subagent_tasks(id, kind, status, title, prompt, transport, session_key, repo, pr_number, pr_url, base_ref, head_ref, worktree_path, result_path, stdout_path, stderr_path, metadata_json, pid, exit_code, error, created_at, started_at, finished_at, updated_at)
+VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(id) DO UPDATE SET
+  kind=excluded.kind,
+  status=excluded.status,
+  title=excluded.title,
+  prompt=excluded.prompt,
+  transport=excluded.transport,
+  session_key=excluded.session_key,
+  repo=excluded.repo,
+  pr_number=excluded.pr_number,
+  pr_url=excluded.pr_url,
+  base_ref=excluded.base_ref,
+  head_ref=excluded.head_ref,
+  worktree_path=excluded.worktree_path,
+  result_path=excluded.result_path,
+  stdout_path=excluded.stdout_path,
+  stderr_path=excluded.stderr_path,
+  metadata_json=excluded.metadata_json,
+  pid=excluded.pid,
+  exit_code=excluded.exit_code,
+  error=excluded.error,
+  started_at=excluded.started_at,
+  finished_at=excluded.finished_at,
+  updated_at=excluded.updated_at
+`, task.ID, task.Kind, task.Status, task.Title, task.Prompt, task.Transport, task.SessionKey, task.Repo, task.PRNumber, task.PRURL, task.BaseRef, task.HeadRef, task.WorktreePath, task.ResultPath, task.StdoutPath, task.StderrPath, task.MetadataJSON, task.PID, nullableInt(task.ExitCode), task.Error, task.CreatedAt.UTC().Format(time.RFC3339Nano), nullableTimeString(task.StartedAt), nullableTimeString(task.FinishedAt), updatedAt)
+	if err != nil {
+		return fmt.Errorf("upsert subagent task: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) GetSubagentTask(ctx context.Context, id string) (SubagentTask, bool, error) {
+	row := s.db.QueryRowContext(ctx, subagentTaskSelectSQL()+` WHERE id = ?`, id)
+	return scanSubagentTask(row)
+}
+
+func (s *Store) ListSubagentTasks(ctx context.Context, filter SubagentTaskFilter) ([]SubagentTask, error) {
+	query := subagentTaskSelectSQL()
+	args := []any{}
+	where := []string{}
+	if strings.TrimSpace(filter.Status) != "" {
+		where = append(where, "status = ?")
+		args = append(args, strings.TrimSpace(filter.Status))
+	}
+	if strings.TrimSpace(filter.Kind) != "" {
+		where = append(where, "kind = ?")
+		args = append(args, strings.TrimSpace(filter.Kind))
+	}
+	if strings.TrimSpace(filter.Repo) != "" {
+		where = append(where, "repo = ?")
+		args = append(args, strings.TrimSpace(filter.Repo))
+	}
+	if strings.TrimSpace(filter.Transport) != "" {
+		where = append(where, "transport = ?")
+		args = append(args, strings.TrimSpace(filter.Transport))
+	}
+	if strings.TrimSpace(filter.SessionKey) != "" {
+		where = append(where, "session_key = ?")
+		args = append(args, strings.TrimSpace(filter.SessionKey))
+	}
+	if len(where) > 0 {
+		query += " WHERE " + strings.Join(where, " AND ")
+	}
+	query += " ORDER BY created_at DESC"
+	limit := filter.Limit
+	if limit <= 0 {
+		limit = 20
+	}
+	if limit > 200 {
+		limit = 200
+	}
+	query += " LIMIT ?"
+	args = append(args, limit)
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list subagent tasks: %w", err)
+	}
+	defer rows.Close()
+	out := []SubagentTask{}
+	for rows.Next() {
+		task, _, err := scanSubagentTask(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, task)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate subagent tasks: %w", err)
+	}
+	return out, nil
+}
+
+func (s *Store) ClaimNextSubagentTask(ctx context.Context) (SubagentTask, bool, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return SubagentTask{}, false, fmt.Errorf("begin claim subagent task: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+
+	row := tx.QueryRowContext(ctx, subagentTaskSelectSQL()+` WHERE status = 'queued' ORDER BY created_at ASC LIMIT 1`)
+	task, ok, err := scanSubagentTask(row)
+	if err != nil || !ok {
+		if err != nil {
+			return SubagentTask{}, false, err
+		}
+		if err := tx.Commit(); err != nil {
+			return SubagentTask{}, false, fmt.Errorf("commit empty subagent claim: %w", err)
+		}
+		committed = true
+		return SubagentTask{}, false, nil
+	}
+	now := time.Now().UTC()
+	res, err := tx.ExecContext(ctx, `
+UPDATE subagent_tasks
+SET status = 'running', started_at = ?, updated_at = ?
+WHERE id = ? AND status = 'queued'
+`, now.Format(time.RFC3339Nano), now.Format(time.RFC3339Nano), task.ID)
+	if err != nil {
+		return SubagentTask{}, false, fmt.Errorf("claim subagent task: %w", err)
+	}
+	affected, _ := res.RowsAffected()
+	if affected == 0 {
+		if err := tx.Commit(); err != nil {
+			return SubagentTask{}, false, fmt.Errorf("commit skipped subagent claim: %w", err)
+		}
+		committed = true
+		return SubagentTask{}, false, nil
+	}
+	if err := tx.Commit(); err != nil {
+		return SubagentTask{}, false, fmt.Errorf("commit subagent claim: %w", err)
+	}
+	committed = true
+	task.Status = "running"
+	task.StartedAt = &now
+	task.UpdatedAt = now
+	return task, true, nil
+}
+
+func (s *Store) UpdateSubagentTaskStatus(ctx context.Context, id, status, errText string) error {
+	if strings.TrimSpace(id) == "" {
+		return fmt.Errorf("subagent task id is required")
+	}
+	status = strings.TrimSpace(status)
+	if status == "" {
+		return fmt.Errorf("subagent task status is required")
+	}
+	now := time.Now().UTC()
+	var finished interface{}
+	switch status {
+	case "succeeded", "failed", "canceled":
+		finished = now.Format(time.RFC3339Nano)
+	default:
+		finished = nil
+	}
+	_, err := s.db.ExecContext(ctx, `
+UPDATE subagent_tasks
+SET status = ?, error = ?, finished_at = COALESCE(?, finished_at), updated_at = ?
+WHERE id = ?
+`, status, strings.TrimSpace(errText), finished, now.Format(time.RFC3339Nano), id)
+	if err != nil {
+		return fmt.Errorf("update subagent task status: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) MarkRunningSubagentTasksInterrupted(ctx context.Context) error {
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	_, err := s.db.ExecContext(ctx, `
+UPDATE subagent_tasks
+SET status = 'failed',
+    error = 'interrupted by OllamaClaw restart',
+    finished_at = ?,
+    updated_at = ?
+WHERE status = 'running'
+`, now, now)
+	if err != nil {
+		return fmt.Errorf("mark running subagent tasks interrupted: %w", err)
+	}
+	return nil
+}
+
+type scanner interface {
+	Scan(dest ...any) error
+}
+
+func subagentTaskSelectSQL() string {
+	return `SELECT id, kind, status, title, prompt, transport, session_key, repo, pr_number, pr_url, base_ref, head_ref, worktree_path, result_path, stdout_path, stderr_path, metadata_json, pid, exit_code, error, created_at, started_at, finished_at, updated_at FROM subagent_tasks`
+}
+
+func scanSubagentTask(row scanner) (SubagentTask, bool, error) {
+	var (
+		task                    SubagentTask
+		exitCode                sql.NullInt64
+		createdRaw, updatedRaw  string
+		startedRaw, finishedRaw sql.NullString
+	)
+	err := row.Scan(&task.ID, &task.Kind, &task.Status, &task.Title, &task.Prompt, &task.Transport, &task.SessionKey, &task.Repo, &task.PRNumber, &task.PRURL, &task.BaseRef, &task.HeadRef, &task.WorktreePath, &task.ResultPath, &task.StdoutPath, &task.StderrPath, &task.MetadataJSON, &task.PID, &exitCode, &task.Error, &createdRaw, &startedRaw, &finishedRaw, &updatedRaw)
+	if errors.Is(err, sql.ErrNoRows) {
+		return SubagentTask{}, false, nil
+	}
+	if err != nil {
+		return SubagentTask{}, false, fmt.Errorf("scan subagent task: %w", err)
+	}
+	if exitCode.Valid {
+		v := int(exitCode.Int64)
+		task.ExitCode = &v
+	}
+	task.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdRaw)
+	task.StartedAt = parseNullTime(startedRaw)
+	task.FinishedAt = parseNullTime(finishedRaw)
+	task.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updatedRaw)
+	return task, true, nil
+}
+
 func parseNullTime(v sql.NullString) *time.Time {
 	if !v.Valid || strings.TrimSpace(v.String) == "" {
 		return nil
@@ -757,6 +1029,13 @@ func nullableTimeString(t *time.Time) interface{} {
 		return nil
 	}
 	return t.UTC().Format(time.RFC3339Nano)
+}
+
+func nullableInt(v *int) interface{} {
+	if v == nil {
+		return nil
+	}
+	return *v
 }
 
 func boolToInt(v bool) int {

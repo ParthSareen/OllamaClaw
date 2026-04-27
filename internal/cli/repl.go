@@ -68,7 +68,7 @@ func handleREPLCommand(ctx context.Context, eng *agent.Engine, cmd string) error
 		fmt.Println("bye")
 		return nil
 	case "/help":
-		fmt.Println("Commands: /help /model [name] /tools /verbose [on|off] /think [on|off|low|medium|high|default] /status /reset /exit")
+		fmt.Println("Commands: /help /model [name] /tools /verbose [on|off] /think [on|off|low|medium|high|xhigh|default] /status /reset /exit")
 		return nil
 	case "/model":
 		sess, err := eng.GetOrCreateSession(ctx, "repl", "default")
@@ -141,7 +141,7 @@ func handleREPLCommand(ctx context.Context, eng *agent.Engine, cmd string) error
 		}
 		value, ok := parseThinkValue(parts[1])
 		if !ok {
-			fmt.Println("usage: /think [on|off|low|medium|high|default]")
+			fmt.Println("usage: /think [on|off|low|medium|high|xhigh|default]")
 			return nil
 		}
 		if err := eng.SetSessionThinkValue(ctx, transport, sessionKey, value); err != nil {
@@ -179,7 +179,7 @@ func parseThinkValue(raw string) (string, bool) {
 		return "on", true
 	case "off", "0", "false", "no":
 		return "off", true
-	case "low", "medium", "high":
+	case "low", "medium", "high", "xhigh":
 		return strings.ToLower(strings.TrimSpace(raw)), true
 	case "default", "auto":
 		return "default", true

@@ -262,6 +262,7 @@ func TestParseThinkValue(t *testing.T) {
 		{in: "low", want: "low", ok: true},
 		{in: "medium", want: "medium", ok: true},
 		{in: "high", want: "high", ok: true},
+		{in: "xhigh", want: "xhigh", ok: true},
 		{in: "default", want: "default", ok: true},
 		{in: "auto", want: "default", ok: true},
 		{in: "false", want: "off", ok: true},

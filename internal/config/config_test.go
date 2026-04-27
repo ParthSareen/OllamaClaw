@@ -36,6 +36,21 @@ func TestLoadCreatesDefaultConfig(t *testing.T) {
 	if !strings.HasSuffix(cfg.Voice.KokoroPython, filepath.Join(".ollamaclaw", "kokoro-test", "venv", "bin", "python")) {
 		t.Fatalf("unexpected kokoro python path: %q", cfg.Voice.KokoroPython)
 	}
+	if !cfg.Subagents.Enabled {
+		t.Fatalf("expected subagents to default enabled")
+	}
+	if cfg.Subagents.CodexBinary != "codex" {
+		t.Fatalf("unexpected subagent codex binary: %q", cfg.Subagents.CodexBinary)
+	}
+	if cfg.Subagents.MaxConcurrent != 3 {
+		t.Fatalf("unexpected subagent max concurrent: %d", cfg.Subagents.MaxConcurrent)
+	}
+	if cfg.Subagents.DefaultReasoningEffort != "xhigh" {
+		t.Fatalf("unexpected subagent reasoning effort: %q", cfg.Subagents.DefaultReasoningEffort)
+	}
+	if !strings.HasSuffix(cfg.Subagents.RootDir, filepath.Join(".ollamaclaw", "subagents")) {
+		t.Fatalf("unexpected subagent root dir: %q", cfg.Subagents.RootDir)
+	}
 	path, _ := ConfigPath()
 	if _, err := os.Stat(path); err != nil {
 		t.Fatalf("expected config file to exist: %v", err)
@@ -63,6 +78,7 @@ func TestSaveExpandsDBPath(t *testing.T) {
 	cfg.LogPath = "~/custom/ollamaclaw.log"
 	cfg.Voice.KokoroPython = "~/custom/kokoro/bin/python"
 	cfg.LocalControl.TokenPath = "~/custom/local.token"
+	cfg.Subagents.RootDir = "~/custom/subagents"
 	if err := Save(cfg); err != nil {
 		t.Fatalf("Save() error: %v", err)
 	}
@@ -85,6 +101,10 @@ func TestSaveExpandsDBPath(t *testing.T) {
 	expectedToken := filepath.Join(home, "custom", "local.token")
 	if loaded.LocalControl.TokenPath != expectedToken {
 		t.Fatalf("expected %s, got %s", expectedToken, loaded.LocalControl.TokenPath)
+	}
+	expectedSubagents := filepath.Join(home, "custom", "subagents")
+	if loaded.Subagents.RootDir != expectedSubagents {
+		t.Fatalf("expected %s, got %s", expectedSubagents, loaded.Subagents.RootDir)
 	}
 }
 

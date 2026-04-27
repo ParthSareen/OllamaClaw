@@ -38,6 +38,7 @@ type Config struct {
 	Voice               VoiceConfig    `json:"voice"`
 	GitHubWebhook       GitHubWebhook  `json:"github_webhook"`
 	LocalControl        LocalControl   `json:"local_control"`
+	Subagents           SubagentConfig `json:"subagents"`
 }
 
 type TelegramConfig struct {
@@ -69,6 +70,18 @@ type LocalControl struct {
 	Enabled    bool   `json:"enabled"`
 	ListenAddr string `json:"listen_addr"`
 	TokenPath  string `json:"token_path"`
+}
+
+type SubagentConfig struct {
+	Enabled                bool   `json:"enabled"`
+	CodexBinary            string `json:"codex_binary"`
+	RootDir                string `json:"root_dir"`
+	MaxConcurrent          int    `json:"max_concurrent"`
+	DefaultTimeoutMinutes  int    `json:"default_timeout_minutes"`
+	DefaultModel           string `json:"default_model"`
+	DefaultProfile         string `json:"default_profile"`
+	DefaultReasoningEffort string `json:"default_reasoning_effort"`
+	Sandbox                string `json:"sandbox"`
 }
 
 func Default() Config {
@@ -106,6 +119,17 @@ func Default() Config {
 			Enabled:    true,
 			ListenAddr: defaultLocalControl,
 			TokenPath:  filepath.Join(base, defaultLocalToken),
+		},
+		Subagents: SubagentConfig{
+			Enabled:                true,
+			CodexBinary:            "codex",
+			RootDir:                filepath.Join(base, "subagents"),
+			MaxConcurrent:          3,
+			DefaultTimeoutMinutes:  45,
+			DefaultModel:           "",
+			DefaultProfile:         "",
+			DefaultReasoningEffort: "xhigh",
+			Sandbox:                "workspace-write",
 		},
 	}
 }
@@ -257,6 +281,36 @@ func sanitize(cfg *Config) {
 	if cfg.LocalControl.TokenPath == "" {
 		cfg.LocalControl.TokenPath = defaults.LocalControl.TokenPath
 	}
+	cfg.Subagents.CodexBinary = strings.TrimSpace(cfg.Subagents.CodexBinary)
+	if cfg.Subagents.CodexBinary == "" {
+		cfg.Subagents.CodexBinary = defaults.Subagents.CodexBinary
+	}
+	cfg.Subagents.RootDir = strings.TrimSpace(cfg.Subagents.RootDir)
+	if cfg.Subagents.RootDir == "" {
+		cfg.Subagents.RootDir = defaults.Subagents.RootDir
+	}
+	if cfg.Subagents.MaxConcurrent <= 0 {
+		cfg.Subagents.MaxConcurrent = defaults.Subagents.MaxConcurrent
+	}
+	if cfg.Subagents.MaxConcurrent > 12 {
+		cfg.Subagents.MaxConcurrent = 12
+	}
+	if cfg.Subagents.DefaultTimeoutMinutes <= 0 {
+		cfg.Subagents.DefaultTimeoutMinutes = defaults.Subagents.DefaultTimeoutMinutes
+	}
+	if cfg.Subagents.DefaultTimeoutMinutes > 24*60 {
+		cfg.Subagents.DefaultTimeoutMinutes = 24 * 60
+	}
+	cfg.Subagents.DefaultModel = strings.TrimSpace(cfg.Subagents.DefaultModel)
+	cfg.Subagents.DefaultProfile = strings.TrimSpace(cfg.Subagents.DefaultProfile)
+	cfg.Subagents.DefaultReasoningEffort = normalizeReasoningEffort(cfg.Subagents.DefaultReasoningEffort)
+	if cfg.Subagents.DefaultReasoningEffort == "" {
+		cfg.Subagents.DefaultReasoningEffort = defaults.Subagents.DefaultReasoningEffort
+	}
+	cfg.Subagents.Sandbox = strings.TrimSpace(cfg.Subagents.Sandbox)
+	if cfg.Subagents.Sandbox == "" {
+		cfg.Subagents.Sandbox = defaults.Subagents.Sandbox
+	}
 }
 
 func Load() (Config, error) {
@@ -299,6 +353,10 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, fmt.Errorf("expand local control token path: %w", err)
 	}
+	cfg.Subagents.RootDir, err = expandPath(cfg.Subagents.RootDir)
+	if err != nil {
+		return Config{}, fmt.Errorf("expand subagents root dir: %w", err)
+	}
 	return cfg, nil
 }
 
@@ -311,6 +369,7 @@ func Save(cfg Config) error {
 	cfg.LogPath, _ = expandPath(cfg.LogPath)
 	cfg.Voice.KokoroPython, _ = expandPath(cfg.Voice.KokoroPython)
 	cfg.LocalControl.TokenPath, _ = expandPath(cfg.LocalControl.TokenPath)
+	cfg.Subagents.RootDir, _ = expandPath(cfg.Subagents.RootDir)
 	path, err := ConfigPath()
 	if err != nil {
 		return err
@@ -358,4 +417,13 @@ func normalizeRepoAllowlist(items []string) []string {
 		return nil
 	}
 	return out
+}
+
+func normalizeReasoningEffort(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "low", "medium", "high", "xhigh":
+		return strings.ToLower(strings.TrimSpace(raw))
+	default:
+		return ""
+	}
 }

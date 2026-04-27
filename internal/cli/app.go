@@ -19,6 +19,7 @@ import (
 	"github.com/ParthSareen/OllamaClaw/internal/cronjobs"
 	"github.com/ParthSareen/OllamaClaw/internal/db"
 	"github.com/ParthSareen/OllamaClaw/internal/ollama"
+	"github.com/ParthSareen/OllamaClaw/internal/subagents"
 	"github.com/ParthSareen/OllamaClaw/internal/telegram"
 	"github.com/ParthSareen/OllamaClaw/internal/util"
 )
@@ -26,7 +27,7 @@ import (
 type App struct{}
 
 var (
-	BuildVersion = "0.2.1"
+	BuildVersion = "0.3.0"
 	BuildCommit  = "unknown"
 	BuildDate    = "unknown"
 )
@@ -86,10 +87,18 @@ func (a *App) runRepl(args []string) error {
 		fmt.Printf("\n[reminder %s/%s]\n%s\n", transport, sessionKey, content)
 		return nil
 	})
+	r.subagents.SetOutputSink(func(ctx context.Context, transport, sessionKey, content string) error {
+		fmt.Printf("\n[subagent %s/%s]\n%s\n", transport, sessionKey, content)
+		return nil
+	})
 	if err := r.cron.Start(context.Background()); err != nil {
 		return err
 	}
 	defer r.cron.Stop()
+	if err := r.subagents.Start(context.Background()); err != nil {
+		return err
+	}
+	defer r.subagents.Stop()
 	if strings.TrimSpace(*model) != "" {
 		sess, err := r.engine.GetOrCreateSession(context.Background(), "repl", "default")
 		if err == nil {
@@ -211,6 +220,7 @@ func (a *App) runLaunch(args []string) error {
 		Store:      r.store,
 		Engine:     r.engine,
 		Scheduler:  r.cron,
+		Subagents:  r.subagents,
 		AppVersion: buildLabel,
 	}
 	for {
@@ -226,7 +236,7 @@ func (a *App) runLaunch(args []string) error {
 func runtimeBuildLabel() string {
 	version := strings.TrimSpace(BuildVersion)
 	if version == "" {
-		version = "0.2.1"
+		version = "0.3.0"
 	}
 	parts := []string{version}
 	commit := strings.TrimSpace(BuildCommit)
@@ -405,10 +415,11 @@ func previewCommandForError(cmd string) string {
 }
 
 type runtime struct {
-	cfg    config.Config
-	store  *db.Store
-	engine *agent.Engine
-	cron   *cronjobs.Manager
+	cfg       config.Config
+	store     *db.Store
+	engine    *agent.Engine
+	cron      *cronjobs.Manager
+	subagents *subagents.Manager
 }
 
 func (a *App) bootstrap() (*runtime, func(), error) {
@@ -422,7 +433,8 @@ func (a *App) bootstrap() (*runtime, func(), error) {
 	}
 	client := ollama.NewClient(cfg.OllamaHost)
 	cronMgr := cronjobs.NewManager(store)
-	eng := agent.New(cfg, store, client, cronMgr)
+	subagentMgr := subagents.NewManager(cfg.Subagents, store)
+	eng := agent.New(cfg, store, client, cronMgr, subagentMgr)
 	cronMgr.SetRunner(func(ctx context.Context, transport, sessionKey, prompt string) (cronjobs.RunResult, error) {
 		res, err := eng.HandleText(ctx, transport, sessionKey, prompt)
 		if err != nil {
@@ -437,12 +449,13 @@ func (a *App) bootstrap() (*runtime, func(), error) {
 	})
 	cleanup := func() {
 		cronMgr.Stop()
+		subagentMgr.Stop()
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
 		_ = store.SetSetting(ctx, "last_shutdown", time.Now().UTC().Format(time.RFC3339Nano))
 		_ = store.Close()
 	}
-	return &runtime{cfg: cfg, store: store, engine: eng, cron: cronMgr}, cleanup, nil
+	return &runtime{cfg: cfg, store: store, engine: eng, cron: cronMgr, subagents: subagentMgr}, cleanup, nil
 }
 
 func extractBashCommands(trace []agent.ToolTraceEntry) []string {
