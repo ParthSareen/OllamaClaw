@@ -1,7 +1,7 @@
 # OllamaClaw
 
 OllamaClaw is a private Telegram-first local agent for your laptop, powered by Ollama. It is built for remote coding/ops work from a trusted DM: ask it questions, let it inspect files/logs, run safe shell commands, follow up on GitHub/CI, and run reminder-triggered tasks while keeping state locally.
-Current app version: `0.3.0`.
+Current app version: `0.4.0`.
 
 It supports:
 - Private Telegram DM gateway with owner allowlist, image input, `/stop`, `/restart`, `/status`, `/fullsystem`, live tool visibility, and thinking controls

@@ -27,7 +27,7 @@ import (
 type App struct{}
 
 var (
-	BuildVersion = "0.3.0"
+	BuildVersion = "0.4.0"
 	BuildCommit  = "unknown"
 	BuildDate    = "unknown"
 )
@@ -236,7 +236,7 @@ func (a *App) runLaunch(args []string) error {
 func runtimeBuildLabel() string {
 	version := strings.TrimSpace(BuildVersion)
 	if version == "" {
-		version = "0.3.0"
+		version = "0.4.0"
 	}
 	parts := []string{version}
 	commit := strings.TrimSpace(BuildCommit)
