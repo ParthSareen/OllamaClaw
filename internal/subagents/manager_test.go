@@ -29,9 +29,9 @@ func TestManagerRunsGenericCodexTask(t *testing.T) {
 		Sandbox:                "workspace-write",
 	}, store)
 
-	delivered := make(chan string, 1)
-	mgr.SetOutputSink(func(ctx context.Context, transport, sessionKey, content string) error {
-		delivered <- content
+	delivered := make(chan db.SubagentNotification, 1)
+	mgr.SetOutputSink(func(ctx context.Context, notification db.SubagentNotification) error {
+		delivered <- notification
 		return nil
 	})
 	if err := mgr.Start(context.Background()); err != nil {
@@ -61,12 +61,78 @@ func TestManagerRunsGenericCodexTask(t *testing.T) {
 		t.Fatalf("unexpected result content: %q", result.Content)
 	}
 	select {
-	case msg := <-delivered:
-		if !strings.Contains(msg, info.ID) || !strings.Contains(msg, "fake result: hello from test") {
-			t.Fatalf("unexpected delivery: %q", msg)
+	case notification := <-delivered:
+		if notification.TaskID != info.ID || !strings.Contains(notification.Content, "fake result: hello from test") {
+			t.Fatalf("unexpected delivery: %+v", notification)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatalf("expected delivery")
+	}
+}
+
+func TestCompletionNotificationSurvivesManagerRestart(t *testing.T) {
+	store, cleanup := openTestStore(t)
+	defer cleanup()
+	root := filepath.Join(t.TempDir(), "subagents")
+	workdir := t.TempDir()
+	fakeCodex := writeFakeCodex(t)
+	cfg := config.SubagentConfig{
+		Enabled:                true,
+		CodexBinary:            fakeCodex,
+		RootDir:                root,
+		MaxConcurrent:          1,
+		DefaultTimeoutMinutes:  1,
+		DefaultReasoningEffort: "xhigh",
+		Sandbox:                "workspace-write",
+	}
+
+	mgr := NewManager(cfg, store)
+	if err := mgr.Start(context.Background()); err != nil {
+		t.Fatalf("start first manager: %v", err)
+	}
+	info, err := mgr.AddSubagentTask(context.Background(), tools.SubagentSpec{
+		Prompt:     "durable delivery",
+		Transport:  "telegram",
+		SessionKey: "123",
+		Workdir:    workdir,
+	})
+	if err != nil {
+		t.Fatalf("add task: %v", err)
+	}
+	waitForTaskStatus(t, store, info.ID, statusSucceeded)
+	mgr.Stop()
+
+	notificationID := "subagent-completion-" + info.ID
+	notification, ok, err := store.GetSubagentNotification(context.Background(), notificationID)
+	if err != nil || !ok {
+		t.Fatalf("expected pending notification ok=%t err=%v", ok, err)
+	}
+	if notification.Status != notificationStatusPending {
+		t.Fatalf("expected pending notification, got %s", notification.Status)
+	}
+
+	delivered := make(chan db.SubagentNotification, 1)
+	mgr = NewManager(cfg, store)
+	mgr.SetOutputSink(func(ctx context.Context, notification db.SubagentNotification) error {
+		delivered <- notification
+		return nil
+	})
+	if err := mgr.Start(context.Background()); err != nil {
+		t.Fatalf("start second manager: %v", err)
+	}
+	defer mgr.Stop()
+
+	select {
+	case notification := <-delivered:
+		if notification.TaskID != info.ID || !strings.Contains(notification.Content, "fake result: durable delivery") {
+			t.Fatalf("unexpected delivery: %+v", notification)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("expected durable delivery after restart")
+	}
+	notification = waitForNotificationStatus(t, store, notificationID, notificationStatusDelivered)
+	if notification.DeliveredAt == nil {
+		t.Fatalf("expected delivered timestamp")
 	}
 }
 
@@ -150,6 +216,22 @@ func TestCodexArgsUseProfileLongFlag(t *testing.T) {
 	if args[len(args)-1] != "-" {
 		t.Fatalf("expected stdin prompt marker, got args: %v", args)
 	}
+
+	prArgs := mgr.codexArgs(db.SubagentTask{
+		ID:         "agent-pr",
+		Kind:       kindPRReview,
+		BaseRef:    "main",
+		ResultPath: "/tmp/result.md",
+	}, "/tmp/repo")
+	if !containsArgPair(prArgs, "--base", "origin/main") {
+		t.Fatalf("expected --base origin/main in PR args: %v", prArgs)
+	}
+	if prArgs[len(prArgs)-1] == "-" {
+		t.Fatalf("PR review with --base must not pass stdin prompt marker: %v", prArgs)
+	}
+	if codexStdin(db.SubagentTask{Kind: kindPRReview, BaseRef: "main", Prompt: "extra"}) != nil {
+		t.Fatalf("PR review with --base must not pass stdin prompt")
+	}
 }
 
 func openTestStore(t *testing.T) (*db.Store, func()) {
@@ -213,4 +295,24 @@ func waitForTaskStatus(t *testing.T, store *db.Store, id, status string) db.Suba
 	}
 	t.Fatalf("timed out waiting for %s", status)
 	return db.SubagentTask{}
+}
+
+func waitForNotificationStatus(t *testing.T, store *db.Store, id, status string) db.SubagentNotification {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		notification, ok, err := store.GetSubagentNotification(context.Background(), id)
+		if err != nil {
+			t.Fatalf("get notification: %v", err)
+		}
+		if !ok {
+			t.Fatalf("notification not found: %s", id)
+		}
+		if notification.Status == status {
+			return notification
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for notification %s", status)
+	return db.SubagentNotification{}
 }

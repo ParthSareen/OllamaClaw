@@ -97,3 +97,20 @@ type SubagentTaskFilter struct {
 	SessionKey string
 	Limit      int
 }
+
+type SubagentNotification struct {
+	ID            string
+	TaskID        string
+	Kind          string
+	Status        string
+	Transport     string
+	SessionKey    string
+	Content       string
+	Attempts      int
+	LastError     string
+	NextAttemptAt time.Time
+	LockedAt      *time.Time
+	DeliveredAt   *time.Time
+	CreatedAt     time.Time
+	UpdatedAt     time.Time
+}

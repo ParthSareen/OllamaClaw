@@ -96,27 +96,30 @@ type inFlightTurn struct {
 }
 
 type pendingTurn struct {
-	generation   uint64
-	chatID       int64
-	userID       int64
-	sessionKey   string
-	text         string
-	imageFileIDs []string
-	voiceFileID  string
-	localSource  string
-	localAudio   string
-	localCleanup func()
-	noDebounce   bool
-	messageCount int
-	readyAt      time.Time
-	bot          *bot.Bot
+	generation           uint64
+	chatID               int64
+	userID               int64
+	sessionKey           string
+	text                 string
+	imageFileIDs         []string
+	voiceFileID          string
+	localSource          string
+	localAudio           string
+	localCleanup         func()
+	syntheticToolResults []agent.SyntheticToolResult
+	waiters              []chan error
+	noDebounce           bool
+	messageCount         int
+	readyAt              time.Time
+	bot                  *bot.Bot
 }
 
 type turnExecutionOptions struct {
-	LocalSource        string
-	LocalAudio         string
-	LocalCleanup       func()
-	TelegramVoiceInput bool
+	LocalSource          string
+	LocalAudio           string
+	LocalCleanup         func()
+	TelegramVoiceInput   bool
+	SyntheticToolResults []agent.SyntheticToolResult
 }
 
 func (o turnExecutionOptions) isLocalText() bool {
@@ -317,18 +320,18 @@ func (r *Runner) Run(ctx context.Context) error {
 		defer r.logf("reminder scheduler stopped")
 	}
 	if r.Subagents != nil {
-		r.Subagents.SetOutputSink(func(ctx context.Context, transport, sessionKey, content string) error {
-			if transport != "telegram" {
+		r.Subagents.SetOutputSink(func(ctx context.Context, notification db.SubagentNotification) error {
+			if notification.Transport != "telegram" {
 				return nil
 			}
+			sessionKey := strings.TrimSpace(notification.SessionKey)
 			chatID, err := strconv.ParseInt(sessionKey, 10, 64)
 			if err != nil {
 				r.logf("subagent output drop: invalid session_key=%q error=%v", sessionKey, r.redactError(err))
 				return err
 			}
-			r.logf("subagent output -> chat=%d bytes=%d preview=%q", chatID, len(content), r.previewForLog(content))
-			r.sendChunked(ctx, b, chatID, nil, content)
-			return nil
+			r.logf("subagent completion queued -> chat=%d notification=%s task=%s bytes=%d preview=%q", chatID, notification.ID, notification.TaskID, len(notification.Content), r.previewForLog(notification.Content))
+			return r.enqueueSubagentCompletionTurn(ctx, b, chatID, sessionKey, notification)
 		})
 		if err := r.Subagents.Start(runCtx); err != nil {
 			r.logf("subagent manager start failed: %v", r.redactError(err))
@@ -484,14 +487,14 @@ func (r *Runner) handleUpdate(ctx context.Context, b *bot.Bot, update *models.Up
 	r.schedulePendingTurnDrain(sessionKey, queued.generation)
 }
 
-func (r *Runner) executeTurn(ctx context.Context, turnCtx context.Context, b *bot.Bot, chatID, userID int64, sessionKey, text string, imageFileIDs []string, voiceFileID string, opts turnExecutionOptions) {
+func (r *Runner) executeTurn(ctx context.Context, turnCtx context.Context, b *bot.Bot, chatID, userID int64, sessionKey, text string, imageFileIDs []string, voiceFileID string, opts turnExecutionOptions) error {
 	opts.TelegramVoiceInput = strings.TrimSpace(voiceFileID) != ""
 	if opts.LocalCleanup != nil {
 		defer opts.LocalCleanup()
 	}
 	if r.turnExecutor != nil {
 		r.turnExecutor(ctx, turnCtx, b, chatID, userID, sessionKey, text, imageFileIDs)
-		return
+		return nil
 	}
 	if opts.isLocalText() && strings.TrimSpace(text) != "" {
 		r.logf("local text input echo: chat=%d session_key=%s source=%s chars=%d", chatID, sessionKey, strings.TrimSpace(opts.LocalSource), len(strings.TrimSpace(text)))
@@ -521,13 +524,15 @@ func (r *Runner) executeTurn(ctx context.Context, turnCtx context.Context, b *bo
 		transcript, transcribeErr := r.voiceService().Transcribe(turnCtx, opts.LocalAudio)
 		if transcribeErr != nil {
 			r.logf("local voice transcription failed: chat=%d session_key=%s source=%s error=%v", chatID, sessionKey, strings.TrimSpace(opts.LocalSource), r.redactError(transcribeErr))
-			r.replyError(ctx, b, chatID, progress, fmt.Errorf("failed to transcribe local audio: %w", transcribeErr))
-			return
+			err := fmt.Errorf("failed to transcribe local audio: %w", transcribeErr)
+			r.replyError(ctx, b, chatID, progress, err)
+			return err
 		}
 		transcript = stripLocalTranscriptArtifact(strings.TrimSpace(transcript))
 		if transcript == "" {
-			r.replyError(ctx, b, chatID, progress, errors.New("local audio transcription was empty"))
-			return
+			err := errors.New("local audio transcription was empty")
+			r.replyError(ctx, b, chatID, progress, err)
+			return err
 		}
 		text = transcript
 		r.logf("local voice transcription success: chat=%d session_key=%s source=%s chars=%d preview=%q", chatID, sessionKey, strings.TrimSpace(opts.LocalSource), len(transcript), r.previewForLog(transcript))
@@ -540,20 +545,23 @@ func (r *Runner) executeTurn(ctx context.Context, turnCtx context.Context, b *bo
 		}
 		if voiceErr != nil {
 			r.logf("voice fetch failed: chat=%d session_key=%s error=%v", chatID, sessionKey, r.redactError(voiceErr))
-			r.replyError(ctx, b, chatID, progress, fmt.Errorf("failed to fetch voice attachment: %w", voiceErr))
-			return
+			err := fmt.Errorf("failed to fetch voice attachment: %w", voiceErr)
+			r.replyError(ctx, b, chatID, progress, err)
+			return err
 		}
 		r.logf("voice fetch success: chat=%d session_key=%s path=%s", chatID, sessionKey, voicePath)
 		transcript, transcribeErr := r.voiceService().Transcribe(turnCtx, voicePath)
 		if transcribeErr != nil {
 			r.logf("voice transcription failed: chat=%d session_key=%s error=%v", chatID, sessionKey, r.redactError(transcribeErr))
-			r.replyError(ctx, b, chatID, progress, fmt.Errorf("failed to transcribe voice note: %w", transcribeErr))
-			return
+			err := fmt.Errorf("failed to transcribe voice note: %w", transcribeErr)
+			r.replyError(ctx, b, chatID, progress, err)
+			return err
 		}
 		transcript = strings.TrimSpace(transcript)
 		if transcript == "" {
-			r.replyError(ctx, b, chatID, progress, errors.New("voice note transcription was empty"))
-			return
+			err := errors.New("voice note transcription was empty")
+			r.replyError(ctx, b, chatID, progress, err)
+			return err
 		}
 		if strings.TrimSpace(text) != "" {
 			text = strings.TrimSpace(transcript) + "\n\nTelegram caption:\n" + strings.TrimSpace(text)
@@ -567,14 +575,26 @@ func (r *Runner) executeTurn(ctx context.Context, turnCtx context.Context, b *bo
 		images, imgErr := fetchTelegramImages(turnCtx, b, imageFileIDs)
 		if imgErr != nil {
 			r.logf("image fetch failed: chat=%d session_key=%s error=%v", chatID, sessionKey, r.redactError(imgErr))
-			r.replyError(ctx, b, chatID, progress, fmt.Errorf("failed to fetch image attachment: %w", imgErr))
-			return
+			err := fmt.Errorf("failed to fetch image attachment: %w", imgErr)
+			r.replyError(ctx, b, chatID, progress, err)
+			return err
 		}
 		inputImages = images
 		r.logf("image fetch success: chat=%d session_key=%s images=%d", chatID, sessionKey, len(inputImages))
 	}
 	res, err := r.Engine.HandleTextWithOptions(turnCtx, "telegram", sessionKey, text, agent.HandleOptions{
-		InputImages: inputImages,
+		InputImages:          inputImages,
+		SyntheticToolResults: opts.SyntheticToolResults,
+		OnCompactionEvent: func(ev agent.CompactionEvent) {
+			line := formatCompactionEvent(ev)
+			r.logf("compaction event: chat=%d %s", chatID, r.previewForLog(line))
+			sendCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_, sendErr := b.SendMessage(sendCtx, &bot.SendMessageParams{ChatID: chatID, Text: line})
+			if sendErr != nil {
+				r.logf("compaction event send failed: chat=%d error=%v", chatID, r.redactError(sendErr))
+			}
+		},
 		OnToolEvent: func(ev agent.ToolEvent) {
 			if !showTools || ev.Phase != agent.ToolEventFinish {
 				return
@@ -597,25 +617,13 @@ func (r *Runner) executeTurn(ctx context.Context, turnCtx context.Context, b *bo
 			} else {
 				_, _ = b.SendMessage(ctx, &bot.SendMessageParams{ChatID: chatID, Text: "stopped."})
 			}
-			return
+			return err
 		}
 		r.logf("agent turn failed: chat=%d error=%v", chatID, r.redactError(err))
 		r.replyError(ctx, b, chatID, progress, err)
-		return
+		return err
 	}
 	r.logf("agent turn complete: chat=%d model=%s prompt_tokens=%d eval_tokens=%d compacted=%t tool_calls=%d elapsed_ms=%d", chatID, res.Session.ModelOverride, res.PromptTokens, res.EvalTokens, res.Compacted, len(res.ToolTrace), time.Since(startedAt).Milliseconds())
-	if res.Compacted {
-		thresholdTokens := int(float64(r.Cfg.ContextWindowTokens) * r.Cfg.CompactionThreshold)
-		compaction := r.readCompactionSnapshot(context.Background(), sessionKey, res.Session)
-		notice := formatCompactionNotice(res.PromptTokens, thresholdTokens, r.Cfg.KeepRecentTurns, compaction)
-		r.logf("compaction notice: chat=%d %s", chatID, r.previewForLog(notice))
-		sendCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		_, sendErr := b.SendMessage(sendCtx, &bot.SendMessageParams{ChatID: chatID, Text: notice})
-		cancel()
-		if sendErr != nil {
-			r.logf("compaction notice send failed: chat=%d error=%v", chatID, r.redactError(sendErr))
-		}
-	}
 	for i, tr := range res.ToolTrace {
 		line := fmt.Sprintf("tool trace [%d/%d]: chat=%d name=%s duration_ms=%d args=%q", i+1, len(res.ToolTrace), chatID, tr.Name, tr.DurationMs, r.previewForLog(tr.ArgsJSON))
 		if strings.TrimSpace(tr.Error) != "" {
@@ -651,6 +659,46 @@ func (r *Runner) executeTurn(ctx context.Context, turnCtx context.Context, b *bo
 	}
 	r.logf("response send: chat=%d chars=%d voice_chars=%d", chatID, len(displayContent), len(speechContent))
 	r.sendAssistantResponse(ctx, turnCtx, b, chatID, sessionKey, progress, displayContent, speechContent, showTools, r.responseDeliveryForTurn(ctx, sessionKey, opts))
+	return nil
+}
+
+func (r *Runner) enqueueSubagentCompletionTurn(ctx context.Context, b *bot.Bot, chatID int64, sessionKey string, notification db.SubagentNotification) error {
+	waiter := make(chan error, 1)
+	queued := r.enqueuePendingTurn(sessionKey, pendingTurn{
+		chatID:     chatID,
+		sessionKey: sessionKey,
+		text:       "",
+		syntheticToolResults: []agent.SyntheticToolResult{
+			syntheticSubagentCompletion(notification),
+		},
+		waiters:      []chan error{waiter},
+		noDebounce:   true,
+		messageCount: 1,
+		bot:          b,
+	})
+	r.logf("subagent completion parent turn queued: chat=%d session_key=%s generation=%d notification=%s task=%s", chatID, sessionKey, queued.generation, notification.ID, notification.TaskID)
+	r.schedulePendingTurnDrain(sessionKey, queued.generation)
+	select {
+	case err := <-waiter:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func syntheticSubagentCompletion(notification db.SubagentNotification) agent.SyntheticToolResult {
+	args := map[string]interface{}{
+		"id":              notification.TaskID,
+		"notification_id": notification.ID,
+		"event":           "background_completion",
+	}
+	return agent.SyntheticToolResult{
+		ToolName:         "subagent_completion",
+		ToolCallID:       "subagent_completion:" + strings.TrimSpace(notification.ID),
+		Args:             args,
+		ResultJSON:       strings.TrimSpace(notification.Content),
+		AssistantContent: "Background subagent completed.",
+	}
 }
 
 func (r *Runner) authorize(ctx context.Context, b *bot.Bot, chatID, userID int64, cmd string) bool {
@@ -1460,8 +1508,12 @@ func (r *Runner) enqueuePendingTurn(sessionKey string, turn pendingTurn) pending
 	turn.voiceFileID = strings.TrimSpace(turn.voiceFileID)
 	turn.localSource = strings.TrimSpace(turn.localSource)
 	turn.localAudio = strings.TrimSpace(turn.localAudio)
+	turn.syntheticToolResults = append([]agent.SyntheticToolResult(nil), turn.syntheticToolResults...)
+	turn.waiters = append([]chan error(nil), turn.waiters...)
 	if turn.messageCount <= 0 {
-		turn.messageCount = 1
+		if strings.TrimSpace(turn.text) != "" || len(turn.imageFileIDs) > 0 || turn.voiceFileID != "" || turn.localAudio != "" || len(turn.syntheticToolResults) > 0 {
+			turn.messageCount = 1
+		}
 	}
 	r.pendingMu.Lock()
 	if r.pendingTurns == nil {
@@ -1486,6 +1538,8 @@ func (r *Runner) enqueuePendingTurn(sessionKey string, turn pendingTurn) pending
 		} else if turn.localCleanup != nil {
 			turn.localCleanup()
 		}
+		existing.syntheticToolResults = append(existing.syntheticToolResults, turn.syntheticToolResults...)
+		existing.waiters = append(existing.waiters, turn.waiters...)
 		existing.noDebounce = existing.noDebounce || turn.noDebounce
 		if turn.chatID != 0 {
 			existing.chatID = turn.chatID
@@ -1603,13 +1657,27 @@ func (r *Runner) drainPendingTurn(sessionKey string, generation uint64) {
 		func() {
 			defer turnCancel()
 			defer r.endTurn(turn.sessionKey, turnID)
-			r.executeTurn(context.Background(), turnCtx, turn.bot, turn.chatID, turn.userID, turn.sessionKey, turn.text, turn.imageFileIDs, turn.voiceFileID, turnExecutionOptions{
-				LocalSource:  turn.localSource,
-				LocalAudio:   turn.localAudio,
-				LocalCleanup: turn.localCleanup,
+			err := r.executeTurn(context.Background(), turnCtx, turn.bot, turn.chatID, turn.userID, turn.sessionKey, turn.text, turn.imageFileIDs, turn.voiceFileID, turnExecutionOptions{
+				LocalSource:          turn.localSource,
+				LocalAudio:           turn.localAudio,
+				LocalCleanup:         turn.localCleanup,
+				SyntheticToolResults: turn.syntheticToolResults,
 			})
+			notifyPendingTurnWaiters(turn.waiters, err)
 		}()
 		return
+	}
+}
+
+func notifyPendingTurnWaiters(waiters []chan error, err error) {
+	for _, waiter := range waiters {
+		if waiter == nil {
+			continue
+		}
+		select {
+		case waiter <- err:
+		default:
+		}
 	}
 }
 
@@ -1670,6 +1738,22 @@ func (r *Runner) readCompactionSnapshot(ctx context.Context, sessionKey string, 
 
 func formatCompactionNotice(promptTokens, thresholdTokens, keepRecentTurns int, snap compactionSnapshot) string {
 	return fmt.Sprintf("context compacted:\nprompt_tokens: %d\nthreshold_tokens: %d\nkeep_recent_turns: %d\ncompactions_total: %d\nlast_compaction_at: %s", promptTokens, thresholdTokens, keepRecentTurns, snap.TotalCount, snap.LastAt)
+}
+
+func formatCompactionEvent(ev agent.CompactionEvent) string {
+	switch ev.Phase {
+	case agent.CompactionEventStart:
+		return "context compaction started."
+	case agent.CompactionEventDone:
+		return "context compaction done."
+	case agent.CompactionEventFailure:
+		if strings.TrimSpace(ev.Error) == "" {
+			return "context compaction failed."
+		}
+		return "context compaction failed: " + strings.TrimSpace(ev.Error)
+	default:
+		return "context compaction event: " + string(ev.Phase)
+	}
 }
 
 func formatCoreMemoryEvent(ev agent.CoreMemoryEvent) string {
@@ -2152,6 +2236,9 @@ func formatLiveToolEvent(ev agent.ToolEvent) string {
 }
 
 func liveToolLabel(ev agent.ToolEvent) string {
+	if strings.EqualFold(strings.TrimSpace(ev.Name), "subagent_completion") {
+		return "subagent completed"
+	}
 	if !strings.EqualFold(strings.TrimSpace(ev.Name), "bash") {
 		return ev.Name
 	}

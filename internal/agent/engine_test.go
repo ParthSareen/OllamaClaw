@@ -969,6 +969,68 @@ func TestHandleTextInjectsPrefetchedBashAsToolContext(t *testing.T) {
 	}
 }
 
+func TestHandleTextInjectsSyntheticToolResult(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	ctx := context.Background()
+
+	var seenMessages []ollama.ChatMessage
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req ollama.ChatRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		seenMessages = req.Messages
+		resp := ollama.ChatResponse{
+			Message:         ollama.ChatMessage{Role: "assistant", Content: "The background review is done."},
+			PromptEvalCount: 12,
+			EvalCount:       5,
+			Done:            true,
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer srv.Close()
+
+	engine, store := newTestEngine(t, srv.URL)
+	defer store.Close()
+	events := []ToolEvent{}
+	res, err := engine.HandleTextWithOptions(ctx, "telegram", "123", "", HandleOptions{
+		SyntheticToolResults: []SyntheticToolResult{
+			{
+				ToolName:   "subagent_completion",
+				ToolCallID: "subagent_completion:test",
+				Args:       map[string]interface{}{"id": "agent-test"},
+				ResultJSON: `{"id":"agent-test","status":"succeeded","preview":"looks good"}`,
+			},
+		},
+		OnToolEvent: func(ev ToolEvent) {
+			events = append(events, ev)
+		},
+	})
+	if err != nil {
+		t.Fatalf("HandleTextWithOptions() error: %v", err)
+	}
+	if strings.TrimSpace(res.AssistantContent) != "The background review is done." {
+		t.Fatalf("unexpected assistant content: %q", res.AssistantContent)
+	}
+	foundAssistantCall := false
+	foundToolResult := false
+	for _, m := range seenMessages {
+		if m.Role == "assistant" && len(m.ToolCalls) > 0 && m.ToolCalls[0].Function.Name == "subagent_completion" {
+			foundAssistantCall = true
+		}
+		if m.Role == "tool" && m.ToolName == "subagent_completion" && strings.Contains(m.Content, `"preview":"looks good"`) {
+			foundToolResult = true
+		}
+	}
+	if !foundAssistantCall || !foundToolResult {
+		t.Fatalf("expected synthetic assistant/tool result in prompt, got %#v", seenMessages)
+	}
+	if len(events) != 2 || events[0].Phase != ToolEventStart || events[1].Phase != ToolEventFinish {
+		t.Fatalf("expected synthetic tool start/finish events, got %#v", events)
+	}
+}
+
 func TestHandleTextPrefetchedContextRequiresRunID(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	ctx := context.Background()
@@ -1089,28 +1151,28 @@ func TestWithTimezonePolicyPromptAppendsOnce(t *testing.T) {
 	}
 }
 
-func TestWithCurrentTimePromptAddsPacificAndUTC(t *testing.T) {
+func TestWithCurrentDayPromptAddsPacificDayAndBashHint(t *testing.T) {
 	base := "You are custom."
 	now := time.Date(2026, time.April, 15, 18, 45, 30, 0, time.UTC)
-	got := withCurrentTimePrompt(base, now)
-	if !strings.Contains(got, "Current runtime time:") {
-		t.Fatalf("expected current runtime time section, got %q", got)
+	got := withCurrentDayPrompt(base, now)
+	if !strings.Contains(got, "Current day marker:") {
+		t.Fatalf("expected current day marker section, got %q", got)
 	}
-	if !strings.Contains(got, "Current time (America/Los_Angeles): 2026-04-15T11:45:30-07:00") {
-		t.Fatalf("expected pacific timestamp in prompt, got %q", got)
+	if !strings.Contains(got, "Current date (PST): 2026-04-15 Wednesday") {
+		t.Fatalf("expected PST day marker in prompt, got %q", got)
 	}
-	if !strings.Contains(got, "Current time (UTC): 2026-04-15T18:45:30Z") {
-		t.Fatalf("expected UTC timestamp in prompt, got %q", got)
+	if !strings.Contains(got, "use the bash tool to run `date`") {
+		t.Fatalf("expected bash date hint in prompt, got %q", got)
 	}
 }
 
-func TestWithCurrentTimePromptAppendsOnce(t *testing.T) {
+func TestWithCurrentDayPromptAppendsOnce(t *testing.T) {
 	base := "You are custom."
 	now := time.Date(2026, time.April, 15, 18, 45, 30, 0, time.UTC)
-	once := withCurrentTimePrompt(base, now)
-	twice := withCurrentTimePrompt(once, now.Add(2*time.Hour))
+	once := withCurrentDayPrompt(base, now)
+	twice := withCurrentDayPrompt(once, now.Add(2*time.Hour))
 	if twice != once {
-		t.Fatalf("expected second current-time application to be idempotent, got %q", twice)
+		t.Fatalf("expected second current-day application to be idempotent, got %q", twice)
 	}
 }
 
@@ -1159,8 +1221,8 @@ func TestFullSystemContextIncludesCoreAndCompactionSummary(t *testing.T) {
 	if !strings.Contains(full, "System prompt:\n") {
 		t.Fatalf("expected system prompt section, got %q", full)
 	}
-	if !strings.Contains(full, "Current runtime time:") {
-		t.Fatalf("expected runtime time in system prompt, got %q", full)
+	if !strings.Contains(full, "Current day marker:") {
+		t.Fatalf("expected current day marker in system prompt, got %q", full)
 	}
 	if !strings.Contains(full, "Core memories:\n- User likes terse but warm responses.") {
 		t.Fatalf("expected core memories section, got %q", full)
@@ -1292,6 +1354,103 @@ func TestCompactionSummaryOmitsThinking(t *testing.T) {
 	}
 	if callCount != 2 {
 		t.Fatalf("expected chat + summary calls, got %d", callCount)
+	}
+}
+
+func TestCompactionEventsBlockUntilDone(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	ctx := context.Background()
+
+	summaryStarted := make(chan struct{})
+	releaseSummary := make(chan struct{})
+	callCount := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		var req ollama.ChatRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		resp := ollama.ChatResponse{
+			Message:         ollama.ChatMessage{Role: "assistant", Content: "final"},
+			PromptEvalCount: 20,
+			EvalCount:       1,
+			Done:            true,
+		}
+		if callCount == 2 {
+			close(summaryStarted)
+			<-releaseSummary
+			resp.Message.Content = "summary after blocking"
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer srv.Close()
+
+	engine, store := newTestEngine(t, srv.URL)
+	defer store.Close()
+	engine.cfg.CompactionThreshold = 0.001
+	engine.cfg.KeepRecentTurns = 1
+
+	sess, err := engine.GetOrCreateSession(ctx, "telegram", "8750063231")
+	if err != nil {
+		t.Fatalf("GetOrCreateSession error: %v", err)
+	}
+	if err := store.InsertMessage(ctx, &db.Message{SessionID: sess.ID, Role: "user", Content: "old request"}); err != nil {
+		t.Fatalf("InsertMessage user error: %v", err)
+	}
+	if err := store.InsertMessage(ctx, &db.Message{SessionID: sess.ID, Role: "assistant", Content: "old answer"}); err != nil {
+		t.Fatalf("InsertMessage assistant error: %v", err)
+	}
+
+	events := make(chan CompactionEvent, 4)
+	done := make(chan error, 1)
+	go func() {
+		_, err := engine.HandleTextWithOptions(ctx, "telegram", "8750063231", "new request", HandleOptions{
+			OnCompactionEvent: func(ev CompactionEvent) {
+				events <- ev
+			},
+		})
+		done <- err
+	}()
+
+	select {
+	case ev := <-events:
+		if ev.Phase != CompactionEventStart {
+			t.Fatalf("expected compaction start event, got %+v", ev)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for compaction start event")
+	}
+	select {
+	case <-summaryStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for summary request")
+	}
+	select {
+	case err := <-done:
+		t.Fatalf("HandleText returned before compaction completed: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(releaseSummary)
+	select {
+	case ev := <-events:
+		if ev.Phase != CompactionEventDone {
+			t.Fatalf("expected compaction done event, got %+v", ev)
+		}
+		if ev.SummaryChars == 0 || ev.ArchivedMessageCount == 0 {
+			t.Fatalf("expected done event details, got %+v", ev)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for compaction done event")
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("HandleText error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for HandleText completion")
 	}
 }
 

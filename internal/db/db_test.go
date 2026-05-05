@@ -436,3 +436,73 @@ func TestCronPrefetchCommandsPersistence(t *testing.T) {
 		t.Fatalf("expected deduped 2 commands, got %d (%v)", len(commands), commands)
 	}
 }
+
+func TestSubagentNotificationLifecycle(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	store, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open() error: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+	now := time.Now().UTC()
+	task := SubagentTask{
+		ID:           "task-1",
+		Kind:         "generic",
+		Status:       "succeeded",
+		Title:        "done",
+		Prompt:       "work",
+		Transport:    "telegram",
+		SessionKey:   "123",
+		MetadataJSON: "{}",
+		CreatedAt:    now,
+		FinishedAt:   &now,
+	}
+	notification := SubagentNotification{
+		ID:            "subagent-completion-task-1",
+		TaskID:        task.ID,
+		Kind:          "completion",
+		Status:        "pending",
+		Transport:     "telegram",
+		SessionKey:    "123",
+		Content:       "done",
+		NextAttemptAt: now,
+		CreatedAt:     now,
+	}
+	if err := store.CompleteSubagentTask(ctx, task, &notification); err != nil {
+		t.Fatalf("CompleteSubagentTask() error: %v", err)
+	}
+
+	claimed, ok, err := store.ClaimNextSubagentNotification(ctx, now.Add(time.Second))
+	if err != nil || !ok {
+		t.Fatalf("ClaimNextSubagentNotification() ok=%t err=%v", ok, err)
+	}
+	if claimed.Status != "sending" || claimed.Attempts != 1 {
+		t.Fatalf("expected sending attempt 1, got status=%s attempts=%d", claimed.Status, claimed.Attempts)
+	}
+	next := now.Add(time.Minute)
+	if err := store.MarkSubagentNotificationRetry(ctx, claimed.ID, "telegram down", next); err != nil {
+		t.Fatalf("MarkSubagentNotificationRetry() error: %v", err)
+	}
+	if _, ok, err := store.ClaimNextSubagentNotification(ctx, now.Add(30*time.Second)); err != nil || ok {
+		t.Fatalf("expected no claim before next attempt, ok=%t err=%v", ok, err)
+	}
+	claimed, ok, err = store.ClaimNextSubagentNotification(ctx, next.Add(time.Second))
+	if err != nil || !ok {
+		t.Fatalf("ClaimNextSubagentNotification() retry ok=%t err=%v", ok, err)
+	}
+	if claimed.Attempts != 2 {
+		t.Fatalf("expected attempt 2, got %d", claimed.Attempts)
+	}
+	if err := store.MarkSubagentNotificationDelivered(ctx, claimed.ID); err != nil {
+		t.Fatalf("MarkSubagentNotificationDelivered() error: %v", err)
+	}
+	got, ok, err := store.GetSubagentNotification(ctx, claimed.ID)
+	if err != nil || !ok {
+		t.Fatalf("GetSubagentNotification() ok=%t err=%v", ok, err)
+	}
+	if got.Status != "delivered" || got.DeliveredAt == nil {
+		t.Fatalf("expected delivered notification, got status=%s delivered=%v", got.Status, got.DeliveredAt)
+	}
+}

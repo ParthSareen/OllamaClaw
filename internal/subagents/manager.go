@@ -24,7 +24,7 @@ import (
 	"github.com/ParthSareen/OllamaClaw/internal/tools"
 )
 
-type OutputSinkFunc func(ctx context.Context, transport, sessionKey, content string) error
+type OutputSinkFunc func(ctx context.Context, notification db.SubagentNotification) error
 
 type Manager struct {
 	store *db.Store
@@ -35,6 +35,7 @@ type Manager struct {
 	started bool
 	cancel  context.CancelFunc
 	signal  chan struct{}
+	notify  chan struct{}
 	running map[string]context.CancelFunc
 	sink    OutputSinkFunc
 	wg      sync.WaitGroup
@@ -50,8 +51,16 @@ const (
 	kindGeneric  = "generic"
 	kindPRReview = "pr_review"
 
-	resultMaxBytes  = 64 * 1024
-	previewMaxRunes = 3400
+	notificationKindCompletion  = "completion"
+	notificationStatusPending   = "pending"
+	notificationStatusSending   = "sending"
+	notificationStatusDelivered = "delivered"
+
+	resultMaxBytes        = 64 * 1024
+	previewMaxRunes       = 3400
+	notifyRetryBaseDelay  = 5 * time.Second
+	notifyRetryMaxDelay   = 5 * time.Minute
+	notifyDispatchTimeout = 30 * time.Minute
 )
 
 var (
@@ -70,14 +79,16 @@ func NewManager(cfg config.SubagentConfig, store *db.Store) *Manager {
 		cfg:     cfg,
 		cwd:     cwd,
 		signal:  make(chan struct{}, signalCap),
+		notify:  make(chan struct{}, 1),
 		running: map[string]context.CancelFunc{},
 	}
 }
 
 func (m *Manager) SetOutputSink(fn OutputSinkFunc) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	m.sink = fn
+	m.mu.Unlock()
+	m.wakeNotifications()
 }
 
 func (m *Manager) Start(ctx context.Context) error {
@@ -97,6 +108,9 @@ func (m *Manager) Start(ctx context.Context) error {
 		return fmt.Errorf("create subagent repo dir: %w", err)
 	}
 	if err := m.store.MarkRunningSubagentTasksInterrupted(ctx); err != nil {
+		return err
+	}
+	if err := m.store.ResetSendingSubagentNotifications(ctx); err != nil {
 		return err
 	}
 
@@ -121,7 +135,13 @@ func (m *Manager) Start(ctx context.Context) error {
 			m.worker(runCtx)
 		}()
 	}
+	m.wg.Add(1)
+	go func() {
+		defer m.wg.Done()
+		m.notificationDispatcher(runCtx)
+	}()
 	m.wake()
+	m.wakeNotifications()
 	return nil
 }
 
@@ -395,7 +415,7 @@ func (m *Manager) runTask(parent context.Context, task db.SubagentTask) {
 	defer stderr.Close()
 
 	cmd := exec.CommandContext(runCtx, m.codexBinary(), args...)
-	cmd.Stdin = strings.NewReader(task.Prompt)
+	cmd.Stdin = codexStdin(task)
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
 	if err := cmd.Start(); err != nil {
@@ -433,11 +453,7 @@ func (m *Manager) runTask(parent context.Context, task db.SubagentTask) {
 		task.Status = statusSucceeded
 		task.Error = ""
 	}
-	if err := m.store.UpsertSubagentTask(context.Background(), task); err != nil {
-		m.failTask(task, err, task.ExitCode)
-		return
-	}
-	m.deliver(task)
+	m.finishTask(task)
 }
 
 func (m *Manager) prepareWorkdir(ctx context.Context, task *db.SubagentTask) (string, error) {
@@ -564,12 +580,20 @@ func (m *Manager) codexArgs(task db.SubagentTask, workdir string) []string {
 		base := strings.TrimSpace(task.BaseRef)
 		if base != "" {
 			args = append(args, "--base", "origin/"+base)
+			return args
 		}
 		args = append(args, "-")
 		return args
 	}
 	args = append(args, "-")
 	return args
+}
+
+func codexStdin(task db.SubagentTask) io.Reader {
+	if task.Kind == kindPRReview && strings.TrimSpace(task.BaseRef) != "" {
+		return nil
+	}
+	return strings.NewReader(task.Prompt)
 }
 
 func (m *Manager) taskTimeout(task db.SubagentTask) time.Duration {
@@ -613,29 +637,118 @@ func (m *Manager) failTask(task db.SubagentTask, err error, exitCode *int) {
 	task.Error = err.Error()
 	task.ExitCode = exitCode
 	task.FinishedAt = &now
-	_ = m.store.UpsertSubagentTask(context.Background(), task)
-	m.deliver(task)
+	m.finishTask(task)
 }
 
-func (m *Manager) deliver(task db.SubagentTask) {
+func (m *Manager) finishTask(task db.SubagentTask) {
+	notification := m.completionNotification(task)
+	if err := m.store.CompleteSubagentTask(context.Background(), task, notification); err != nil {
+		_ = m.store.UpsertSubagentTask(context.Background(), task)
+		return
+	}
+	if notification != nil {
+		m.wakeNotifications()
+	}
+}
+
+func (m *Manager) completionNotification(task db.SubagentTask) *db.SubagentNotification {
 	meta := taskMetadata(&task)
 	deliver := true
 	if v, ok := meta["deliver"].(bool); ok {
 		deliver = v
 	}
 	if !deliver || strings.TrimSpace(task.Transport) == "" || strings.TrimSpace(task.SessionKey) == "" {
-		return
+		return nil
 	}
+	now := time.Now().UTC()
+	return &db.SubagentNotification{
+		ID:            "subagent-completion-" + task.ID,
+		TaskID:        task.ID,
+		Kind:          notificationKindCompletion,
+		Status:        notificationStatusPending,
+		Transport:     strings.TrimSpace(task.Transport),
+		SessionKey:    strings.TrimSpace(task.SessionKey),
+		Content:       completionPayloadJSON(task),
+		NextAttemptAt: now,
+		CreatedAt:     now,
+	}
+}
+
+func (m *Manager) notificationDispatcher(ctx context.Context) {
+	for {
+		if err := ctx.Err(); err != nil {
+			return
+		}
+		if !m.hasSink() {
+			m.waitForNotificationWork(ctx, 5*time.Second)
+			continue
+		}
+		notification, ok, err := m.store.ClaimNextSubagentNotification(ctx, time.Now().UTC())
+		if err != nil {
+			m.waitForNotificationWork(ctx, time.Second)
+			continue
+		}
+		if !ok {
+			m.waitForNotificationWork(ctx, 5*time.Second)
+			continue
+		}
+		m.dispatchNotification(ctx, notification)
+	}
+}
+
+func (m *Manager) hasSink() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.sink != nil
+}
+
+func (m *Manager) dispatchNotification(parent context.Context, notification db.SubagentNotification) {
 	m.mu.Lock()
 	sink := m.sink
 	m.mu.Unlock()
 	if sink == nil {
+		m.retryNotification(notification, errors.New("notification sink unavailable"))
 		return
 	}
-	content := formatCompletion(task)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(parent, notifyDispatchTimeout)
 	defer cancel()
-	_ = sink(ctx, task.Transport, task.SessionKey, content)
+	if err := sink(ctx, notification); err != nil {
+		m.retryNotification(notification, err)
+		return
+	}
+	if err := m.store.MarkSubagentNotificationDelivered(context.Background(), notification.ID); err != nil {
+		m.retryNotification(notification, err)
+	}
+}
+
+func (m *Manager) retryNotification(notification db.SubagentNotification, err error) {
+	delay := notificationRetryDelay(notification.Attempts)
+	next := time.Now().UTC().Add(delay)
+	_ = m.store.MarkSubagentNotificationRetry(context.Background(), notification.ID, err.Error(), next)
+}
+
+func notificationRetryDelay(attempts int) time.Duration {
+	if attempts <= 0 {
+		return notifyRetryBaseDelay
+	}
+	delay := notifyRetryBaseDelay
+	for i := 1; i < attempts; i++ {
+		delay *= 2
+		if delay >= notifyRetryMaxDelay {
+			return notifyRetryMaxDelay
+		}
+	}
+	return delay
+}
+
+func (m *Manager) waitForNotificationWork(ctx context.Context, delay time.Duration) {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+	case <-m.notify:
+	case <-timer.C:
+	}
 }
 
 func (m *Manager) wake() {
@@ -649,6 +762,13 @@ func (m *Manager) wake() {
 		default:
 			return
 		}
+	}
+}
+
+func (m *Manager) wakeNotifications() {
+	select {
+	case m.notify <- struct{}{}:
+	default:
 	}
 }
 
@@ -817,6 +937,42 @@ func formatCompletion(task db.SubagentTask) string {
 		preview += "\n\n...[truncated; use /agents show " + task.ID + " for the stored result]"
 	}
 	return header + "\n\n" + preview
+}
+
+func completionPayloadJSON(task db.SubagentTask) string {
+	payload := map[string]interface{}{
+		"id":            task.ID,
+		"kind":          task.Kind,
+		"status":        task.Status,
+		"title":         task.Title,
+		"repo":          task.Repo,
+		"pr_number":     task.PRNumber,
+		"pr_url":        task.PRURL,
+		"base_ref":      task.BaseRef,
+		"head_ref":      task.HeadRef,
+		"worktree_path": task.WorktreePath,
+		"result_path":   task.ResultPath,
+		"stdout_path":   task.StdoutPath,
+		"stderr_path":   task.StderrPath,
+		"exit_code":     task.ExitCode,
+		"error":         task.Error,
+		"created_at":    formatTime(task.CreatedAt),
+	}
+	if task.StartedAt != nil {
+		payload["started_at"] = formatTime(*task.StartedAt)
+	}
+	if task.FinishedAt != nil {
+		payload["finished_at"] = formatTime(*task.FinishedAt)
+	}
+	if strings.TrimSpace(task.ResultPath) != "" {
+		content, truncated, err := readLimited(task.ResultPath, resultMaxBytes)
+		if err == nil && strings.TrimSpace(content) != "" {
+			payload["preview"] = truncateRunes(strings.TrimSpace(content), previewMaxRunes)
+			payload["truncated"] = truncated || payload["preview"] != strings.TrimSpace(content)
+		}
+	}
+	b, _ := json.Marshal(payload)
+	return string(b)
 }
 
 func taskInfo(task db.SubagentTask) tools.SubagentInfo {

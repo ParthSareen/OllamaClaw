@@ -48,6 +48,7 @@ Execution behavior:
 - Use tools whenever they reduce guesswork, improve speed, or increase correctness.
 - For long-running, parallel, or independent work, use subagent tools to launch background Codex tasks and return task IDs immediately.
 - For multiple PR reviews, prefer subagent_pr_review so each PR can run as an isolated report-only Codex task.
+- When a subagent_completion tool result appears, digest it into a user-facing final result and call subagent_result only if the preview is insufficient.
 - For prompt tuning, use managed system_prompt tools instead of directly editing prompt files.
 - Never fabricate tool results, file contents, command outcomes, or links.
 - If tool output is long, summarize key findings first, then include critical details.
@@ -68,8 +69,8 @@ REMINDER behavior:
 - Report only relevant results.
 
 Timezone policy:
-- Treat all scheduling and time-based operations in America/Los_Angeles (PST/PDT).
-- Convert timezone-based outputs into America/Los_Angeles before presenting times.`
+- Treat all scheduling and time-based operations in PST (America/Los_Angeles).
+- Convert timezone-based outputs into PST before presenting times.`
 
 type Engine struct {
 	cfg            config.Config
@@ -132,16 +133,25 @@ type PromptEstimate struct {
 }
 
 type HandleOptions struct {
-	OnToolEvent func(ToolEvent)
-	InputImages []string
+	OnToolEvent          func(ToolEvent)
+	OnCompactionEvent    func(CompactionEvent)
+	InputImages          []string
+	SyntheticToolResults []SyntheticToolResult
 }
 
 type ToolEventPhase string
+type CompactionEventPhase string
 
 const (
 	ToolEventStart       ToolEventPhase = "start"
 	ToolEventFinish      ToolEventPhase = "finish"
 	prefetchToolIDPrefix                = "prefetch_ctx:"
+)
+
+const (
+	CompactionEventStart   CompactionEventPhase = "start"
+	CompactionEventDone    CompactionEventPhase = "done"
+	CompactionEventFailure CompactionEventPhase = "failure"
 )
 
 type ToolEvent struct {
@@ -152,6 +162,17 @@ type ToolEvent struct {
 	ResultJSON string
 	Error      string
 	DurationMs int64
+}
+
+type CompactionEvent struct {
+	Phase                CompactionEventPhase
+	PromptTokens         int
+	ThresholdTokens      int
+	KeepRecentTurns      int
+	ArchivedMessageCount int
+	SummaryChars         int
+	DurationMs           int64
+	Error                string
 }
 
 type ToolTraceEntry struct {
@@ -166,6 +187,14 @@ type ThinkingTraceEntry struct {
 	Step          int
 	Thinking      string
 	ToolCallCount int
+}
+
+type SyntheticToolResult struct {
+	ToolName         string
+	ToolCallID       string
+	Args             map[string]interface{}
+	ResultJSON       string
+	AssistantContent string
 }
 
 func New(cfg config.Config, store *db.Store, client *ollama.Client, reminderCtrl tools.ReminderController, subagentCtrl tools.SubagentController) *Engine {
@@ -219,10 +248,6 @@ func (e *Engine) HandleTextWithOptions(ctx context.Context, transport, sessionKe
 		activePrefetchToolCallID = prefetchToolCallID
 		shouldCleanupPrefetch = true
 	}
-	if err := e.store.InsertMessage(ctx, &db.Message{SessionID: sess.ID, Role: "user", Content: input}); err != nil {
-		return HandleResult{}, err
-	}
-
 	model := sess.ModelOverride
 	if strings.TrimSpace(model) == "" {
 		model = e.cfg.DefaultModel
@@ -239,6 +264,24 @@ func (e *Engine) HandleTextWithOptions(ctx context.Context, transport, sessionKe
 	toolTrace := []ToolTraceEntry{}
 	thinkingTrace := []ThinkingTraceEntry{}
 	toolCallIndex := 0
+
+	if len(opts.SyntheticToolResults) > 0 {
+		for _, synthetic := range opts.SyntheticToolResults {
+			toolCallIndex++
+			trace, err := e.injectSyntheticToolResult(ctx, sess.ID, toolCallIndex, synthetic, opts.OnToolEvent)
+			if err != nil {
+				return HandleResult{}, err
+			}
+			toolTrace = append(toolTrace, trace)
+		}
+	}
+	if strings.TrimSpace(input) != "" {
+		if err := e.store.InsertMessage(ctx, &db.Message{SessionID: sess.ID, Role: "user", Content: input}); err != nil {
+			return HandleResult{}, err
+		}
+	} else if len(opts.SyntheticToolResults) == 0 {
+		return HandleResult{}, errors.New("input is required")
+	}
 
 	for i := 0; i < 12; i++ {
 		if err := ctx.Err(); err != nil {
@@ -298,7 +341,7 @@ func (e *Engine) HandleTextWithOptions(ctx context.Context, transport, sessionKe
 			lastReply = resp.Message.Content
 		}
 
-		justCompacted, err := e.maybeCompact(ctx, sess, model, resp.PromptEvalCount, thinkParam)
+		justCompacted, err := e.maybeCompact(ctx, sess, model, resp.PromptEvalCount, thinkParam, opts.OnCompactionEvent)
 		if err != nil {
 			return HandleResult{}, err
 		}
@@ -412,6 +455,16 @@ func (e *Engine) emitToolEvent(cb func(ToolEvent), ev ToolEvent) {
 	cb(ev)
 }
 
+func (e *Engine) emitCompactionEvent(cb func(CompactionEvent), ev CompactionEvent) {
+	if cb == nil {
+		return
+	}
+	defer func() {
+		_ = recover()
+	}()
+	cb(ev)
+}
+
 func (e *Engine) emitCoreMemoryEvent(ev CoreMemoryEvent) {
 	e.eventMu.RLock()
 	cb := e.coreMemorySink
@@ -468,6 +521,77 @@ func (e *Engine) injectPrefetchedBashContext(ctx context.Context, sessionID, too
 		}
 	}
 	return nil
+}
+
+func (e *Engine) injectSyntheticToolResult(ctx context.Context, sessionID string, index int, synthetic SyntheticToolResult, onToolEvent func(ToolEvent)) (ToolTraceEntry, error) {
+	name := strings.TrimSpace(synthetic.ToolName)
+	if name == "" {
+		name = "synthetic_tool"
+	}
+	toolCallID := strings.TrimSpace(synthetic.ToolCallID)
+	if toolCallID == "" {
+		toolCallID = fmt.Sprintf("synthetic:%s:%d:%d", name, time.Now().UnixNano(), index)
+	}
+	args := synthetic.Args
+	if args == nil {
+		args = map[string]interface{}{}
+	}
+	argsJSON := mustJSON(args)
+	resultJSON := strings.TrimSpace(synthetic.ResultJSON)
+	if resultJSON == "" {
+		resultJSON = "{}"
+	}
+	call := []ollama.ToolCall{
+		{
+			Function: ollama.ToolCallFunction{
+				Name:      name,
+				Arguments: args,
+			},
+		},
+	}
+	callJSON, _ := json.Marshal(call)
+	content := strings.TrimSpace(synthetic.AssistantContent)
+	if content == "" {
+		content = "Background tool result ready."
+	}
+	e.emitToolEvent(onToolEvent, ToolEvent{
+		Phase:    ToolEventStart,
+		Index:    index,
+		Name:     name,
+		ArgsJSON: argsJSON,
+	})
+	if err := e.store.InsertMessage(ctx, &db.Message{
+		SessionID:     sessionID,
+		Role:          "assistant",
+		Content:       content,
+		ToolCallID:    toolCallID,
+		ToolCallsJSON: string(callJSON),
+	}); err != nil {
+		return ToolTraceEntry{}, err
+	}
+	if err := e.store.InsertMessage(ctx, &db.Message{
+		SessionID:    sessionID,
+		Role:         "tool",
+		ToolName:     name,
+		ToolCallID:   toolCallID,
+		ToolArgsJSON: argsJSON,
+		Content:      resultJSON,
+	}); err != nil {
+		return ToolTraceEntry{}, err
+	}
+	trace := ToolTraceEntry{
+		Name:       name,
+		ArgsJSON:   argsJSON,
+		ResultJSON: truncateForTrace(resultJSON, 2000),
+	}
+	e.emitToolEvent(onToolEvent, ToolEvent{
+		Phase:      ToolEventFinish,
+		Index:      index,
+		Name:       name,
+		ArgsJSON:   argsJSON,
+		ResultJSON: trace.ResultJSON,
+	})
+	return trace, nil
 }
 
 func (e *Engine) ListTools(ctx context.Context) ([]tools.Tool, error) {
@@ -800,31 +924,30 @@ func withTimezonePolicyPrompt(base string) string {
 		text = defaultSystemPrompt
 	}
 	lower := strings.ToLower(text)
-	if strings.Contains(lower, "america/los_angeles") || strings.Contains(lower, "pst/pdt") {
+	if strings.Contains(lower, "america/los_angeles") || strings.Contains(lower, "pst") {
 		return text
 	}
-	addendum := "\n\nTimezone policy:\n- Treat all scheduling and time-based operations in America/Los_Angeles (PST/PDT).\n- Convert timezone-based outputs into America/Los_Angeles before presenting times."
+	addendum := "\n\nTimezone policy:\n- Treat all scheduling and time-based operations in PST (America/Los_Angeles).\n- Convert timezone-based outputs into PST before presenting times."
 	return text + addendum
 }
 
-func withCurrentTimePrompt(base string, now time.Time) string {
+func withCurrentDayPrompt(base string, now time.Time) string {
 	text := strings.TrimSpace(base)
 	if text == "" {
 		text = defaultSystemPrompt
 	}
 	lower := strings.ToLower(text)
-	if strings.Contains(lower, "current runtime time:") || strings.Contains(lower, "current time (america/los_angeles):") {
+	if strings.Contains(lower, "current day marker:") || strings.Contains(lower, "current date (pst):") {
 		return text
 	}
-	pacific := now.In(util.PacificLocation()).Format(time.RFC3339)
-	utc := now.UTC().Format(time.RFC3339)
-	addendum := "\n\nCurrent runtime time:\n- Current time (America/Los_Angeles): " + pacific + "\n- Current time (UTC): " + utc + "\n- Interpret relative dates (today/tomorrow/yesterday/this week) against America/Los_Angeles."
+	pacificDay := now.In(util.PacificLocation()).Format("2006-01-02 Monday")
+	addendum := "\n\nCurrent day marker:\n- Current date (PST): " + pacificDay + "\n- Interpret relative dates (today/tomorrow/yesterday/this week) against PST/America/Los_Angeles.\n- If the exact current clock time is needed, use the bash tool to run `date`."
 	return text + addendum
 }
 
 func composeSystemPrompt(base, overlay string, now time.Time) string {
 	text := withTimezonePolicyPrompt(base)
-	text = withCurrentTimePrompt(text, now)
+	text = withCurrentDayPrompt(text, now)
 	overlay = strings.TrimSpace(overlay)
 	if overlay == "" {
 		return text
@@ -1160,7 +1283,7 @@ func coreMemoriesLastTurnSettingKey(sessionID string) string {
 	return "core_memories_last_turn:" + strings.TrimSpace(sessionID)
 }
 
-func (e *Engine) maybeCompact(ctx context.Context, sess db.Session, model string, promptEvalCount int, thinkParam interface{}) (bool, error) {
+func (e *Engine) maybeCompact(ctx context.Context, sess db.Session, model string, promptEvalCount int, thinkParam interface{}, onCompactionEvent func(CompactionEvent)) (bool, error) {
 	thresholdTokens := int(float64(e.cfg.ContextWindowTokens) * e.cfg.CompactionThreshold)
 	if promptEvalCount < thresholdTokens {
 		return false, nil
@@ -1204,17 +1327,43 @@ func (e *Engine) maybeCompact(ctx context.Context, sess db.Session, model string
 		ids = append(ids, row.ID)
 	}
 	b, _ := json.Marshal(payload)
+	startedAt := time.Now()
+	baseEvent := CompactionEvent{
+		PromptTokens:         promptEvalCount,
+		ThresholdTokens:      thresholdTokens,
+		KeepRecentTurns:      e.cfg.KeepRecentTurns,
+		ArchivedMessageCount: len(ids),
+	}
+	e.emitCompactionEvent(onCompactionEvent, CompactionEvent{
+		Phase:                CompactionEventStart,
+		PromptTokens:         baseEvent.PromptTokens,
+		ThresholdTokens:      baseEvent.ThresholdTokens,
+		KeepRecentTurns:      baseEvent.KeepRecentTurns,
+		ArchivedMessageCount: baseEvent.ArchivedMessageCount,
+	})
+	fail := func(err error) (bool, error) {
+		e.emitCompactionEvent(onCompactionEvent, CompactionEvent{
+			Phase:                CompactionEventFailure,
+			PromptTokens:         baseEvent.PromptTokens,
+			ThresholdTokens:      baseEvent.ThresholdTokens,
+			KeepRecentTurns:      baseEvent.KeepRecentTurns,
+			ArchivedMessageCount: baseEvent.ArchivedMessageCount,
+			DurationMs:           time.Since(startedAt).Milliseconds(),
+			Error:                err.Error(),
+		})
+		return false, err
+	}
 	summaryPrompt := []ollama.ChatMessage{
 		{Role: "system", Content: "Summarize the archived conversation for future continuation. Include decisions, constraints, file/task state, and unresolved items."},
 		{Role: "user", Content: "Previous summary:\n" + latestSummary + "\n\nMessages to summarize:\n" + string(b)},
 	}
 	summaryReq := ollama.ChatRequest{Model: model, Messages: summaryPrompt, Stream: false, Think: thinkParam}
 	if err := ensureChatRequestWithinContextWindow(summaryReq, e.cfg.ContextWindowTokens); err != nil {
-		return false, err
+		return fail(err)
 	}
 	summaryResp, err := e.client.Chat(ctx, summaryReq)
 	if err != nil {
-		return false, err
+		return fail(err)
 	}
 	summary := strings.TrimSpace(summaryResp.Message.Content)
 	if summary == "" {
@@ -1226,14 +1375,23 @@ func (e *Engine) maybeCompact(ctx context.Context, sess db.Session, model string
 		FirstKeptMessage:  rows[keepStart].ID,
 		ArchivedBeforeSeq: rows[keepStart].Seq,
 	}); err != nil {
-		return false, err
+		return fail(err)
 	}
 	if err := e.store.ArchiveMessagesByIDs(ctx, sess.ID, ids); err != nil {
-		return false, err
+		return fail(err)
 	}
 	if err := e.store.IncrementCompactions(ctx, sess.ID); err != nil {
-		return false, err
+		return fail(err)
 	}
+	e.emitCompactionEvent(onCompactionEvent, CompactionEvent{
+		Phase:                CompactionEventDone,
+		PromptTokens:         baseEvent.PromptTokens,
+		ThresholdTokens:      baseEvent.ThresholdTokens,
+		KeepRecentTurns:      baseEvent.KeepRecentTurns,
+		ArchivedMessageCount: baseEvent.ArchivedMessageCount,
+		SummaryChars:         len([]rune(summary)),
+		DurationMs:           time.Since(startedAt).Milliseconds(),
+	})
 	return true, nil
 }
 

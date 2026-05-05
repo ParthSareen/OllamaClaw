@@ -87,8 +87,8 @@ func (a *App) runRepl(args []string) error {
 		fmt.Printf("\n[reminder %s/%s]\n%s\n", transport, sessionKey, content)
 		return nil
 	})
-	r.subagents.SetOutputSink(func(ctx context.Context, transport, sessionKey, content string) error {
-		fmt.Printf("\n[subagent %s/%s]\n%s\n", transport, sessionKey, content)
+	r.subagents.SetOutputSink(func(ctx context.Context, notification db.SubagentNotification) error {
+		fmt.Printf("\n[subagent %s/%s]\n%s\n", notification.Transport, notification.SessionKey, notification.Content)
 		return nil
 	})
 	if err := r.cron.Start(context.Background()); err != nil {

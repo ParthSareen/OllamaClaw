@@ -177,6 +177,29 @@ CREATE INDEX IF NOT EXISTS idx_subagent_tasks_status ON subagent_tasks(status, c
 CREATE INDEX IF NOT EXISTS idx_subagent_tasks_origin ON subagent_tasks(transport, session_key, created_at);
 CREATE INDEX IF NOT EXISTS idx_subagent_tasks_repo_pr ON subagent_tasks(repo, pr_number);
 `,
+		`
+CREATE TABLE IF NOT EXISTS subagent_notifications (
+  id TEXT PRIMARY KEY,
+  task_id TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  status TEXT NOT NULL,
+  transport TEXT NOT NULL,
+  session_key TEXT NOT NULL,
+  content TEXT NOT NULL,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  last_error TEXT NOT NULL DEFAULT '',
+  next_attempt_at TEXT NOT NULL,
+  locked_at TEXT NULL,
+  delivered_at TEXT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE(task_id, kind)
+);
+
+CREATE INDEX IF NOT EXISTS idx_subagent_notifications_status ON subagent_notifications(status, next_attempt_at, created_at);
+CREATE INDEX IF NOT EXISTS idx_subagent_notifications_origin ON subagent_notifications(transport, session_key, created_at);
+CREATE INDEX IF NOT EXISTS idx_subagent_notifications_task ON subagent_notifications(task_id);
+`,
 	}
 
 	for i, sqlText := range migrations {
@@ -774,6 +797,17 @@ func (s *Store) UpsertCronPrefetchCommands(ctx context.Context, jobID string, co
 }
 
 func (s *Store) UpsertSubagentTask(ctx context.Context, task SubagentTask) error {
+	if err := upsertSubagentTask(ctx, s.db, task); err != nil {
+		return fmt.Errorf("upsert subagent task: %w", err)
+	}
+	return nil
+}
+
+type execer interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+}
+
+func upsertSubagentTask(ctx context.Context, exec execer, task SubagentTask) error {
 	if strings.TrimSpace(task.ID) == "" {
 		return fmt.Errorf("subagent task id is required")
 	}
@@ -791,7 +825,7 @@ func (s *Store) UpsertSubagentTask(ctx context.Context, task SubagentTask) error
 		task.CreatedAt = now
 	}
 	updatedAt := now.Format(time.RFC3339Nano)
-	_, err := s.db.ExecContext(ctx, `
+	_, err := exec.ExecContext(ctx, `
 INSERT INTO subagent_tasks(id, kind, status, title, prompt, transport, session_key, repo, pr_number, pr_url, base_ref, head_ref, worktree_path, result_path, stdout_path, stderr_path, metadata_json, pid, exit_code, error, created_at, started_at, finished_at, updated_at)
 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(id) DO UPDATE SET
@@ -819,7 +853,71 @@ ON CONFLICT(id) DO UPDATE SET
   updated_at=excluded.updated_at
 `, task.ID, task.Kind, task.Status, task.Title, task.Prompt, task.Transport, task.SessionKey, task.Repo, task.PRNumber, task.PRURL, task.BaseRef, task.HeadRef, task.WorktreePath, task.ResultPath, task.StdoutPath, task.StderrPath, task.MetadataJSON, task.PID, nullableInt(task.ExitCode), task.Error, task.CreatedAt.UTC().Format(time.RFC3339Nano), nullableTimeString(task.StartedAt), nullableTimeString(task.FinishedAt), updatedAt)
 	if err != nil {
-		return fmt.Errorf("upsert subagent task: %w", err)
+		return err
+	}
+	return nil
+}
+
+func (s *Store) CompleteSubagentTask(ctx context.Context, task SubagentTask, notification *SubagentNotification) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin complete subagent task: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+	if err := upsertSubagentTask(ctx, tx, task); err != nil {
+		return fmt.Errorf("upsert completed subagent task: %w", err)
+	}
+	if notification != nil {
+		if err := enqueueSubagentNotification(ctx, tx, *notification); err != nil {
+			return fmt.Errorf("enqueue subagent notification: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit complete subagent task: %w", err)
+	}
+	committed = true
+	return nil
+}
+
+func (s *Store) EnqueueSubagentNotification(ctx context.Context, notification SubagentNotification) error {
+	if err := enqueueSubagentNotification(ctx, s.db, notification); err != nil {
+		return fmt.Errorf("enqueue subagent notification: %w", err)
+	}
+	return nil
+}
+
+func enqueueSubagentNotification(ctx context.Context, exec execer, notification SubagentNotification) error {
+	if strings.TrimSpace(notification.ID) == "" {
+		return fmt.Errorf("subagent notification id is required")
+	}
+	if strings.TrimSpace(notification.TaskID) == "" {
+		return fmt.Errorf("subagent notification task id is required")
+	}
+	if strings.TrimSpace(notification.Kind) == "" {
+		notification.Kind = "completion"
+	}
+	if strings.TrimSpace(notification.Status) == "" {
+		notification.Status = "pending"
+	}
+	now := time.Now().UTC()
+	if notification.CreatedAt.IsZero() {
+		notification.CreatedAt = now
+	}
+	if notification.NextAttemptAt.IsZero() {
+		notification.NextAttemptAt = now
+	}
+	_, err := exec.ExecContext(ctx, `
+INSERT INTO subagent_notifications(id, task_id, kind, status, transport, session_key, content, attempts, last_error, next_attempt_at, locked_at, delivered_at, created_at, updated_at)
+VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(id) DO NOTHING
+`, notification.ID, notification.TaskID, notification.Kind, notification.Status, notification.Transport, notification.SessionKey, notification.Content, notification.Attempts, notification.LastError, notification.NextAttemptAt.UTC().Format(time.RFC3339Nano), nullableTimeString(notification.LockedAt), nullableTimeString(notification.DeliveredAt), notification.CreatedAt.UTC().Format(time.RFC3339Nano), now.Format(time.RFC3339Nano))
+	if err != nil {
+		return err
 	}
 	return nil
 }
@@ -980,12 +1078,133 @@ WHERE status = 'running'
 	return nil
 }
 
+func (s *Store) ResetSendingSubagentNotifications(ctx context.Context) error {
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	_, err := s.db.ExecContext(ctx, `
+UPDATE subagent_notifications
+SET status = 'pending',
+    locked_at = NULL,
+    last_error = CASE WHEN TRIM(last_error) = '' THEN 'interrupted by OllamaClaw restart' ELSE last_error END,
+    next_attempt_at = ?,
+    updated_at = ?
+WHERE status = 'sending'
+`, now, now)
+	if err != nil {
+		return fmt.Errorf("reset sending subagent notifications: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) GetSubagentNotification(ctx context.Context, id string) (SubagentNotification, bool, error) {
+	row := s.db.QueryRowContext(ctx, subagentNotificationSelectSQL()+` WHERE id = ?`, strings.TrimSpace(id))
+	return scanSubagentNotification(row)
+}
+
+func (s *Store) ClaimNextSubagentNotification(ctx context.Context, now time.Time) (SubagentNotification, bool, error) {
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	nowRaw := now.UTC().Format(time.RFC3339Nano)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return SubagentNotification{}, false, fmt.Errorf("begin claim subagent notification: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+
+	row := tx.QueryRowContext(ctx, subagentNotificationSelectSQL()+` WHERE status = 'pending' AND next_attempt_at <= ? ORDER BY created_at ASC LIMIT 1`, nowRaw)
+	notification, ok, err := scanSubagentNotification(row)
+	if err != nil || !ok {
+		if err != nil {
+			return SubagentNotification{}, false, err
+		}
+		if err := tx.Commit(); err != nil {
+			return SubagentNotification{}, false, fmt.Errorf("commit empty subagent notification claim: %w", err)
+		}
+		committed = true
+		return SubagentNotification{}, false, nil
+	}
+
+	res, err := tx.ExecContext(ctx, `
+UPDATE subagent_notifications
+SET status = 'sending',
+    attempts = attempts + 1,
+    locked_at = ?,
+    updated_at = ?
+WHERE id = ? AND status = 'pending' AND next_attempt_at <= ?
+`, nowRaw, nowRaw, notification.ID, nowRaw)
+	if err != nil {
+		return SubagentNotification{}, false, fmt.Errorf("claim subagent notification: %w", err)
+	}
+	affected, _ := res.RowsAffected()
+	if affected == 0 {
+		if err := tx.Commit(); err != nil {
+			return SubagentNotification{}, false, fmt.Errorf("commit skipped subagent notification claim: %w", err)
+		}
+		committed = true
+		return SubagentNotification{}, false, nil
+	}
+	if err := tx.Commit(); err != nil {
+		return SubagentNotification{}, false, fmt.Errorf("commit subagent notification claim: %w", err)
+	}
+	committed = true
+	notification.Status = "sending"
+	notification.Attempts++
+	notification.LockedAt = &now
+	notification.UpdatedAt = now
+	return notification, true, nil
+}
+
+func (s *Store) MarkSubagentNotificationDelivered(ctx context.Context, id string) error {
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	_, err := s.db.ExecContext(ctx, `
+UPDATE subagent_notifications
+SET status = 'delivered',
+    locked_at = NULL,
+    delivered_at = ?,
+    updated_at = ?
+WHERE id = ?
+`, now, now, strings.TrimSpace(id))
+	if err != nil {
+		return fmt.Errorf("mark subagent notification delivered: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) MarkSubagentNotificationRetry(ctx context.Context, id, errText string, nextAttemptAt time.Time) error {
+	if nextAttemptAt.IsZero() {
+		nextAttemptAt = time.Now().UTC()
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	_, err := s.db.ExecContext(ctx, `
+UPDATE subagent_notifications
+SET status = 'pending',
+    locked_at = NULL,
+    last_error = ?,
+    next_attempt_at = ?,
+    updated_at = ?
+WHERE id = ?
+`, strings.TrimSpace(errText), nextAttemptAt.UTC().Format(time.RFC3339Nano), now, strings.TrimSpace(id))
+	if err != nil {
+		return fmt.Errorf("mark subagent notification retry: %w", err)
+	}
+	return nil
+}
+
 type scanner interface {
 	Scan(dest ...any) error
 }
 
 func subagentTaskSelectSQL() string {
 	return `SELECT id, kind, status, title, prompt, transport, session_key, repo, pr_number, pr_url, base_ref, head_ref, worktree_path, result_path, stdout_path, stderr_path, metadata_json, pid, exit_code, error, created_at, started_at, finished_at, updated_at FROM subagent_tasks`
+}
+
+func subagentNotificationSelectSQL() string {
+	return `SELECT id, task_id, kind, status, transport, session_key, content, attempts, last_error, next_attempt_at, locked_at, delivered_at, created_at, updated_at FROM subagent_notifications`
 }
 
 func scanSubagentTask(row scanner) (SubagentTask, bool, error) {
@@ -1011,6 +1230,27 @@ func scanSubagentTask(row scanner) (SubagentTask, bool, error) {
 	task.FinishedAt = parseNullTime(finishedRaw)
 	task.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updatedRaw)
 	return task, true, nil
+}
+
+func scanSubagentNotification(row scanner) (SubagentNotification, bool, error) {
+	var (
+		notification                    SubagentNotification
+		nextRaw, createdRaw, updatedRaw string
+		lockedRaw, deliveredRaw         sql.NullString
+	)
+	err := row.Scan(&notification.ID, &notification.TaskID, &notification.Kind, &notification.Status, &notification.Transport, &notification.SessionKey, &notification.Content, &notification.Attempts, &notification.LastError, &nextRaw, &lockedRaw, &deliveredRaw, &createdRaw, &updatedRaw)
+	if errors.Is(err, sql.ErrNoRows) {
+		return SubagentNotification{}, false, nil
+	}
+	if err != nil {
+		return SubagentNotification{}, false, fmt.Errorf("scan subagent notification: %w", err)
+	}
+	notification.NextAttemptAt, _ = time.Parse(time.RFC3339Nano, nextRaw)
+	notification.LockedAt = parseNullTime(lockedRaw)
+	notification.DeliveredAt = parseNullTime(deliveredRaw)
+	notification.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdRaw)
+	notification.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updatedRaw)
+	return notification, true, nil
 }
 
 func parseNullTime(v sql.NullString) *time.Time {

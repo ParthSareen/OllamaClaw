@@ -814,6 +814,21 @@ func TestFormatCompactionNotice(t *testing.T) {
 	}
 }
 
+func TestFormatCompactionEvent(t *testing.T) {
+	start := formatCompactionEvent(agent.CompactionEvent{Phase: agent.CompactionEventStart})
+	if start != "context compaction started." {
+		t.Fatalf("unexpected start event: %q", start)
+	}
+	done := formatCompactionEvent(agent.CompactionEvent{Phase: agent.CompactionEventDone})
+	if done != "context compaction done." {
+		t.Fatalf("unexpected done event: %q", done)
+	}
+	failed := formatCompactionEvent(agent.CompactionEvent{Phase: agent.CompactionEventFailure, Error: "summary failed"})
+	if !strings.Contains(failed, "context compaction failed: summary failed") {
+		t.Fatalf("unexpected failure event: %q", failed)
+	}
+}
+
 func TestFormatCoreMemoryEvent(t *testing.T) {
 	start := formatCoreMemoryEvent(agent.CoreMemoryEvent{
 		Phase:         agent.CoreMemoryEventStart,

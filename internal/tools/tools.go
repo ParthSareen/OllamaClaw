@@ -834,7 +834,7 @@ func reminderTools(ctrl ReminderController) []Tool {
 	return []Tool{
 		{
 			Name:        "reminder_add",
-			Description: "Create or update a reminder in America/Los_Angeles (PST/PDT). The reminder is deterministically compiled to a cron schedule for runtime triggering.",
+			Description: "Create or update a reminder in PST (America/Los_Angeles). The reminder is deterministically compiled to a cron schedule for runtime triggering.",
 			Schema: mustSchema(`{
   "type": "object",
   "properties": {
@@ -941,7 +941,7 @@ func reminderTools(ctrl ReminderController) []Tool {
 		},
 		{
 			Name:        "reminder_list",
-			Description: "List configured reminders (timestamps returned in America/Los_Angeles, PST/PDT)",
+			Description: "List configured reminders (timestamps returned in PST / America/Los_Angeles)",
 			Schema: mustSchema(`{
   "type": "object",
   "properties": {

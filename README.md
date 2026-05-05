@@ -195,7 +195,7 @@ ollamaclaw telegram run   # legacy alias for launch
 - `/model [name]` shows/sets per-chat model
 - `/tools` lists built-in tools
 - `/reminder list [active|all]` lists reminders
-- All reminder schedules and timestamps are interpreted in `America/Los_Angeles` (PST/PDT)
+- All reminder schedules and timestamps are interpreted in PST (`America/Los_Angeles`)
 - `/reminder safe <id>` marks a reminder as safe (Telegram bash approvals auto-approve for that reminder)
 - `/reminder unsafe <id>` removes safe mode from a reminder
 - `/reminder prefetch list <id>` shows learned prefetched commands for a reminder
@@ -289,7 +289,7 @@ Output:
 ```
 
 ### `reminder_add`
-Structured reminder creation in PST/PDT. Modes: `once`, `daily`, `interval`, `weekdays`, `monthly`.
+Structured reminder creation in PST. Modes: `once`, `daily`, `interval`, `weekdays`, `monthly`.
 
 ### `reminder_list`
 Lists reminders with normalized spec and compiled cron schedule.
@@ -411,6 +411,7 @@ Tables:
 - `cron_jobs`
 - `cron_prefetch_commands`
 - `subagent_tasks`
+- `subagent_notifications`
 
 Compaction archives old rows (`archived=1`) and keeps raw history in SQLite.
 
@@ -439,7 +440,8 @@ Compaction archives old rows (`archived=1`) and keeps raw history in SQLite.
 - Subagents run headless Codex CLI jobs in the background and store artifacts under `~/.ollamaclaw/subagents/tasks/<id>/`
 - Subagents default to Codex `model_reasoning_effort="xhigh"` unless the task supplies `reasoning_effort`
 - PR review jobs use `gh` for read-only PR metadata, create isolated git worktrees under `~/.ollamaclaw/subagents/worktrees/`, and run `codex exec review`
-- Telegram sends completion reports back to the originating chat; `/agents list`, `/agents show <id>`, and `/agents cancel <id>` provide manual control
+- Completion reports are written to a durable SQLite notification outbox, injected into the parent session as a synthetic `subagent_completion` tool result, then digested by the normal agent turn before Telegram delivery
+- `/agents list`, `/agents show <id>`, and `/agents cancel <id>` provide manual control
 - V1 is report-only for GitHub: agents must not post comments, submit reviews, push branches, or mutate GitHub state
 
 ## Development
